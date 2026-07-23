@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "main"
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  pull_request:
+    branches:
+      - "main"
+
+# Cancel outdated runs for the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run test coverage
+        run: npm run test:coverage
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: "coverage-report"
+          path: "coverage/"
+          retention-days: 14
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: [lint, test]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install GitVersion
+        uses: gittools/actions/gitversion/setup@v3.2.1
+
+      - name: Determine Version
+        id: gitversion
+        uses: gittools/actions/gitversion/execute@v3.2.1
+        with:
+          useConfigFile: true
+          configFilePath: GitVersion.yml
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.x"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Set version
+        run: "npm version ${{ steps.gitversion.outputs.fullSemVer }} --no-git-tag-version"
+
+      - name: Build
+        run: npm run build
+        env:
+          # Injected into the bundle as the on-map version badge.
+          APP_VERSION: ${{ steps.gitversion.outputs.fullSemVer }}
+
+      - name: Write deploy metadata
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "deploy_type=production" > deploy-info.env
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "deploy_type=preview" > deploy-info.env
+          else
+            echo "deploy_type=none" > deploy-info.env
+          fi
+          echo "version=${{ steps.gitversion.outputs.fullSemVer }}" >> deploy-info.env
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "dist"
+          path: "./dist"
+          retention-days: 7
+
+      - name: Upload deploy metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: "deploy-info"
+          path: "deploy-info.env"
+          retention-days: 7

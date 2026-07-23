@@ -1,0 +1,28 @@
+mode: ContinuousDelivery
+branches:
+  main:
+    label: beta
+    increment: Minor
+    regex: ^main$
+    is-main-branch: true
+    source-branches: []
+  pull-request:
+    label: alpha
+    increment: Minor
+  feature:
+    label: alpha
+    increment: Minor
+    regex: ^feature/?
+    is-main-branch: false
+    source-branches:
+      - main
+  hotfix:
+    label: alpha
+    increment: Patch
+    regex: ^(?:hot)?fix/?
+    is-main-branch: false
+    source-branches:
+      - main
+ignore:
+  sha: []
+merge-message-formats: {}

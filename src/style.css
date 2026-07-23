@@ -1,0 +1,702 @@
+:root {
+  --bg: #0a0e13;
+  --bg-2: #0f1620;
+  --panel: #131c27;
+  --panel-2: #182231;
+  --line: #223042;
+  --line-soft: #1a2634;
+  --fg: #e8eef5;
+  --muted: #8a99a8;
+  --accent: #22d3ee; /* grid / camera */
+  --accent-ink: #04141a;
+  --tactic: #3b82f6; /* areas / tactical */
+  --tactic-2: #60a5fa;
+  --ember: #e0a458; /* warm arcane accent (brand, flourishes) */
+  --danger: #ef4444;
+  --radius: 14px;
+  --shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+*:focus-visible {
+  outline: 2px solid var(--tactic-2);
+  outline-offset: 2px;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.45 system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Make taps on the controls register instantly and never get reinterpreted as a
+   pan/scroll gesture (which was occasionally swallowing the FAB ✕ tap). The map
+   canvas keeps its own touch-action for pan/pinch/rotate. */
+.fab,
+.fab-item,
+.icon-btn,
+.hud-icon,
+.capture-btn,
+.chip,
+.sel {
+  touch-action: manipulation;
+}
+
+/* The app is a full-bleed map (the stage) with a top bar and floating overlays —
+   there is no bottom panel/sheet anymore; all controls live in the on-map HUD. */
+#app {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  max-width: 1500px;
+  margin: 0 auto;
+  background: radial-gradient(120% 60% at 50% 0%, #0e1620 0%, var(--bg) 60%);
+}
+
+/* --- Loader ---------------------------------------------------------- */
+.loader {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 24px;
+  text-align: center;
+  background: var(--bg);
+  transition: opacity 0.35s ease;
+}
+.loader.done {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+/* The loading screen: a themed d20 that spins while the vision engine loads.
+   (Sized at ~2/3 of its former size.) */
+.loader-die {
+  width: min(100px, 27vw);
+  height: auto;
+  margin-bottom: 8px;
+  filter: drop-shadow(0 4px 14px rgba(0, 0, 0, 0.55));
+  animation: spin 1.6s linear infinite;
+  transform-origin: 50% 50%;
+}
+@media (prefers-reduced-motion: reduce) {
+  .loader-die {
+    animation: none;
+  }
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.loader-msg {
+  margin: 0;
+  font-size: 15px;
+  color: var(--fg);
+}
+.loader-bar {
+  width: min(280px, 70vw);
+  height: 8px;
+  border-radius: 999px;
+  background: #1c2a38;
+  overflow: hidden;
+}
+.loader-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--tactic-2));
+  transition: width 0.15s ease;
+}
+.loader-fill.indeterminate {
+  width: 40% !important;
+  animation: indet 1.1s ease-in-out infinite;
+}
+@keyframes indet {
+  0% {
+    margin-left: -40%;
+  }
+  100% {
+    margin-left: 100%;
+  }
+}
+.loader.error .loader-die {
+  animation: none;
+  filter: grayscale(0.7) drop-shadow(0 0 8px rgba(239, 68, 68, 0.5));
+}
+
+/* --- Top bar --------------------------------------------------------- */
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 9px 16px;
+  padding-top: max(9px, env(safe-area-inset-top));
+  border-bottom: 1px solid var(--line-soft);
+  background: rgba(10, 14, 19, 0.72);
+  backdrop-filter: blur(8px);
+}
+.brand-logo {
+  height: 42px;
+  width: auto;
+  flex: none;
+  cursor: pointer;
+  display: block;
+  filter: drop-shadow(0 1px 4px rgba(0, 0, 0, 0.5));
+}
+.tagline {
+  font-size: 10.5px;
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+}
+/* Right cluster: detection status (camera mode) OR the result-mode retake button. */
+.topbar-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.status {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+  min-width: 0;
+  max-width: 40vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.topbar-actions[hidden] {
+  display: none;
+}
+/* Compact square button carrying a single Lucide glyph (camera / retake). */
+.icon-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  flex: none;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--fg);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.06s;
+}
+.icon-btn:hover {
+  background: #1e2a3a;
+}
+.icon-btn:active {
+  transform: translateY(1px) scale(0.98);
+}
+.icon-btn svg {
+  display: block;
+}
+/* The measure-unit select in the header (always visible in result mode). */
+.sel-unit {
+  height: 38px;
+  min-width: 52px;
+  padding: 0 8px;
+  font-size: 13px;
+  flex: none;
+}
+
+/* --- Stage (camera / result) ---------------------------------------- */
+.stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  /* Grid centering cleanly centers the single in-flow child (the camera/canvas)
+     even when its intrinsic size differs from the stage — avoiding the flexbox
+     min-content quirk that pushed the landscape canvas off-centre on a narrow
+     portrait screen. The overlays (HUD / FAB / capture / hint) are absolute. */
+  display: grid;
+  place-items: center;
+  background: #000;
+  overflow: hidden;
+}
+.stage video:not([hidden]),
+.stage #view:not([hidden]) {
+  max-width: 100%;
+  max-height: 100%;
+  min-width: 0;
+  min-height: 0;
+  display: block;
+  object-fit: contain;
+}
+
+.hint {
+  position: absolute;
+  /* Sits BELOW the (raised) Scatta button so it stays readable. */
+  bottom: calc(16px + env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: calc(100% - 24px);
+  text-align: center;
+  background: rgba(0, 0, 0, 0.66);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 9px 16px;
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--fg);
+  pointer-events: none;
+  backdrop-filter: blur(4px);
+}
+
+/* --- Heads-up panel (contextual controls over the top of the map) ---- */
+.hud {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 16;
+  width: min(560px, calc(100% - 24px));
+  background: rgba(17, 24, 33, 0.93);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(10px);
+  overflow: hidden;
+}
+.hud[hidden] {
+  display: none;
+}
+.hud-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px 9px 12px;
+}
+.hud-badge {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--tactic);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18);
+}
+.hud-badge.ally {
+  background: #22c55e;
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.18);
+}
+.hud-badge.enemy {
+  background: #ef4444;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.18);
+}
+.hud-badge.area {
+  background: var(--tactic);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.18);
+}
+.hud-title {
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--fg);
+  margin-right: auto;
+}
+.hud-head-actions {
+  display: flex;
+  gap: 6px;
+}
+.hud-icon {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  flex: none;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--fg);
+  border-radius: 9px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, transform 0.06s;
+}
+.hud-icon:hover {
+  background: #1e2a3a;
+}
+.hud-icon:active {
+  transform: translateY(1px) scale(0.97);
+}
+.hud-icon svg {
+  display: block;
+}
+.hud-icon.danger {
+  border-color: #7f1d1d;
+  color: #fca5a5;
+}
+.hud-icon.danger:hover {
+  background: rgba(239, 68, 68, 0.12);
+}
+/* Chevron points down when expanded; flips up when collapsed (tap to expand). */
+.chev {
+  transition: transform 0.2s ease;
+}
+.hud.collapsed .chev {
+  transform: rotate(180deg);
+}
+.hud-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 12px 12px;
+  max-height: 42dvh;
+  overflow-y: auto;
+}
+.hud.collapsed .hud-body {
+  display: none;
+}
+.hud-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.hud-section[hidden] {
+  display: none;
+}
+.hud-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+.hud-hint {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--muted);
+}
+.hud-hint[hidden] {
+  display: none;
+}
+
+/* --- Floating "add" speed-dial (pieces / areas) --------------------- */
+.fab-wrap {
+  position: absolute;
+  right: 14px;
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  z-index: 15;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  pointer-events: none; /* only the buttons are interactive */
+}
+.fab-wrap[hidden] {
+  display: none;
+}
+.fab {
+  pointer-events: auto;
+  align-self: flex-end;
+  width: 52px;
+  height: 52px;
+  border-radius: 50%;
+  border: none;
+  background: var(--tactic);
+  color: #fff;
+  font-size: 30px;
+  font-weight: 400;
+  line-height: 1;
+  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.5);
+  cursor: pointer;
+  transition: transform 0.2s ease, background 0.2s ease;
+}
+.fab.mode-ally {
+  background: #22c55e;
+  color: #05130a;
+}
+.fab.mode-enemy {
+  background: #ef4444;
+  color: #1a0606;
+}
+.fab.mode-area {
+  background: #3b82f6;
+}
+.fab-menu {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  opacity: 0;
+  transform: translateY(8px) scale(0.96);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  pointer-events: none;
+}
+.fab-wrap.open .fab-menu {
+  opacity: 1;
+  transform: none;
+  pointer-events: auto;
+}
+.fab-item {
+  pointer-events: auto;
+  border-radius: 999px;
+  padding: 9px 16px;
+  font-weight: 600;
+  font-size: 14px;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--fg);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
+  cursor: pointer;
+}
+.fab-item.enemy {
+  border-color: #9b3b3b;
+  color: #fca5a5;
+}
+.fab-item.ally {
+  border-color: #2f7d4f;
+  color: #86efac;
+}
+.fab-item.area {
+  border-color: #3b5bd6;
+  color: #93b4fd;
+}
+
+/* --- Transient toast (placement hints) ------------------------------ */
+.toast {
+  position: absolute;
+  left: 14px;
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  z-index: 15;
+  max-width: min(340px, calc(100% - 90px)); /* clear the FAB on the right */
+  padding: 9px 14px;
+  border-radius: 12px;
+  background: rgba(17, 24, 33, 0.94);
+  border: 1px solid var(--line);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.3;
+  /* Never taller than 2 lines. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+  pointer-events: none;
+}
+.toast[hidden] {
+  display: none;
+}
+.toast.show {
+  opacity: 1;
+  transform: none;
+}
+
+/* --- Build version badge (overlaid, bottom-left) -------------------- */
+.version-badge {
+  position: absolute;
+  left: 10px;
+  bottom: calc(7px + env(safe-area-inset-bottom));
+  /* Below the transient toast (z 15) — it may briefly cover the badge. */
+  z-index: 14;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+  color: rgba(226, 236, 247, 0.62);
+  background: rgba(10, 14, 19, 0.42);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+  user-select: none;
+}
+.version-badge:empty {
+  display: none;
+}
+
+/* --- Capture button (camera mode only) ------------------------------ */
+.capture-btn {
+  position: absolute;
+  /* Raised so the "inquadra…" hint fits underneath it. */
+  bottom: calc(62px + env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 15;
+  appearance: none;
+  border: none;
+  border-radius: 999px;
+  padding: 13px 30px;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--accent-ink);
+  background: linear-gradient(135deg, var(--accent), #16b8d4);
+  box-shadow: 0 6px 18px rgba(34, 211, 238, 0.3);
+  cursor: pointer;
+  transition: transform 0.06s, filter 0.15s, opacity 0.15s;
+}
+.capture-btn:hover {
+  filter: brightness(1.05);
+}
+.capture-btn:active {
+  transform: translateX(-50%) translateY(1px) scale(0.99);
+}
+.capture-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.capture-btn[hidden] {
+  display: none;
+}
+
+/* --- Shared controls (chips + selects used by the HUD) -------------- */
+/* Segmented control for area types */
+.segtype {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  width: 100%;
+}
+.segtype .chip {
+  padding: 10px 4px;
+  border-radius: 12px;
+  line-height: 1.1;
+  font-size: 12px;
+}
+/* Area section: the type chips + size (+ creature) selects on one wrapping line. */
+.hud-area-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.hud-area-row .segtype {
+  display: flex;
+  flex-wrap: wrap;
+  width: auto;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 6px;
+}
+.hud-area-row .segtype .chip {
+  padding: 8px 11px;
+  border-radius: 999px;
+  font-size: 12px;
+}
+.hud-area-row .sel {
+  flex: 0 0 auto;
+}
+.seg {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.chip {
+  background: var(--panel-2);
+  color: #c3cfdc;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 7px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  transition: background 0.14s, border-color 0.14s, color 0.14s, transform 0.06s;
+}
+.chip:active {
+  transform: translateY(1px);
+}
+.chip.on {
+  background: linear-gradient(135deg, var(--tactic), #2f6fd6);
+  color: #fff;
+  border-color: transparent;
+  box-shadow: 0 3px 10px rgba(59, 130, 246, 0.3);
+}
+.fld {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+.fld[hidden] {
+  display: none;
+}
+.sel {
+  background: var(--panel-2);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 8px 10px;
+  font-size: 14px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  min-width: 56px;
+}
+.sel:focus {
+  border-color: var(--tactic);
+}
+
+/* --- Phone tweaks ---------------------------------------------------- */
+@media (max-width: 599px) {
+  .topbar {
+    gap: 9px;
+    padding: 6px 12px;
+    padding-top: max(6px, env(safe-area-inset-top));
+  }
+  .brand-logo {
+    height: 34px;
+  }
+  .tagline {
+    font-size: 9.5px;
+    letter-spacing: 0.8px;
+  }
+  .hud {
+    top: 8px;
+    width: calc(100% - 16px);
+  }
+}
+
+/* Very narrow phones: drop the tagline and shrink the icon button so the logo +
+   the retake button always fit on one row. */
+@media (max-width: 430px) {
+  .tagline {
+    display: none;
+  }
+  .icon-btn {
+    width: 34px;
+    height: 34px;
+  }
+  .sel-unit {
+    height: 34px;
+    min-width: 46px;
+  }
+  .topbar-right {
+    gap: 7px;
+  }
+}

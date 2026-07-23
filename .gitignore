@@ -1,0 +1,15 @@
+node_modules
+dist
+dist-ssr
+coverage
+*.local
+.DS_Store
+.vite
+
+# editor
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# scratch
+.remember

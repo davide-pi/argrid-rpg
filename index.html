@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#0b0f14" />
+    <title>ARGrid — Grid Detector</title>
+    <style>
+      /* Critical CSS, applied before the app stylesheet loads, so the loading screen
+         is fully styled on the very first paint — no flash of the (unstyled) app or
+         of full-size images on (re)load. */
+      html,
+      body {
+        margin: 0;
+        background: #0a0e13;
+      }
+      img {
+        max-width: 100%;
+      }
+      /* The loader is an opaque full-screen overlay from the first paint, so the app
+         behind it (header logo etc.) never flashes through. */
+      .loader {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        padding: 24px;
+        background: #0a0e13;
+      }
+      .loader-die {
+        width: min(100px, 27vw);
+        height: auto;
+      }
+      .brand-logo {
+        height: 42px;
+        width: auto;
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="loader" class="loader">
+      <img class="loader-die" src="/loading.png" alt="" aria-hidden="true" />
+      <p id="loaderMsg" class="loader-msg">Caricamento…</p>
+      <div class="loader-bar"><div id="loaderFill" class="loader-fill"></div></div>
+    </div>
+
+    <div id="app">
+      <header class="topbar">
+        <img id="brand" class="brand-logo" src="/logo.png" alt="ARGrid RPG" title="ARGrid RPG" />
+        <span class="tagline">Mappa tattica · PF2e</span>
+        <div class="topbar-right">
+          <span id="status" class="status">Caricamento…</span>
+          <!-- Result-mode actions: the (global) measure unit + retake. -->
+          <div class="topbar-actions" id="topActions" hidden>
+            <select id="areaUnit" class="sel sel-unit" aria-label="Unità di misura" title="Unità di misura">
+              <option value="q">q</option>
+              <option value="m">m</option>
+              <option value="ft">ft</option>
+            </select>
+            <button id="btnRetake" class="icon-btn" type="button" aria-label="Rifai la foto" title="Rifai la foto">
+              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z" />
+                <circle cx="12" cy="13" r="3" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main class="stage" id="stage">
+        <!-- Live camera preview -->
+        <video id="video" playsinline muted autoplay></video>
+        <!-- Captured photo + AR overlay are drawn on this single canvas -->
+        <canvas id="view" hidden></canvas>
+        <div id="hint" class="hint">Inquadra una griglia di quadrati e scatta.</div>
+
+        <!-- Contextual heads-up panel, overlaid on the TOP of the map. Shows the
+             controls for whatever is active (a selected piece, an area, or a
+             movement). Collapsible; it does NOT reopen itself when you move things. -->
+        <div class="hud" id="hud" hidden>
+          <div class="hud-head" id="hudHead">
+            <span class="hud-badge" id="hudBadge" aria-hidden="true"></span>
+            <span class="hud-title" id="hudTitle">—</span>
+            <div class="hud-head-actions">
+              <button class="hud-icon danger" id="pieceRemove" type="button" aria-label="Rimuovi pedina" title="Rimuovi pedina" hidden>
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M3 6h18" />
+                  <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                  <line x1="10" x2="10" y1="11" y2="17" />
+                  <line x1="14" x2="14" y1="11" y2="17" />
+                </svg>
+              </button>
+              <button class="hud-icon" id="hudCollapse" type="button" aria-label="Riduci o espandi">
+                <svg class="chev" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+              </button>
+              <button class="hud-icon" id="hudClose" type="button" aria-label="Chiudi">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M18 6 6 18" />
+                  <path d="m6 6 12 12" />
+                </svg>
+              </button>
+            </div>
+          </div>
+          <div class="hud-body" id="hudBody">
+            <!-- Area controls: type + size (+ creature for emanations) on one line;
+                 the measure unit lives in the header. -->
+            <div class="hud-section" id="hudArea" hidden>
+              <div class="hud-area-row">
+                <div class="seg segtype" id="areaType">
+                  <button type="button" class="chip" data-t="emanazione">Emanazione</button>
+                  <button type="button" class="chip" data-t="esplosione">Esplosione</button>
+                  <button type="button" class="chip" data-t="cono">Cono</button>
+                  <button type="button" class="chip" data-t="linea">Linea</button>
+                </div>
+                <select id="areaSizeSel" class="sel" aria-label="Dimensione dell'area" title="Dimensione"></select>
+                <select id="areaCreature" class="sel" aria-label="Taglia della creatura" title="Taglia creatura" hidden></select>
+              </div>
+              <p class="hud-hint" id="areaRotHint" hidden>Ruota trascinando la punta sulla mappa.</p>
+            </div>
+
+            <!-- Piece editor -->
+            <div class="hud-section" id="hudPiece" hidden>
+              <div class="hud-row">
+                <label class="fld">Taglia <select id="pieceSize" class="sel"></select></label>
+                <label class="fld">Movimento <select id="pieceMove" class="sel"></select></label>
+              </div>
+              <p class="hud-hint">Tocca la pedina per il movimento · trascinala per spostarla.</p>
+            </div>
+
+            <!-- Movement -->
+            <div class="hud-section" id="hudMove" hidden>
+              <p class="hud-hint">Tocca una cella per vedere i percorsi · tocca un'altra pedina per spostarti su di essa.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Transient hint (e.g. entering placement mode), bottom-left near the FAB. -->
+        <div class="toast" id="toast" hidden></div>
+
+        <!-- Floating "add" speed-dial (pieces / areas), overlaying the map. -->
+        <div class="fab-wrap" id="fabWrap" hidden>
+          <div class="fab-menu" id="fabMenu">
+            <button type="button" class="fab-item enemy" id="fabEnemy">Nemico</button>
+            <button type="button" class="fab-item ally" id="fabAlly">Alleato</button>
+            <button type="button" class="fab-item area" id="fabArea">Area</button>
+          </div>
+          <button type="button" class="fab" id="fab" aria-label="Aggiungi pedina o area">＋</button>
+        </div>
+
+        <!-- Capture button (camera mode only). -->
+        <button id="btnCapture" class="capture-btn" disabled>Scatta</button>
+
+        <!-- Build version (computed by GitVersion in CI), overlaid bottom-left. -->
+        <span id="versionBadge" class="version-badge" aria-hidden="true"></span>
+      </main>
+    </div>
+
+    <!-- OpenCV must be bootstrapped from a CLASSIC script (its Emscripten
+         runtime does not initialize when driven from an ES module). -->
+    <script src="/opencv-boot.js"></script>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

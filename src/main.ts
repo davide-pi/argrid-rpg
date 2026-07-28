@@ -531,7 +531,9 @@ async function runDetection() {
     updateResultChrome();
   } catch (err) {
     console.error(err);
-    setStatus('Errore analisi: ' + (err as Error).message);
+    // Only surface the error for the CURRENT photo — a superseded run that throws
+    // must not overwrite the header with a stale "Errore analisi" for a discarded photo.
+    if (myGen === detectGen) setStatus('Errore analisi: ' + (err as Error).message);
   } finally {
     detecting = false;
     hideProcessing();

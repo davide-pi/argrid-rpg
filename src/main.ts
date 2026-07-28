@@ -434,6 +434,7 @@ function capture() {
 
 function processImage(canvas: HTMLCanvasElement) {
   lastCapture = canvas;
+  detectGen++; // a new photo supersedes any in-flight analysis
   view.hidden = false;
   hint.hidden = true;
   zoom.reset(); // start each new capture unzoomed
@@ -465,6 +466,12 @@ const nextFrame = () =>
   new Promise<void>((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
 
 let detecting = false;
+// Detection generation: bumped on every new capture / retake so an in-flight analysis
+// (staged over many frames) can tell it has been SUPERSEDED and discard its result
+// instead of committing a stale grid over a newer photo. `detectPending` remembers that
+// a fresh photo arrived while a run was busy, so it's analysed once the run finishes.
+let detectGen = 0;
+let detectPending = false;
 
 // Max ratio between the two families' cell pitches before a fit is treated as "not a
 // grid" (one family collapsed → micro one way / macro the other).
@@ -477,14 +484,22 @@ const MIN_GRID_CELLS = 5;
 
 async function runDetection() {
   // One detection at a time — the pipeline is heavy and holds OpenCV Mats.
-  if (!cv || !lastCapture || detecting) return;
+  if (!cv || !lastCapture) return;
+  if (detecting) {
+    // A run is in flight; it will pick up the latest capture when it finishes, so this
+    // photo isn't silently dropped (retake + quick re-shoot during analysis).
+    detectPending = true;
+    return;
+  }
   detecting = true;
+  const myGen = detectGen; // the photo this run belongs to
   showProcessing("Analisi dell'immagine…", 0);
   await nextFrame(); // paint the overlay before the first blocking stage
   try {
     const t0 = performance.now();
     // Drive the staged detector: paint each step, yield a frame (die spins /
-    // bar advances), then run the next synchronous stage.
+    // bar advances), then run the next synchronous stage. Always drained to
+    // completion so the generator's own `finally` frees its OpenCV Mats.
     const gen = detectGridSteps(cv, lastCapture, currentParams(), debug);
     let step = gen.next();
     while (!step.done) {
@@ -492,6 +507,10 @@ async function runDetection() {
       await nextFrame();
       step = gen.next();
     }
+    // Superseded by a newer capture / retake while we were analysing (the staged run
+    // spans many frames)? Discard this result — committing it would draw an old grid
+    // over a newer photo.
+    if (myGen !== detectGen) return;
     setProcessing('Quasi pronto…', 1);
     lastResult = step.value;
 
@@ -516,6 +535,11 @@ async function runDetection() {
   } finally {
     detecting = false;
     hideProcessing();
+    // A fresh photo arrived while we were busy → analyse the latest capture now.
+    if (detectPending) {
+      detectPending = false;
+      runDetection();
+    }
   }
 }
 
@@ -2661,6 +2685,8 @@ function retake() {
   showingResult = false;
   lastResult = null;
   lastCapture = null;
+  detectGen++; // supersede any in-flight analysis; don't commit its grid after we leave
+  detectPending = false; // nothing to re-analyse once we're back on the camera
   deselectCell();
   zoom.reset();
   view.hidden = true;

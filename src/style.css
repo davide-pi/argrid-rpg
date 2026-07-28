@@ -311,17 +311,19 @@ body {
 
 .hint {
   position: absolute;
-  /* Sits BELOW the (raised) Scatta button so it stays readable. */
-  bottom: calc(16px + env(safe-area-inset-bottom));
+  /* Sits BELOW the (raised) Scatta button so it stays readable. Kept short so it
+     stays on ONE line (a two-line pill crowded the Scatta button). */
+  bottom: calc(18px + env(safe-area-inset-bottom));
   left: 50%;
   transform: translateX(-50%);
   max-width: calc(100% - 24px);
+  white-space: nowrap;
   text-align: center;
   background: rgba(0, 0, 0, 0.66);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  padding: 9px 16px;
+  padding: 6px 14px;
   border-radius: 999px;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--fg);
   pointer-events: none;
   backdrop-filter: blur(4px);

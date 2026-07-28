@@ -153,8 +153,9 @@ body {
   gap: 12px;
   padding: 24px;
   text-align: center;
-  background: rgba(10, 14, 19, 0.82);
-  backdrop-filter: blur(2px);
+  /* Opaque, so the just-captured (or previous) photo is fully hidden while the
+     grid is being analysed — only the die + progress show, on a black ground. */
+  background: var(--bg);
 }
 .processing[hidden] {
   display: none;

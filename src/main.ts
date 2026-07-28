@@ -319,7 +319,7 @@ async function startCamera() {
     hud.hidden = true; // no contextual controls on the live camera
     if (placeMode !== 'none') setPlaceMode('none');
     fabWrap.hidden = true; // nothing to add on the live camera
-    setStatus('Fotocamera attiva');
+    setStatus(''); // no header status on the live camera (the on-map hint suffices)
   } catch (err) {
     console.error(err);
     setStatus('Fotocamera non disponibile — tocca lo schermo per riprovare');
@@ -433,7 +433,14 @@ function reportStatus(dt: number) {
     setStatus(`${i.rawCount} linee grezze ma nessuna griglia — inquadra più da vicino`);
     return;
   }
-  const base = `Griglia ${i.aCount}×${i.bCount} · ${i.angleADeg.toFixed(0)}°/${i.angleBDeg.toFixed(0)}° · ${dt}ms`;
+  // Weak detection: few REAL (detected) lines, so most of the shown grid is
+  // extrapolated and may be wrong. Warn instead of silently trusting it. (The
+  // frame extension keeps aCount+bCount > 0 even here, so confidence — not the
+  // total — is what flags it.)
+  if (i.confidence < 0.35) {
+    showToast('Griglia incerta — prova con più contrasto, luce o inquadrando più da vicino.');
+  }
+  const base = `Griglia ${i.detectedA}×${i.detectedB} · conf ${(i.confidence * 100).toFixed(0)}% · ${i.angleADeg.toFixed(0)}°/${i.angleBDeg.toFixed(0)}° · ${dt}ms`;
   // On success the top-right shows the action buttons instead of a status line;
   // only surface the (verbose) grid info while debugging.
   setStatus(debug ? `${base} · grezze ${i.rawCount} · Hough ${i.usedHough} · edge ${i.edgePixels}` : '');

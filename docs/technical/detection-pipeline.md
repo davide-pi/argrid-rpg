@@ -97,10 +97,13 @@ exact synthetic θ do **not** catch it — only real Hough output does.
 ## `GridResult.info` (diagnostics, `grid-detector.ts:52`)
 
 `rawCount`, `aCount`, `bCount`, `angleADeg/BDeg`, `spacingA/B` (px, original coords),
-`usedHough` (settled threshold), `cannyHigh` (from Otsu), `edgePixels`. Surfaced in the
-status line when `debug` is on (`main.ts:382`). Note `aCount`/`bCount` are the **total**
-family sizes (detected + filled + extended); the `lineMorph` fallback gates on
-detected-only counts instead, so extension never suppresses it.
+`usedHough` (settled threshold), `cannyHigh` (from Otsu), `edgePixels`, plus
+`detectedA`/`detectedB` (real DETECTED lines per family) and `confidence` (0..1).
+Surfaced in the status line when `debug` is on. Note `aCount`/`bCount` are the **total**
+family sizes (detected + filled + extended); the `lineMorph` fallback and `confidence`
+gate on the **detected-only** counts instead, so fill/extension never inflate them.
+`confidence` = `clamp((min(detectedA, detectedB) − 2) / 4, 0, 1)`; the UI warns the user
+with a toast when it is below 0.35 (a mostly-extrapolated, unreliable grid).
 
 ## Debug output (edges + raw Hough lines)
 

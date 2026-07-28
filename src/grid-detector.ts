@@ -86,6 +86,9 @@ export interface GridResult {
     usedHough: number; // Hough threshold the retry loop settled on
     cannyHigh: number; // Canny high threshold picked from Otsu
     edgePixels: number; // number of edge pixels (diagnostics)
+    detectedA: number; // real DETECTED (non-filled) lines per family …
+    detectedB: number;
+    confidence: number; // …feeding a 0..1 heuristic detection-quality score
   };
 }
 
@@ -117,11 +120,76 @@ function meanAngle180(anglesDeg: number[]): number {
   return m;
 }
 
+/** Number of DETECTED (non-filled/non-extended) lines in a family. */
+const detectedCount = (fam: Line2[]): number => fam.reduce((n, l) => n + (l.filled ? 0 : 1), 0);
+
+/** Smaller family's detected-line count — the binding constraint on whether a
+ * real grid was found (both families must be present). */
+const gridStrength = (r: GridResult): number =>
+  Math.min(detectedCount(r.familyA), detectedCount(r.familyB));
+
+/** 0..1 heuristic detection quality from the detected line counts. A grid needs
+ * ≥2 detected lines per family to exist at all; ~6+ per family is an unambiguous
+ * detection. Extrapolated/filled lines don't count, so a mostly-extended result
+ * (few real lines) scores low. */
+function gridConfidence(familyA: Line2[], familyB: Line2[]): number {
+  const m = Math.min(detectedCount(familyA), detectedCount(familyB));
+  if (m < 2) return 0;
+  return Math.max(0, Math.min(1, (m - 2) / 4)); // 2→0, 6→1
+}
+
 /** A coarse progress tick emitted between the heavy detection stages, so the UI
  * can show a (jumpy) percentage and keep the loading die spinning. */
 export interface DetectProgress {
   frac: number; // 0..1
   label: string;
+}
+
+/** Downscale `src` so its longest side is `maxDim`, then run the full pipeline;
+ * synchronous (drains the staged generator). The caller owns `src`. */
+function runAtMaxDim(
+  cv: any,
+  src: any,
+  W0: number,
+  H0: number,
+  maxDim: number,
+  params: DetectorParams,
+  wantEdges: boolean,
+): GridResult {
+  const scale = Math.min(1, maxDim / Math.max(W0, H0));
+  const work = new cv.Mat();
+  if (scale < 1) {
+    cv.resize(src, work, new cv.Size(Math.round(W0 * scale), Math.round(H0 * scale)), 0, 0, cv.INTER_AREA);
+  } else {
+    src.copyTo(work);
+  }
+  const r = detectGridFromMat(cv, work, W0, H0, scale, params, wantEdges);
+  work.delete();
+  return r;
+}
+
+/** Generator form of `runAtMaxDim`, forwarding the pipeline's progress ticks. */
+function* runAtMaxDimSteps(
+  cv: any,
+  src: any,
+  W0: number,
+  H0: number,
+  maxDim: number,
+  params: DetectorParams,
+  wantEdges: boolean,
+): Generator<DetectProgress, GridResult, void> {
+  const scale = Math.min(1, maxDim / Math.max(W0, H0));
+  const work = new cv.Mat();
+  try {
+    if (scale < 1) {
+      cv.resize(src, work, new cv.Size(Math.round(W0 * scale), Math.round(H0 * scale)), 0, 0, cv.INTER_AREA);
+    } else {
+      src.copyTo(work);
+    }
+    return yield* detectGridFromMatSteps(cv, work, W0, H0, scale, params, wantEdges);
+  } finally {
+    work.delete();
+  }
 }
 
 export function detectGrid(
@@ -132,27 +200,12 @@ export function detectGrid(
 ): GridResult {
   const W0 = srcCanvas.width;
   const H0 = srcCanvas.height;
-  const scale = Math.min(1, params.maxDim / Math.max(W0, H0));
-
   const src = cv.imread(srcCanvas);
-  const work = new cv.Mat();
-  if (scale < 1) {
-    cv.resize(
-      src,
-      work,
-      new cv.Size(Math.round(W0 * scale), Math.round(H0 * scale)),
-      0,
-      0,
-      cv.INTER_AREA,
-    );
-  } else {
-    src.copyTo(work);
+  try {
+    return runAtMaxDim(cv, src, W0, H0, params.maxDim, params, wantEdges);
+  } finally {
+    src.delete();
   }
-
-  const result = detectGridFromMat(cv, work, W0, H0, scale, params, wantEdges);
-  src.delete();
-  work.delete();
-  return result;
 }
 
 /**
@@ -170,26 +223,11 @@ export function* detectGridSteps(
 ): Generator<DetectProgress, GridResult, void> {
   const W0 = srcCanvas.width;
   const H0 = srcCanvas.height;
-  const scale = Math.min(1, params.maxDim / Math.max(W0, H0));
   const src = cv.imread(srcCanvas);
-  const work = new cv.Mat();
   try {
-    if (scale < 1) {
-      cv.resize(
-        src,
-        work,
-        new cv.Size(Math.round(W0 * scale), Math.round(H0 * scale)),
-        0,
-        0,
-        cv.INTER_AREA,
-      );
-    } else {
-      src.copyTo(work);
-    }
-    return yield* detectGridFromMatSteps(cv, work, W0, H0, scale, params, wantEdges);
+    return yield* runAtMaxDimSteps(cv, src, W0, H0, params.maxDim, params, wantEdges);
   } finally {
     src.delete();
-    work.delete();
   }
 }
 
@@ -205,27 +243,12 @@ export function detectGridFromImageData(
 ): GridResult {
   const W0 = imageData.width;
   const H0 = imageData.height;
-  const scale = Math.min(1, params.maxDim / Math.max(W0, H0));
-
   const src = cv.matFromImageData(imageData);
-  const work = new cv.Mat();
-  if (scale < 1) {
-    cv.resize(
-      src,
-      work,
-      new cv.Size(Math.round(W0 * scale), Math.round(H0 * scale)),
-      0,
-      0,
-      cv.INTER_AREA,
-    );
-  } else {
-    src.copyTo(work);
+  try {
+    return runAtMaxDim(cv, src, W0, H0, params.maxDim, params, wantEdges);
+  } finally {
+    src.delete();
   }
-
-  const result = detectGridFromMat(cv, work, W0, H0, scale, params, wantEdges);
-  src.delete();
-  work.delete();
-  return result;
 }
 
 /**
@@ -322,15 +345,13 @@ export function* detectGridFromMatSteps(
   // When Canny drowns in background texture (a grid drawn on dirt/cork), it finds
   // no grid. Retry with the morphological line extractor and keep it if it does
   // better. Costs an extra pass only when the plain pipeline already failed.
-  // Count only DETECTED lines (not interior-filled or extrapolated ones), so a
-  // weak detection can't be masked by fill/extension and skip the fallback.
-  const detected = (fam: Line2[]) => fam.reduce((n, l) => n + (l.filled ? 0 : 1), 0);
-  const strength = (r: GridResult) => Math.min(detected(r.familyA), detected(r.familyB));
-  if (params.lineMorph && strength(result) < 3) {
+  // `gridStrength` counts only DETECTED lines (not interior-filled or extrapolated
+  // ones), so a weak detection can't be masked by fill/extension and skip the fallback.
+  if (params.lineMorph && gridStrength(result) < 3) {
     yield { frac: 0.75, label: 'Immagine complessa, riprovo…' };
     const morphEdges = enhanceGridLines(cv, gray);
     const alt = houghToGrid(cv, morphEdges, work, scale, W0, H0, params);
-    if (strength(alt.result) > strength(result)) {
+    if (gridStrength(alt.result) > gridStrength(result)) {
       result = alt.result;
       cannyEdges.delete();
       edges = morphEdges;
@@ -423,7 +444,8 @@ function houghToGrid(
  * line to drop residual blobs -> combine -> dilate. Broken lines are fine: Hough
  * sums the fragments that share a (rho, theta), and the lattice fit rebuilds gaps. */
 function enhanceGridLines(cv: any, gray: any): any {
-  const MW = 1000; // work around ~1000px on the longer side
+  const MW = 1000; // work around ~1000px on the longer side (the SE sizes and the
+  // mean+K·σ threshold below are tuned for this scale — changing it needs retuning)
   const down = Math.min(1, MW / Math.max(gray.cols, gray.rows));
   let g = gray;
   let tempG: any = null;
@@ -709,6 +731,9 @@ export function buildGrid(
       usedHough: 0,
       cannyHigh: 0,
       edgePixels: 0,
+      detectedA: 0,
+      detectedB: 0,
+      confidence: 0,
     },
   };
 
@@ -789,6 +814,9 @@ export function buildGrid(
       usedHough: 0,
       cannyHigh: 0,
       edgePixels: 0,
+      detectedA: detectedCount(familyA),
+      detectedB: detectedCount(familyB),
+      confidence: gridConfidence(familyA, familyB),
     },
   };
 }

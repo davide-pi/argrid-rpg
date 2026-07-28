@@ -943,6 +943,50 @@ function drawStrokes(ctx: CanvasRenderingContext2D) {
   ctx.restore();
 }
 
+/** Magnifier loupe over the corner being dragged, so the finger doesn't hide where
+ * the vertex is landing. Samples the already-drawn photo+grid from the canvas and
+ * shows it zoomed with a crosshair at the exact corner. */
+function drawCornerLoupe(ctx: CanvasRenderingContext2D) {
+  if (manualDrag === null || manualDrag < 0 || manualDrag > 3 || !manualQuad) return;
+  const c = manualQuad[manualDrag]; // image = canvas coords (view backing store)
+  const zoom = 2.5;
+  const R = Math.max(48, view.width * 0.14); // loupe radius (canvas px)
+  const srcR = R / zoom;
+  // Place the loupe offset from the corner (above by default; below if near the top)
+  // so it never sits under the finger, and keep it inside the canvas.
+  let cx = c.x;
+  let cy = c.y - R * 1.7;
+  if (cy - R < 0) cy = c.y + R * 1.7;
+  cx = Math.max(R, Math.min(view.width - R, cx));
+  cy = Math.max(R, Math.min(view.height - R, cy));
+  ctx.save();
+  // Magnified content, clipped to the circle.
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.closePath();
+  ctx.clip();
+  ctx.fillStyle = '#0a0e13';
+  ctx.fillRect(cx - R, cy - R, R * 2, R * 2);
+  ctx.drawImage(view, c.x - srcR, c.y - srcR, srcR * 2, srcR * 2, cx - R, cy - R, R * 2, R * 2);
+  ctx.restore();
+  // Ring + crosshair at the exact vertex.
+  const lw = Math.max(2, view.width / 300);
+  ctx.strokeStyle = '#22d3ee';
+  ctx.lineWidth = lw;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.lineWidth = Math.max(1, lw * 0.6);
+  ctx.beginPath();
+  ctx.moveTo(cx - R * 0.32, cy);
+  ctx.lineTo(cx + R * 0.32, cy);
+  ctx.moveTo(cx, cy - R * 0.32);
+  ctx.lineTo(cx, cy + R * 0.32);
+  ctx.stroke();
+  ctx.restore();
+}
+
 /** Draw the 4 corner handles over the manual grid. */
 function drawManualHandles(ctx: CanvasRenderingContext2D) {
   if (!manualQuad) return;
@@ -1034,8 +1078,12 @@ function draw() {
   }
 
   if (manualActive) {
-    if (manualDrawPending) drawStrokes(ctx);
-    else drawManualHandles(ctx);
+    if (manualDrawPending) {
+      drawStrokes(ctx);
+    } else {
+      drawCornerLoupe(ctx); // magnifier (samples clean photo+grid) while dragging a corner
+      drawManualHandles(ctx);
+    }
     return; // no tactical layer while editing the grid
   }
 

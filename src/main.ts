@@ -94,6 +94,7 @@ const rowsInput = $<HTMLInputElement>('rowsInput');
 const manualDone = $<HTMLButtonElement>('manualDone');
 const manualCancel = $<HTMLButtonElement>('manualCancel');
 const manualCollapse = $<HTMLButtonElement>('manualCollapse');
+const manualInfo = $<HTMLButtonElement>('manualInfo');
 const manualHint = $<HTMLParagraphElement>('manualHint');
 const manualReset = $<HTMLButtonElement>('manualReset');
 
@@ -117,6 +118,7 @@ const hudArea = $<HTMLDivElement>('hudArea');
 const hudPiece = $<HTMLDivElement>('hudPiece');
 const hudMove = $<HTMLDivElement>('hudMove');
 const hudCollapse = $<HTMLButtonElement>('hudCollapse');
+const hudInfo = $<HTMLButtonElement>('hudInfo');
 const hudClose = $<HTMLButtonElement>('hudClose');
 const toast = $<HTMLDivElement>('toast');
 // Area controls (live inside the HUD now).
@@ -715,18 +717,19 @@ function manualDefaultQuad() {
   if (!lastResult) return;
   const W = lastResult.width;
   const H = lastResult.height;
-  const mx = W * 0.12;
-  const my = H * 0.12;
+  // A centred SQUARE 10×10 grid (square cells) — a clean, predictable starting point
+  // the user then drags to fit. (Adapting to a photo's aspect gave odd default counts.)
+  const side = Math.min(W, H) * 0.76;
+  const x0 = (W - side) / 2;
+  const y0 = (H - side) / 2;
   manualQuad = [
-    { x: mx, y: my },
-    { x: W - mx, y: my },
-    { x: W - mx, y: H - my },
-    { x: mx, y: H - my },
+    { x: x0, y: y0 },
+    { x: x0 + side, y: y0 },
+    { x: x0 + side, y: y0 + side },
+    { x: x0, y: y0 + side },
   ];
-  // Default counts: aim for roughly square cells filling the default quad.
-  const cell = Math.min(W - 2 * mx, H - 2 * my) / 10;
-  manualNa = Math.max(2, Math.round((W - 2 * mx) / cell));
-  manualNb = Math.max(2, Math.round((H - 2 * my) / cell));
+  manualNa = 10;
+  manualNb = 10;
 }
 
 function setManualHint() {
@@ -760,18 +763,19 @@ function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
   pinchState = null;
   setManualHint();
   applyManualBarMode();
-  updateManualBar();
   showManualBar(true);
   if (manualDrawPending) {
     // No grid yet — wait for the user to trace lines. Show the photo alone.
     manualQuad = null;
     gridReliable = false;
     gridMap = null;
+    updateManualBar();
     draw();
   } else {
     // Start from the current grid when it's usable, else a default quad — so a
     // well-detected grid is only tweaked, but a bad/absent one starts from scratch.
     if (!gridReliable || !seedQuadFromCurrentGrid()) manualDefaultQuad();
+    updateManualBar(); // sync the counters AFTER na/nb are set (was showing stale values)
     applyManual();
   }
 }
@@ -1067,22 +1071,35 @@ function drawStrokes(ctx: CanvasRenderingContext2D) {
   ctx.restore();
 }
 
-/** Magnifier loupe over the point being dragged (a grid corner or a traced-line
- * endpoint), so the finger doesn't hide where it lands. Samples the already-drawn
- * photo+grid from the canvas and shows it zoomed with a crosshair at the point. */
-function drawLoupeAt(ctx: CanvasRenderingContext2D, c: ImgPt) {
+// Magnifier loupe over the point being dragged (a grid corner or a traced-line
+// endpoint), so the finger doesn't hide where it lands. Drawn in two steps so it sits
+// ABOVE the handles: (1) CAPTURE the clean photo+grid region into an offscreen canvas
+// BEFORE the handles are drawn; (2) DRAW the loupe last, over everything.
+let loupeSrc: HTMLCanvasElement | null = null;
+
+/** Capture the clean magnified source around `c` and return the loupe placement. */
+function captureLoupe(c: ImgPt): { cx: number; cy: number; R: number } {
   const zoom = 2.5;
-  const R = Math.max(48, view.width * 0.14); // loupe radius (canvas px)
+  const R = Math.max(48, view.width * 0.14);
   const srcR = R / zoom;
-  // Place the loupe offset from the corner (above by default; below if near the top)
-  // so it never sits under the finger, and keep it inside the canvas.
   let cx = c.x;
   let cy = c.y - R * 1.7;
-  if (cy - R < 0) cy = c.y + R * 1.7;
+  if (cy - R < 0) cy = c.y + R * 1.7; // flip below if near the top edge
   cx = Math.max(R, Math.min(view.width - R, cx));
   cy = Math.max(R, Math.min(view.height - R, cy));
-  ctx.save();
-  // Magnified content, clipped to the circle.
+  if (!loupeSrc) loupeSrc = document.createElement('canvas');
+  const s = Math.max(2, Math.round(srcR * 2));
+  loupeSrc.width = s;
+  loupeSrc.height = s;
+  const lctx = loupeSrc.getContext('2d')!;
+  lctx.clearRect(0, 0, s, s);
+  lctx.drawImage(view, c.x - srcR, c.y - srcR, srcR * 2, srcR * 2, 0, 0, s, s);
+  return { cx, cy, R };
+}
+
+/** Draw the loupe (ring + magnified capture + crosshair) on top of everything. */
+function drawLoupe(ctx: CanvasRenderingContext2D, p: { cx: number; cy: number; R: number }) {
+  const { cx, cy, R } = p;
   ctx.save();
   ctx.beginPath();
   ctx.arc(cx, cy, R, 0, Math.PI * 2);
@@ -1090,10 +1107,10 @@ function drawLoupeAt(ctx: CanvasRenderingContext2D, c: ImgPt) {
   ctx.clip();
   ctx.fillStyle = '#0a0e13';
   ctx.fillRect(cx - R, cy - R, R * 2, R * 2);
-  ctx.drawImage(view, c.x - srcR, c.y - srcR, srcR * 2, srcR * 2, cx - R, cy - R, R * 2, R * 2);
+  if (loupeSrc) ctx.drawImage(loupeSrc, cx - R, cy - R, R * 2, R * 2);
   ctx.restore();
-  // Ring + crosshair at the exact vertex.
   const lw = Math.max(2, view.width / 300);
+  ctx.save();
   ctx.strokeStyle = '#22d3ee';
   ctx.lineWidth = lw;
   ctx.beginPath();
@@ -1107,6 +1124,20 @@ function drawLoupeAt(ctx: CanvasRenderingContext2D, c: ImgPt) {
   ctx.lineTo(cx, cy + R * 0.32);
   ctx.stroke();
   ctx.restore();
+}
+
+/** The point currently being dragged that should get a loupe (or null). */
+function loupePoint(): ImgPt | null {
+  if (manualDrawPending) {
+    if (manualDrag === ENDPOINT_SENTINEL && drawEndpointDrag) {
+      return manualStrokes[drawEndpointDrag.s][drawEndpointDrag.e];
+    }
+    return null;
+  }
+  if (manualDrag !== null && manualDrag >= 0 && manualDrag <= 3 && manualQuad) {
+    return manualQuad[manualDrag];
+  }
+  return null;
 }
 
 /** Draw the 4 corner handles over the manual grid. */
@@ -1193,18 +1224,13 @@ function draw() {
   }
 
   if (manualActive) {
-    if (manualDrawPending) {
-      if (manualDrag === ENDPOINT_SENTINEL && drawEndpointDrag) {
-        drawLoupeAt(ctx, manualStrokes[drawEndpointDrag.s][drawEndpointDrag.e]);
-      }
-      drawStrokes(ctx);
-    } else {
-      // Magnifier (samples clean photo+grid) while dragging a corner.
-      if (manualDrag !== null && manualDrag >= 0 && manualDrag <= 3 && manualQuad) {
-        drawLoupeAt(ctx, manualQuad[manualDrag]);
-      }
-      drawManualHandles(ctx);
-    }
+    // Capture the clean loupe source (photo+grid) BEFORE drawing handles/strokes, so
+    // the magnifier can be drawn LAST — on top of every other handle.
+    const lp = loupePoint();
+    const place = lp ? captureLoupe(lp) : null;
+    if (manualDrawPending) drawStrokes(ctx);
+    else drawManualHandles(ctx);
+    if (place) drawLoupe(ctx, place);
     return; // no tactical layer while editing the grid
   }
 
@@ -2435,6 +2461,8 @@ hudCollapse.addEventListener('click', () => {
   hudCollapsed = !hudCollapsed;
   refreshHud();
 });
+// (i) toggles the contextual hints (hidden by default to save space).
+hudInfo.addEventListener('click', () => hud.classList.toggle('hints-off'));
 hudClose.addEventListener('click', () => {
   if (activeOverlay?.kind === 'area') removeActiveArea();
   else {
@@ -2573,6 +2601,14 @@ rowsInput.addEventListener('change', () => setManualCount('rows', parseInt(rowsI
 manualCollapse.addEventListener('click', () => {
   manualCollapsed = !manualCollapsed;
   manualBar.classList.toggle('collapsed', manualCollapsed);
+});
+// (i) toggles the instructions (hidden by default to save space).
+manualInfo.addEventListener('click', () => {
+  manualHint.hidden = !manualHint.hidden;
+  if (manualCollapsed && !manualHint.hidden) {
+    manualCollapsed = false;
+    manualBar.classList.remove('collapsed');
+  }
 });
 manualDone.addEventListener('click', () => exitManualMode(true));
 manualCancel.addEventListener('click', () => exitManualMode(false));

@@ -454,6 +454,10 @@ body {
 .hud-hint[hidden] {
   display: none;
 }
+/* Hints are hidden by default (toggled by the HUD (i) button) to save space. */
+.hud.hints-off .hud-hint {
+  display: none;
+}
 
 /* --- Floating "add" speed-dial (pieces / areas) --------------------- */
 .fab-wrap {
@@ -729,18 +733,19 @@ body {
 }
 .manual-bar-row {
   display: flex;
-  gap: 12px;
+  gap: 8px;
   justify-content: center;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
 }
 .btn-mini {
   padding: 7px 14px;
   font-size: 13px;
 }
 .stepper-input {
-  width: 46px;
-  height: 30px;
-  padding: 0 4px;
+  width: 40px;
+  height: 26px;
+  padding: 0 2px;
+  flex: none;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--bg-2);
@@ -760,33 +765,34 @@ body {
 .stepper {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 5px 8px;
+  gap: 5px;
+  padding: 4px 6px;
   border-radius: 999px;
   background: var(--panel-2);
   border: 1px solid var(--line);
 }
 .stepper-lbl {
-  font-size: 12.5px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--muted);
-  padding: 0 2px;
+  padding: 0 1px;
 }
 .stepper-btn {
   appearance: none;
   border: none;
-  width: 30px;
-  height: 30px;
+  width: 26px;
+  height: 26px;
   border-radius: 50%;
   background: #223247;
   color: var(--fg);
-  font-size: 19px;
+  font-size: 17px;
   font-weight: 700;
   line-height: 1;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
+  flex: none;
 }
 .stepper-btn:active {
   transform: scale(0.94);

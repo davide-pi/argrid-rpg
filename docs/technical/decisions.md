@@ -35,6 +35,28 @@ normal, `d = mean(rho·cos(θ − θ̄))` (`src/grid-detector.ts:244`, `mergeDup
 rho collapses it to ~0. Projection is sign-consistent. Unit tests with exact synthetic
 θ do not catch this — only real Hough output does.
 
+### Grid extrapolated to the whole frame by default (`extend: 'frame'`)
+**Decision:** after fitting the regular lattice, continue it `a + b·k` outward past the
+detected extent and tile the **entire image frame** with the inferred grid; extrapolated
+lines are drawn faint (0.5α), flagged `extended`+`filled` (`fitFamilyGrid`, `DEFAULT_PARAMS`
+`src/grid-detector.ts`). Bounded by the frame and a vanishing-point crowding guard;
+`'border'` (a couple of cells) and `'off'` remain as options.
+**Why:** the detector missed the **outer sides** of a grid whose edge is a colour-only
+boundary (similar luminance), and, more broadly, the user wanted a **virtual tactical
+grid** covering the whole photo, not just the drawn map. Extrapolation is exact in the
+rectified plane (pure arithmetic continuation), so it needs no extra detection.
+**Accepted trade-off:** it draws grid over empty areas beyond the physical map and lets
+pieces be placed off the real map; the faint styling flags those cells as inferred. The
+user chose full-frame over the conservative `'border'` mode.
+
+### Fallback strength gates on DETECTED lines only
+**Decision:** the `lineMorph` retry fires on `min(detected(familyA), detected(familyB)) < 3`,
+counting only non-`filled` lines, not `info.aCount/bCount` (`detectGridFromMat`
+`src/grid-detector.ts`).
+**Why:** with `fillGrid` and especially `extend: 'frame'`, the family sizes are inflated by
+rebuilt/extrapolated lines. Gating on the totals would let a weak 2-line detection look
+strong and skip the morphological fallback the noisy-photo path depends on.
+
 ## Tactical engine
 
 ### Unified single grid colour (no H/V distinction)

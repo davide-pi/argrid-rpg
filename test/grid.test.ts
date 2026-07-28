@@ -12,6 +12,10 @@ import {
 
 const DEG = 180 / Math.PI;
 
+// Detection/fill tests pin extension OFF so they assert the detected+filled
+// lattice in isolation (extension is exercised by its own tests below).
+const NO_EXTEND = { ...DEFAULT_PARAMS, extend: 'off' as const };
+
 /**
  * Build the Hough (rho, thetaDeg) representation of an axis-aligned-then-rotated
  * grid. Two perpendicular families, `n` lines each, pitch `s`, rotated by
@@ -56,7 +60,7 @@ function syntheticGrid(opts: {
 
 test('recovers a straight (unrotated) full grid', () => {
   const raw = syntheticGrid({ W: 1000, H: 1000, s: 80, n: 8, rotDeg: 0 });
-  const r = buildGrid(raw, 1, 1000, 1000, DEFAULT_PARAMS);
+  const r = buildGrid(raw, 1, 1000, 1000, NO_EXTEND);
   assert.equal(r.familyA.length, 8, 'family A line count');
   assert.equal(r.familyB.length, 8, 'family B line count');
   assert.ok(Math.abs(r.info.spacingA - 80) < 1, `pitch A ~80, got ${r.info.spacingA}`);
@@ -65,7 +69,7 @@ test('recovers a straight (unrotated) full grid', () => {
 test('recovers a rotated grid (any orientation)', () => {
   for (const rot of [12, 30, 47, 63, 88]) {
     const raw = syntheticGrid({ W: 1200, H: 900, s: 60, n: 9, rotDeg: rot });
-    const r = buildGrid(raw, 1, 1200, 900, DEFAULT_PARAMS);
+    const r = buildGrid(raw, 1, 1200, 900, NO_EXTEND);
     assert.equal(r.familyA.length, 9, `rot ${rot}: family A count`);
     assert.equal(r.familyB.length, 9, `rot ${rot}: family B count`);
     assert.ok(
@@ -79,7 +83,7 @@ test('fills occluded interior lines', () => {
   // Drop interior lines 3,4,5 from one family -> the fill must recreate them.
   // (Result family labels are by dominance, so assert order-independently.)
   const raw = syntheticGrid({ W: 1000, H: 1000, s: 80, n: 8, rotDeg: 20, drop: [3, 4, 5] });
-  const r = buildGrid(raw, 1, 1000, 1000, DEFAULT_PARAMS);
+  const r = buildGrid(raw, 1, 1000, 1000, NO_EXTEND);
   assert.equal(r.familyA.length, 8, 'family A back to 8 lines');
   assert.equal(r.familyB.length, 8, 'family B back to 8 lines');
   const filledTotal =
@@ -89,7 +93,7 @@ test('fills occluded interior lines', () => {
 
 test('does not fill when disabled', () => {
   const raw = syntheticGrid({ W: 1000, H: 1000, s: 80, n: 8, rotDeg: 0, drop: [3, 4, 5] });
-  const r = buildGrid(raw, 1, 1000, 1000, { ...DEFAULT_PARAMS, fillGrid: false });
+  const r = buildGrid(raw, 1, 1000, 1000, { ...NO_EXTEND, fillGrid: false });
   const counts = [r.familyA.length, r.familyB.length].sort((a, b) => a - b);
   assert.deepEqual(counts, [5, 8], 'no interpolation -> 5 detected + 8 detected');
 });
@@ -97,7 +101,7 @@ test('does not fill when disabled', () => {
 test('respects downscale factor for pitch reported in original coords', () => {
   // scale 0.5 means working coords are half size; reported spacing is /scale.
   const raw = syntheticGrid({ W: 500, H: 500, s: 40, n: 6, rotDeg: 0 });
-  const r = buildGrid(raw, 0.5, 1000, 1000, DEFAULT_PARAMS);
+  const r = buildGrid(raw, 0.5, 1000, 1000, NO_EXTEND);
   assert.ok(Math.abs(r.info.spacingA - 80) < 2, `pitch scaled to 80, got ${r.info.spacingA}`);
 });
 
@@ -137,7 +141,7 @@ test('rejects spurious lines that are not part of the regular grid', () => {
   raw.push({ rho: 980, thetaDeg: 0 });
   raw.push({ rho: 400, thetaDeg: 45 });
 
-  const r = buildGrid(raw, 1, 1000, 750, { ...DEFAULT_PARAMS });
+  const r = buildGrid(raw, 1, 1000, 750, NO_EXTEND);
   const det = (fam: Line2[]) => fam.filter((l) => !l.filled).length;
   const counts = [det(r.familyA), det(r.familyB)].sort((a, b) => a - b);
   assert.deepEqual(counts, [11, 11], 'keeps 11+11 real lines, drops the spurious');
@@ -159,8 +163,51 @@ test('reconstructs the lattice, rejecting off-lattice lines at the grid angle', 
   raw.push({ rho: 345, thetaDeg: 0 }); // mid-cell between 310 and 380
   raw.push({ rho: 615, thetaDeg: 0 }); // just off the 590/660 nodes
 
-  const r = buildGrid(raw, 1, 1000, 750, { ...DEFAULT_PARAMS });
+  const r = buildGrid(raw, 1, 1000, 750, NO_EXTEND);
   const det = (fam: Line2[]) => fam.filter((l) => !l.filled).length;
   const counts = [det(r.familyA), det(r.familyB)].sort((a, b) => a - b);
   assert.deepEqual(counts, [10, 10], 'keeps the 10+10 lattice, drops both off-lattice lines');
+});
+
+test('frame extension tiles the grid beyond the detected extent', () => {
+  // A small centred grid: 'frame' must continue the lattice out to the image edges.
+  const raw = syntheticGrid({ W: 1000, H: 1000, s: 80, n: 6, rotDeg: 0 });
+  const off = buildGrid(raw, 1, 1000, 1000, { ...DEFAULT_PARAMS, extend: 'off' });
+  const frame = buildGrid(raw, 1, 1000, 1000, { ...DEFAULT_PARAMS, extend: 'frame' });
+
+  assert.ok(frame.familyA.length > off.familyA.length, 'frame adds lines to family A');
+  assert.ok(frame.familyB.length > off.familyB.length, 'frame adds lines to family B');
+  // The extra lines are flagged as extended (so the UI can draw them faint)…
+  const extra = frame.familyA.filter((l) => l.extended);
+  assert.ok(extra.length > 0, 'extended lines are flagged');
+  assert.ok(
+    extra.every((l) => l.filled),
+    'extended lines are also marked filled (drawn faint)',
+  );
+  // …every line still crosses the frame, and the pitch is preserved.
+  for (const l of frame.familyA) {
+    assert.ok(clipLineToRect(l, 1000, 1000), 'every family-A line crosses the frame');
+  }
+  assert.ok(Math.abs(frame.info.spacingA - 80) < 1.5, `pitch preserved, got ${frame.info.spacingA}`);
+});
+
+test('border extension adds only a couple of cells per side', () => {
+  // Plenty of margin around the grid, so extension is bounded by the cell cap,
+  // not the frame — 'border' must add at most ~2 per side, far fewer than 'frame'.
+  const raw = syntheticGrid({ W: 2000, H: 2000, s: 80, n: 6, rotDeg: 0 });
+  const off = buildGrid(raw, 1, 2000, 2000, { ...DEFAULT_PARAMS, extend: 'off' });
+  const border = buildGrid(raw, 1, 2000, 2000, { ...DEFAULT_PARAMS, extend: 'border' });
+  const frame = buildGrid(raw, 1, 2000, 2000, { ...DEFAULT_PARAMS, extend: 'frame' });
+
+  const addedA = border.familyA.length - off.familyA.length;
+  assert.ok(addedA > 0, 'border extends the grid');
+  assert.ok(addedA <= 4, `border adds at most 2 per side, got ${addedA}`);
+  assert.ok(
+    border.familyA.length < frame.familyA.length,
+    'border adds fewer lines than frame',
+  );
+  assert.ok(
+    border.familyA.filter((l) => l.extended).length === addedA,
+    'the added lines are exactly the extended ones',
+  );
 });

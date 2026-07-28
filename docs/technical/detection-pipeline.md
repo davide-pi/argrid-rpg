@@ -50,11 +50,19 @@ Works in **image-centred** coordinates for numerical stability (`:458`), then ma
    **global integer index** `round((off − a) / b)` (not a running sum, so one
    off-lattice line can't shift the rest), iterative LSQ refit with inlier reject
    (`:761`), then rebuild every row/column from `kmin…kmax`.
-6. **Rebuild occluded rows/cols** — missing indices are emitted as `filled: true` lines
-   when `fillGrid` and the span ≤ 200 (`grid-detector.ts:798`). Detected lines are
+6. **Rebuild occluded rows/cols** — missing indices between `kmin…kmax` are emitted as
+   `filled: true` lines when `fillGrid` and the span ≤ 200. Detected lines are
    `filled: false`.
-7. **Map back into the image** — `fromCentered` (`:465`) + `backToImage` (`:687`); the
-   result carries `familyA`, `familyB`, `rawLines`, and `info`.
+7. **Extrapolate past the detected extent** (`extend`) — continue the same lattice
+   `a + b·k` OUTWARD from `kmin`/`kmax`, mapped back through the homography. Each
+   candidate is kept only while it still crosses the image frame (`crossesImage`) and
+   until successive lines crowd to within `EXTEND_MIN_GAP_PX` px at the image centre
+   (they pile up toward a vanishing point). `'border'` adds ≤ `EXTEND_BORDER_CELLS` (2)
+   cells per side (recovers an outer edge the detector missed); `'frame'` tiles the whole
+   frame (a virtual grid, cap `EXTEND_FRAME_CELLS` = 120). Extended lines are flagged
+   `extended: true` **and** `filled: true`, so they draw faint (0.5α). `'off'` skips this.
+8. **Map back into the image** — `fromCentered` (propagates `filled`/`extended`) +
+   `backToImage`; the result carries `familyA`, `familyB`, `rawLines`, and `info`.
 
 ### The 0/180° rho-wrap (do not average raw rho)
 
@@ -74,13 +82,17 @@ exact synthetic θ do **not** catch it — only real Hough output does.
 | `mergeFrac` | `0.012` | Offset merge distance as a fraction of `maxDim` (`:491`). |
 | `fillGrid` | `true` | Emit occluded rows/cols as `filled` lines (`:798`). UI forces this on (`main.ts:233`). |
 | `focusGating` | `false` | Suppress out-of-focus edges before Hough. Off — it erased faint/hand-drawn grids. |
-| `reconstruct` | `true` | Rebuild the regular lattice and drop off-lattice lines; if off, only detected offsets are used (`:735`). |
+| `reconstruct` | `true` | Rebuild the regular lattice and drop off-lattice lines; if off, only detected offsets are used. |
+| `lineMorph` | `true` | Noisy/low-contrast fallback (grid on dirt/cork): if the plain Canny path detects `< 3` lines per family, retry on a morphological line mask (`enhanceGridLines`) and keep it if it detects more. Strength is counted from **detected** lines only, so fill/extension can't mask a weak detection. |
+| `extend` | `'frame'` | Extrapolate the fitted lattice past the detected lines (step 7): `'off'` none, `'border'` a couple of cells to recover a missed outer edge, `'frame'` tile the whole frame (virtual grid). |
 
 ## `GridResult.info` (diagnostics, `grid-detector.ts:52`)
 
 `rawCount`, `aCount`, `bCount`, `angleADeg/BDeg`, `spacingA/B` (px, original coords),
 `usedHough` (settled threshold), `cannyHigh` (from Otsu), `edgePixels`. Surfaced in the
-status line when `debug` is on (`main.ts:382`).
+status line when `debug` is on (`main.ts:382`). Note `aCount`/`bCount` are the **total**
+family sizes (detected + filled + extended); the `lineMorph` fallback gates on
+detected-only counts instead, so extension never suppresses it.
 
 ## Debug output (edges + raw Hough lines)
 

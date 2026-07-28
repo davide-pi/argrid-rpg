@@ -34,6 +34,13 @@ export interface DetectorParams {
    * if the plain Canny pipeline finds no grid, retry with a morphological line
    * extractor that suppresses isotropic texture and keeps long thin lines. */
   lineMorph: boolean;
+  /** Extrapolate the fitted lattice PAST the detected lines, continuing the same
+   * pitch/orientation, bounded by the image frame:
+   *   'off'    — only detected + interior-filled lines
+   *   'border' — a few cells beyond the detected extent, to recover an outer
+   *              border the detector missed (e.g. a colour-only map edge)
+   *   'frame'  — tile the whole frame with the inferred grid (virtual grid) */
+  extend: 'off' | 'border' | 'frame';
 }
 
 export const DEFAULT_PARAMS: DetectorParams = {
@@ -44,6 +51,7 @@ export const DEFAULT_PARAMS: DetectorParams = {
   focusGating: false,
   reconstruct: true,
   lineMorph: true,
+  extend: 'frame',
 };
 
 /** A line as normal form: nx*x + ny*y = d, with (nx,ny) a unit vector. */
@@ -52,6 +60,7 @@ export interface Line2 {
   ny: number;
   d: number;
   filled?: boolean; // true if interpolated rather than detected
+  extended?: boolean; // true if extrapolated BEYOND the detected extent (see extend)
 }
 
 export interface GridResult {
@@ -225,7 +234,10 @@ export function detectGridFromMat(
   // When Canny drowns in background texture (a grid drawn on dirt/cork), it finds
   // no grid. Retry with the morphological line extractor and keep it if it does
   // better. Costs an extra pass only when the plain pipeline already failed.
-  const strength = (r: GridResult) => Math.min(r.info.aCount, r.info.bCount);
+  // Count only DETECTED lines (not interior-filled or extrapolated ones), so a
+  // weak detection can't be masked by fill/extension and skip the fallback.
+  const detected = (fam: Line2[]) => fam.reduce((n, l) => n + (l.filled ? 0 : 1), 0);
+  const strength = (r: GridResult) => Math.min(detected(r.familyA), detected(r.familyB));
   if (params.lineMorph && strength(result) < 3) {
     const morphEdges = enhanceGridLines(cv, gray);
     const alt = houghToGrid(cv, morphEdges, work, scale, W0, H0, params);
@@ -578,6 +590,7 @@ export function buildGrid(
     ny: l.ny,
     d: l.d + l.nx * cx + l.ny * cy,
     filled: l.filled,
+    extended: l.extended,
   });
 
   // --- Split into two families by nearest orientation (no discard) ------
@@ -610,9 +623,12 @@ export function buildGrid(
   const inB = vB.inliers.map((k) => mB[k]);
 
   // --- Rectify with the horizon, then fit + rebuild the lattice ---------
+  // Extension works in the centred coordinate frame used for fitting; a line
+  // is worth extrapolating only while it still crosses the actual image frame.
+  const crossesImage = (l: Line2): boolean => !!clipLineToRect(fromCentered(l), W0, H0);
   const H = buildRectify(vA.vp, vB.vp);
-  const A = fitFamilyGrid(inA, H, params);
-  const B = fitFamilyGrid(inB, H, params);
+  const A = fitFamilyGrid(inA, H, params, crossesImage);
+  const B = fitFamilyGrid(inB, H, params, crossesImage);
 
   const familyA = A.lines.map(fromCentered);
   const familyB = B.lines.map(fromCentered);
@@ -786,13 +802,30 @@ const robustCell = (xs: number[]): number => {
   return single.length ? median(single) : gm;
 };
 
+/** Conservative extension: how many cells past the detected extent 'border' may
+ * add (recovers an undetected outer border; bounded by the image frame). */
+const EXTEND_BORDER_CELLS = 2;
+/** Aggressive extension safety cap for 'frame' (the frame/crowding guards stop
+ * it far sooner in practice). */
+const EXTEND_FRAME_CELLS = 120;
+/** Stop extrapolating when successive lines crowd to within this many px at the
+ * image centre — i.e. they are piling up toward a vanishing point. */
+const EXTEND_MIN_GAP_PX = 3;
+
 /**
  * Fit ONE family's regular lattice in the rectified plane (where its lines are
  * parallel and evenly spaced) and rebuild the complete set of lines, mapping
  * them back into the image. `inLines` are the family's concurrent lines (merged,
  * with support) in centred image coordinates; `H` is the rectifying homography.
+ * `crossesImage` tests (in the same centred frame) whether a line still meets the
+ * image, so extrapolation stops at the frame.
  */
-function fitFamilyGrid(inLines: LineSup[], H: M3, params: DetectorParams): FamilyGrid {
+function fitFamilyGrid(
+  inLines: LineSup[],
+  H: M3,
+  params: DetectorParams,
+  crossesImage: (l: Line2) => boolean,
+): FamilyGrid {
   const HinvT = transpose3(inv3(H) ?? IDENTITY3);
   const HT = transpose3(H);
   const backToImage = (offset: number, nx: number, ny: number, filled: boolean): Line2 =>
@@ -907,12 +940,46 @@ function fitFamilyGrid(inLines: LineSup[], H: M3, params: DetectorParams): Famil
   const kmin = Math.min(...detectedIdx);
   const kmax = Math.max(...detectedIdx);
   const canFill = params.fillGrid && kmax - kmin <= 200;
-  const out: Line2[] = [];
+  const core: Line2[] = [];
   for (let k = kmin; k <= kmax; k++) {
-    if (detectedIdx.has(k)) out.push(backToImage(a + b * k, meanNx, meanNy, false));
-    else if (canFill) out.push(backToImage(a + b * k, meanNx, meanNy, true));
+    if (detectedIdx.has(k)) core.push(backToImage(a + b * k, meanNx, meanNy, false));
+    else if (canFill) core.push(backToImage(a + b * k, meanNx, meanNy, true));
   }
-  return finalize(out);
+
+  // --- Extrapolate the lattice past the detected extent -----------------
+  // The fitted lattice is just the arithmetic progression a + b·k, so extra
+  // rows/columns are its natural continuation. Extend outward from each end,
+  // stopping when a line leaves the image frame or successive lines crowd toward
+  // a vanishing point; 'border' adds only a few cells (to recover an undetected
+  // outer edge), 'frame' tiles the whole frame. Extended lines are flagged and
+  // drawn faint, since they lie beyond any detected evidence.
+  const cap =
+    params.extend === 'frame'
+      ? EXTEND_FRAME_CELLS
+      : params.extend === 'border'
+        ? EXTEND_BORDER_CELLS
+        : 0;
+  const lo: Line2[] = [];
+  const hi: Line2[] = [];
+  if (cap > 0 && core.length >= 2) {
+    const extendFrom = (startK: number, step: number, out: Line2[]): void => {
+      // (nx,ny) is constant across offsets for this family, so |Δd| at the image
+      // centre is exactly the perpendicular gap — a clean crowding test.
+      let prev = backToImage(a + b * startK, meanNx, meanNy, false);
+      for (let n = 1; n <= cap; n++) {
+        const line = backToImage(a + b * (startK + step * n), meanNx, meanNy, true);
+        line.extended = true;
+        if (!crossesImage(line)) break;
+        if (Math.abs(line.d - prev.d) < EXTEND_MIN_GAP_PX) break;
+        out.push(line);
+        prev = line;
+      }
+    };
+    extendFrom(kmax, +1, hi);
+    extendFrom(kmin, -1, lo);
+    lo.reverse(); // back to ascending-k order
+  }
+  return finalize([...lo, ...core, ...hi]);
 }
 
 function median(xs: number[]): number {

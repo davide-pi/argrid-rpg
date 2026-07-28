@@ -125,6 +125,24 @@ perspective**.
 Implement incrementally, keep only what improves the benchmark (re-labelled by the user), never
 regress the 3 currently-correct.
 
+## Prototype results (FFT prior, 2026-07-28, in-harness — not yet in the pipeline)
+A browser-harness prototype of the FFT prior (gradient-magnitude input, Hann window, aspect-
+preserving square pad, spectral high-pass = subtract a heavily-blurred spectrum, then joint
+selection of two ~orthogonal equal-pitch peak families):
+- **Orientation is reliable.** `test_2` matched the correct grid almost exactly (22.6°/112° pitch
+  ~33); `test_3`/`test_15` got a correct family orientation; crucially **`test_6` DISAGREED with the
+  wrong 45° fit** and found the true near-H/V tile orientation → the FFT prior would fix the 45°
+  distractor trap.
+- **Pitch needs a "fundamental, not harmonic" fix.** It sometimes locks onto a high harmonic
+  (`test_3`: pitch 8 vs the real 69). Fix: per direction, pick the **lowest-frequency strong peak**
+  (largest period) / take the GCD of the harmonic radii, not the strongest peak.
+- **`test_5` stays ambiguous** — FFT agrees with its (wrong) fine-grid detection; it's wrong for a
+  subtler reason (likely detecting the fine graph ruling vs the intended coarser grid), so the FFT
+  prior alone won't fix it; the lattice-consistency score / a coarser-grid preference is needed.
+Next: fundamental-pitch selection → use the prior to **angle-gate Hough + seed the lattice pitch** →
+re-fit → re-label a gallery. The pieces (`dft`, `Sobel`, `copyMakeBorder`, `multiply`, quadrant-swap
+fftshift, JS peak-finding) all work in opencv.js.
+
 ## Sources
 Two research syntheses are in this session's history; key references: deformed-lattice detection
 (Park & Liu), Geiger corner prototypes / libcbdetect, findChessboardCornersSB (checkerboard only —

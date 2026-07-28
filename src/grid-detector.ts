@@ -508,39 +508,53 @@ const CHROMA_MIN_STD = 3;
  */
 function chromaEdges(cv: any, work: any): any {
   const out = cv.Mat.zeros(work.rows, work.cols, cv.CV_8U);
-  const rgb = new cv.Mat();
-  cv.cvtColor(work, rgb, cv.COLOR_RGBA2RGB);
-  const lab = new cv.Mat();
-  cv.cvtColor(rgb, lab, cv.COLOR_RGB2Lab);
-  rgb.delete();
-  const chans = new cv.MatVector();
-  cv.split(lab, chans);
-  lab.delete();
-  for (const idx of [1, 2]) {
-    // a (1) and b (2) are the chroma channels; L (0) is luminance, already used.
-    const ch = chans.get(idx);
-    const me = new cv.Mat();
-    const st = new cv.Mat();
-    cv.meanStdDev(ch, me, st);
-    const sigma = st.data64F[0];
-    me.delete();
-    st.delete();
-    if (sigma >= CHROMA_MIN_STD) {
-      const blur = new cv.Mat();
-      cv.GaussianBlur(ch, blur, new cv.Size(3, 3), 0);
-      const otsuTmp = new cv.Mat();
-      const otsu = cv.threshold(blur, otsuTmp, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-      otsuTmp.delete();
-      const e = new cv.Mat();
-      cv.Canny(blur, e, Math.max(1, Math.round(0.5 * otsu)), Math.max(1, Math.round(otsu)));
-      cv.max(out, e, out);
-      blur.delete();
-      e.delete();
+  // Free the longer-lived temporaries in finally so a cv.* throw can't leak them.
+  let rgb: any = null;
+  let lab: any = null;
+  let chans: any = null;
+  try {
+    rgb = new cv.Mat();
+    cv.cvtColor(work, rgb, cv.COLOR_RGBA2RGB);
+    lab = new cv.Mat();
+    cv.cvtColor(rgb, lab, cv.COLOR_RGB2Lab);
+    rgb.delete();
+    rgb = null;
+    chans = new cv.MatVector();
+    cv.split(lab, chans);
+    lab.delete();
+    lab = null;
+    for (const idx of [1, 2]) {
+      // a (1) and b (2) are the chroma channels; L (0) is luminance, already used.
+      const ch = chans.get(idx);
+      try {
+        const me = new cv.Mat();
+        const st = new cv.Mat();
+        cv.meanStdDev(ch, me, st);
+        const sigma = st.data64F[0];
+        me.delete();
+        st.delete();
+        if (sigma >= CHROMA_MIN_STD) {
+          const blur = new cv.Mat();
+          cv.GaussianBlur(ch, blur, new cv.Size(3, 3), 0);
+          const otsuTmp = new cv.Mat();
+          const otsu = cv.threshold(blur, otsuTmp, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+          otsuTmp.delete();
+          const e = new cv.Mat();
+          cv.Canny(blur, e, Math.max(1, Math.round(0.5 * otsu)), Math.max(1, Math.round(otsu)));
+          cv.max(out, e, out);
+          blur.delete();
+          e.delete();
+        }
+      } finally {
+        ch.delete();
+      }
     }
-    ch.delete();
+    return out;
+  } finally {
+    if (rgb) rgb.delete();
+    if (lab) lab.delete();
+    if (chans) chans.delete();
   }
-  chans.delete();
-  return out;
 }
 
 /**

@@ -140,10 +140,14 @@ const camera = new Camera(video);
 // so the gesture only turns/moves that thing.
 let ringRotating = false;
 let dragKind: 'origin' | 'target' | 'piece' | null = null;
-// Manual-grid editing: which handle is being dragged (0..3 corner, 4 = translate).
+// Manual-grid editing: which handle is being dragged (0..3 corner, 4 = translate,
+// 5 = tracing a line, 6 = pinch-resize). `manualActive` is true throughout manual
+// editing so the whole gesture surface (incl. image pinch-zoom) is handed to the
+// grid editor instead of the zoom controller.
 let manualDrag: number | null = null;
+let manualActive = false;
 const zoom = attachZoomPan(view, {
-  suppress: () => ringRotating || dragKind !== null || manualDrag !== null,
+  suppress: () => ringRotating || dragKind !== null || manualDrag !== null || manualActive,
 });
 let cv: any = null;
 let lastCapture: HTMLCanvasElement | null = null;
@@ -155,9 +159,6 @@ let showingResult = false; // true while a captured photo + overlay is shown
 // (retake / manual grid) is shown over the photo instead. A manual grid sets
 // this true. See MIN_GRID_CONFIDENCE.
 let gridReliable = false;
-// True while the user is editing a manual grid (so the fallback panel stays hidden
-// over it). Set by the manual-grid editor.
-let manualActive = false;
 
 // Tactical state.
 let gridMap: GridMap | null = null; // grid<->image mapping for the current grid
@@ -516,6 +517,10 @@ let manualStrokes: [ImgPt, ImgPt][] = []; // traced reference lines (image coord
 let strokeStart: ImgPt | null = null; // in-progress stroke endpoints
 let strokeEnd: ImgPt | null = null;
 const DRAW_SENTINEL = 5; // manualDrag value while tracing a line
+const PINCH_SENTINEL = 6; // manualDrag value while pinch-resizing the grid
+// Live pointer positions (image coords) during manual editing, for pinch.
+const manualPointerPos = new Map<number, ImgPt>();
+let pinchState: { startDist: number; startQuad: ImgPt[]; center: ImgPt } | null = null;
 
 /** Client → image-pixel coordinates (accounts for CSS sizing + the zoom transform,
  * since the canvas backing store is in image pixels). */
@@ -743,6 +748,8 @@ function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
   manualStrokes = [];
   strokeStart = null;
   strokeEnd = null;
+  manualPointerPos.clear();
+  pinchState = null;
   setManualHint();
   applyManualBarMode();
   updateManualBar();
@@ -820,6 +827,8 @@ function exitManualMode(keep: boolean) {
   manualStrokes = [];
   strokeStart = null;
   strokeEnd = null;
+  manualPointerPos.clear();
+  pinchState = null;
   manualBar.classList.remove('draw-mode');
   showManualBar(false);
   if (keep) {
@@ -843,14 +852,30 @@ function updateEditGridButton() {
 
 // Pointer gestures while editing a manual grid (routed from the map handlers).
 function manualPointerDown(e: PointerEvent) {
+  const p = pointerToImage(e.clientX, e.clientY);
+  if (!p) return;
+  manualPointerPos.set(e.pointerId, p);
+  activePointers.add(e.pointerId);
+
+  // Two fingers on an adjustable quad → pinch-resize the grid about its centre.
+  if (manualPointerPos.size === 2 && !manualDrawPending && manualQuad) {
+    const [a, b] = [...manualPointerPos.values()];
+    const cx = (manualQuad[0].x + manualQuad[1].x + manualQuad[2].x + manualQuad[3].x) / 4;
+    const cy = (manualQuad[0].y + manualQuad[1].y + manualQuad[2].y + manualQuad[3].y) / 4;
+    pinchState = {
+      startDist: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)),
+      startQuad: manualQuad.map((c) => ({ ...c })),
+      center: { x: cx, y: cy },
+    };
+    manualDrag = PINCH_SENTINEL;
+    return;
+  }
+  if (manualPointerPos.size !== 1) {
+    manualDrag = null; // a 3rd finger / can't-pinch state → cancel the current drag
+    return;
+  }
+
   if (manualDrawPending) {
-    activePointers.add(e.pointerId);
-    if (activePointers.size !== 1) {
-      manualDrag = null;
-      return;
-    }
-    const p = pointerToImage(e.clientX, e.clientY);
-    if (!p) return;
     strokeStart = p;
     strokeEnd = p;
     manualDrag = DRAW_SENTINEL;
@@ -858,13 +883,6 @@ function manualPointerDown(e: PointerEvent) {
     return;
   }
   if (!manualQuad) return;
-  activePointers.add(e.pointerId);
-  if (activePointers.size !== 1) {
-    manualDrag = null; // second finger → let the zoom controller pinch/pan
-    return;
-  }
-  const p = pointerToImage(e.clientX, e.clientY);
-  if (!p) return;
   const r = manualHandleRadius();
   let hit = -1;
   for (let i = 0; i < 4; i++) {
@@ -880,17 +898,31 @@ function manualPointerDown(e: PointerEvent) {
   capturePointer(e.pointerId);
 }
 function manualPointerMove(e: PointerEvent) {
+  const p = pointerToImage(e.clientX, e.clientY);
+  if (!p) return;
+  if (manualPointerPos.has(e.pointerId)) manualPointerPos.set(e.pointerId, p);
+
+  if (manualDrag === PINCH_SENTINEL) {
+    if (!pinchState) return;
+    const pts = [...manualPointerPos.values()];
+    if (pts.length < 2) return;
+    e.preventDefault();
+    const s = Math.max(1, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y)) / pinchState.startDist;
+    const ctr = pinchState.center;
+    manualQuad = pinchState.startQuad.map((c) => ({
+      x: ctr.x + (c.x - ctr.x) * s,
+      y: ctr.y + (c.y - ctr.y) * s,
+    }));
+    applyManual();
+    return;
+  }
   if (manualDrag === DRAW_SENTINEL) {
-    const p = pointerToImage(e.clientX, e.clientY);
-    if (!p) return;
     e.preventDefault();
     strokeEnd = p;
     draw();
     return;
   }
   if (manualDrag === null || !manualQuad || !manualDragLast) return;
-  const p = pointerToImage(e.clientX, e.clientY);
-  if (!p) return;
   e.preventDefault();
   if (manualDrag < 4) {
     manualQuad[manualDrag] = p;
@@ -906,7 +938,15 @@ function manualPointerMove(e: PointerEvent) {
   applyManual();
 }
 function manualPointerUp(e: PointerEvent) {
+  manualPointerPos.delete(e.pointerId);
   activePointers.delete(e.pointerId);
+  if (manualDrag === PINCH_SENTINEL) {
+    if (manualPointerPos.size < 2) {
+      pinchState = null;
+      manualDrag = null;
+    }
+    return;
+  }
   if (manualDrag === DRAW_SENTINEL) {
     manualDrag = null;
     if (strokeStart && strokeEnd && Math.hypot(strokeEnd.x - strokeStart.x, strokeEnd.y - strokeStart.y) >= 12) {

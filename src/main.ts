@@ -3,12 +3,14 @@ import { Camera } from './camera';
 import {
   detectGrid,
   detectGridSteps,
+  buildGrid,
   clipLineToRect,
   intersect,
   DEFAULT_PARAMS,
   type DetectorParams,
   type GridResult,
   type Line2,
+  type RawLine,
 } from './grid-detector';
 import { attachZoomPan } from './zoom';
 import {
@@ -93,6 +95,7 @@ const manualDone = $<HTMLButtonElement>('manualDone');
 const manualCancel = $<HTMLButtonElement>('manualCancel');
 const manualCollapse = $<HTMLButtonElement>('manualCollapse');
 const manualHint = $<HTMLParagraphElement>('manualHint');
+const manualReset = $<HTMLButtonElement>('manualReset');
 
 // Debug has no on-screen switch — it's a hidden state toggled by triple-tapping
 // the logo. When on, detection draws its edge/line diagnostics and a verbose status.
@@ -506,12 +509,13 @@ let manualNa = 10; // cells along the top/bottom edge (columns)
 let manualNb = 10; // cells along the left/right edge (rows)
 let manualDragLast: ImgPt | null = null;
 let manualCollapsed = false; // the editor bar can collapse to free the corners under it
-// "Draw a cell" mode: before the quad exists, the user drags one cell and the grid
-// is tiled/expanded from it across the frame.
+// "Draw by hand" mode: the user TRACES reference lines along columns and rows, and
+// the grid is generated from them (buildGrid: family split + fit + extend to frame).
 let manualDrawPending = false;
-let drawCellStart: ImgPt | null = null;
-let drawCellEnd: ImgPt | null = null;
-const DRAW_SENTINEL = 5; // manualDrag value while drawing the seed cell
+let manualStrokes: [ImgPt, ImgPt][] = []; // traced reference lines (image coords)
+let strokeStart: ImgPt | null = null; // in-progress stroke endpoints
+let strokeEnd: ImgPt | null = null;
+const DRAW_SENTINEL = 5; // manualDrag value while tracing a line
 
 /** Client → image-pixel coordinates (accounts for CSS sizing + the zoom transform,
  * since the canvas backing store is in image pixels). */
@@ -715,8 +719,15 @@ function manualDefaultQuad() {
 
 function setManualHint() {
   manualHint.textContent = manualDrawPending
-    ? 'Disegna una cella trascinando sulla mappa: la griglia si espande da lì.'
+    ? 'Traccia linee lungo le colonne e le righe (almeno 2 per verso): la griglia si genera da sole.'
     : 'Trascina gli angoli per adattare la griglia · trascina il centro per spostarla.';
+}
+
+// Draw-mode bar variant: hide the cell steppers (the grid comes from the traced
+// lines) and show the "clear lines" button instead.
+function applyManualBarMode() {
+  manualBar.classList.toggle('draw-mode', manualDrawPending);
+  manualReset.hidden = !manualDrawPending;
 }
 
 function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
@@ -729,13 +740,15 @@ function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
   hideToast();
   manualCollapsed = false;
   manualDrawPending = mode === 'draw';
-  drawCellStart = null;
-  drawCellEnd = null;
+  manualStrokes = [];
+  strokeStart = null;
+  strokeEnd = null;
   setManualHint();
+  applyManualBarMode();
   updateManualBar();
   showManualBar(true);
   if (manualDrawPending) {
-    // No grid yet — wait for the user to drag one cell. Show the photo alone.
+    // No grid yet — wait for the user to trace lines. Show the photo alone.
     manualQuad = null;
     gridReliable = false;
     gridMap = null;
@@ -748,56 +761,69 @@ function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
   }
 }
 
-/** Turn the single dragged cell into a grid that tiles the whole frame. */
-function finalizeDrawnCell() {
-  if (!drawCellStart || !drawCellEnd || !lastResult) return;
-  const x0 = Math.min(drawCellStart.x, drawCellEnd.x);
-  const x1 = Math.max(drawCellStart.x, drawCellEnd.x);
-  const y0 = Math.min(drawCellStart.y, drawCellEnd.y);
-  const y1 = Math.max(drawCellStart.y, drawCellEnd.y);
-  const cw = x1 - x0;
-  const ch = y1 - y0;
-  if (cw < 8 || ch < 8) return; // too small to be a real cell — ignore the drag
-  const W = lastResult.width;
-  const H = lastResult.height;
-  // Tile the drawn cell outward to cover the frame (axis-aligned); the user then
-  // rotates / skews via the corner handles if the map isn't square-on.
-  const nLeft = Math.min(MANUAL_MAX_CELLS, Math.ceil(x0 / cw));
-  const nRight = Math.min(MANUAL_MAX_CELLS, Math.ceil((W - x1) / cw));
-  const nUp = Math.min(MANUAL_MAX_CELLS, Math.ceil(y0 / ch));
-  const nDown = Math.min(MANUAL_MAX_CELLS, Math.ceil((H - y1) / ch));
-  const na = Math.min(MANUAL_MAX_CELLS, nLeft + 1 + nRight);
-  const nb = Math.min(MANUAL_MAX_CELLS, nUp + 1 + nDown);
-  const ox = x0 - nLeft * cw;
-  const oy = y0 - nUp * ch;
-  manualQuad = [
-    { x: ox, y: oy },
-    { x: ox + na * cw, y: oy },
-    { x: ox + na * cw, y: oy + nb * ch },
-    { x: ox, y: oy + nb * ch },
-  ];
-  manualNa = na;
-  manualNb = nb;
-  manualDrawPending = false;
-  setManualHint();
-  updateManualBar();
-  applyManual();
+/** A traced stroke → a RawLine (rho, thetaDeg) in image coords for buildGrid. */
+function strokeToRaw(p1: ImgPt, p2: ImgPt): RawLine {
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  // Normal (nx,ny) = (-dy, dx); its angle in [0,180).
+  let thetaDeg = (Math.atan2(dx, -dy) * 180) / Math.PI;
+  thetaDeg = ((thetaDeg % 180) + 180) % 180;
+  const nx = Math.cos((thetaDeg * Math.PI) / 180);
+  const ny = Math.sin((thetaDeg * Math.PI) / 180);
+  return { rho: nx * p1.x + ny * p1.y, thetaDeg };
+}
+
+/** Generate the grid from the traced lines (buildGrid does the family split, VP,
+ * lattice fit and frame extension). Needs ≥2 lines in each of the two directions. */
+function regenerateFromStrokes() {
+  if (!lastResult) return;
+  if (manualStrokes.length < 2) {
+    gridReliable = false;
+    gridMap = null;
+    draw();
+    return;
+  }
+  const raw = manualStrokes.map(([a, b]) => strokeToRaw(a, b));
+  const res = buildGrid(raw, 1, lastResult.width, lastResult.height, {
+    ...DEFAULT_PARAMS,
+    extend: 'frame',
+  });
+  if (res.familyA.length >= 2 && res.familyB.length >= 2) {
+    lastResult.familyA = res.familyA;
+    lastResult.familyB = res.familyB;
+    gridMap = makeGridMap(res.familyA, res.familyB);
+    gridReliable = !!gridMap;
+    gridDims = { na: res.familyA.length, nb: res.familyB.length };
+  } else {
+    gridReliable = false;
+    gridMap = null;
+  }
+  draw();
 }
 
 /** Leave manual editing. keep=true commits the grid; false discards it (back to the
  * fallback panel). */
 function exitManualMode(keep: boolean) {
-  // Nothing to commit if the user hit "Fatto" before drawing a cell.
-  if (keep && (!manualQuad || !gridMap)) keep = false;
+  if (keep) {
+    if (manualDrawPending) {
+      // Draw mode: keep the grid generated from the traced lines (already extended).
+      if (!gridReliable || !gridMap) keep = false;
+    } else if (!manualQuad || !gridMap) {
+      keep = false; // nothing to commit
+    }
+  }
+  const wasDraw = manualDrawPending;
   manualActive = false;
   manualDrag = null;
   manualDragLast = null;
   manualDrawPending = false;
-  drawCellStart = null;
-  drawCellEnd = null;
+  manualStrokes = [];
+  strokeStart = null;
+  strokeEnd = null;
+  manualBar.classList.remove('draw-mode');
   showManualBar(false);
   if (keep) {
-    commitManualGrid(); // extend the drawn quad to fill the whole frame
+    if (!wasDraw) commitManualGrid(); // adjust mode: extend the drawn quad to frame
     fabWrap.hidden = false;
   } else {
     manualQuad = null;
@@ -825,8 +851,8 @@ function manualPointerDown(e: PointerEvent) {
     }
     const p = pointerToImage(e.clientX, e.clientY);
     if (!p) return;
-    drawCellStart = p;
-    drawCellEnd = p;
+    strokeStart = p;
+    strokeEnd = p;
     manualDrag = DRAW_SENTINEL;
     capturePointer(e.pointerId);
     return;
@@ -858,7 +884,7 @@ function manualPointerMove(e: PointerEvent) {
     const p = pointerToImage(e.clientX, e.clientY);
     if (!p) return;
     e.preventDefault();
-    drawCellEnd = p;
+    strokeEnd = p;
     draw();
     return;
   }
@@ -883,26 +909,37 @@ function manualPointerUp(e: PointerEvent) {
   activePointers.delete(e.pointerId);
   if (manualDrag === DRAW_SENTINEL) {
     manualDrag = null;
-    finalizeDrawnCell();
+    if (strokeStart && strokeEnd && Math.hypot(strokeEnd.x - strokeStart.x, strokeEnd.y - strokeStart.y) >= 12) {
+      manualStrokes.push([strokeStart, strokeEnd]);
+      strokeStart = null;
+      strokeEnd = null;
+      regenerateFromStrokes();
+    } else {
+      strokeStart = null;
+      strokeEnd = null;
+      draw();
+    }
     return;
   }
   manualDrag = null;
   manualDragLast = null;
 }
 
-/** Preview rectangle while the user drags the seed cell in "draw" mode. */
-function drawDrawPreview(ctx: CanvasRenderingContext2D) {
-  if (!drawCellStart || !drawCellEnd) return;
-  const x = Math.min(drawCellStart.x, drawCellEnd.x);
-  const y = Math.min(drawCellStart.y, drawCellEnd.y);
-  const w = Math.abs(drawCellEnd.x - drawCellStart.x);
-  const h = Math.abs(drawCellEnd.y - drawCellStart.y);
+/** Draw the traced reference lines + the in-progress stroke (draw mode). */
+function drawStrokes(ctx: CanvasRenderingContext2D) {
+  const lw = Math.max(2, view.width / 300);
   ctx.save();
-  ctx.lineWidth = Math.max(2, view.width / 320);
+  ctx.lineCap = 'round';
   ctx.strokeStyle = '#22d3ee';
-  ctx.fillStyle = 'rgba(34, 211, 238, 0.14)';
-  ctx.fillRect(x, y, w, h);
-  ctx.strokeRect(x, y, w, h);
+  ctx.lineWidth = lw;
+  const seg = (a: ImgPt, b: ImgPt) => {
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  };
+  for (const [a, b] of manualStrokes) seg(a, b);
+  if (strokeStart && strokeEnd) seg(strokeStart, strokeEnd);
   ctx.restore();
 }
 
@@ -997,7 +1034,7 @@ function draw() {
   }
 
   if (manualActive) {
-    if (manualDrawPending) drawDrawPreview(ctx);
+    if (manualDrawPending) drawStrokes(ctx);
     else drawManualHandles(ctx);
     return; // no tactical layer while editing the grid
   }
@@ -2374,6 +2411,12 @@ manualCollapse.addEventListener('click', () => {
 });
 manualDone.addEventListener('click', () => exitManualMode(true));
 manualCancel.addEventListener('click', () => exitManualMode(false));
+manualReset.addEventListener('click', () => {
+  manualStrokes = [];
+  strokeStart = null;
+  strokeEnd = null;
+  regenerateFromStrokes();
+});
 // Top-bar "edit grid" — adjust any current grid (or start from a default) by hand.
 btnEditGrid.addEventListener('click', () => enterManualMode());
 window.addEventListener('popstate', () => {

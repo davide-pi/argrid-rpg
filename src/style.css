@@ -694,6 +694,10 @@ body {
 .manual-bar.collapsed .manual-bar-body {
   display: none;
 }
+/* In "draw" mode the grid comes from traced lines, so the cell steppers don't apply. */
+.manual-bar.draw-mode .manual-bar-row {
+  display: none;
+}
 .manual-bar.collapsed .manual-bar-head .chev {
   transform: rotate(-90deg);
 }

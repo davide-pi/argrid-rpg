@@ -652,6 +652,20 @@ body {
 .btn-ghost:hover {
   background: #1f2b3b;
 }
+.btn-link {
+  appearance: none;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 6px;
+  margin-top: 4px;
+}
+.btn-link:hover {
+  color: var(--fg);
+}
 
 /* --- Manual grid editor bar (top, collapsible) --------------------- */
 .manual-bar {

@@ -74,11 +74,11 @@ const btnRetake = $<HTMLButtonElement>('btnRetake');
 // The retake (camera) button lives in the top bar and shows only in result mode.
 const topActions = $<HTMLDivElement>('topActions');
 
-// Fallback panel (shown over the photo when the auto grid is unreliable).
-const gridFail = $<HTMLDivElement>('gridFail');
-const failRetake = $<HTMLButtonElement>('failRetake');
-const failAdapt = $<HTMLButtonElement>('failAdapt');
-const failDraw = $<HTMLButtonElement>('failDraw');
+// Manual-grid chooser (shown only when the user taps the top-bar edit button).
+const editChooser = $<HTMLDivElement>('editChooser');
+const chooseAdapt = $<HTMLButtonElement>('chooseAdapt');
+const chooseDraw = $<HTMLButtonElement>('chooseDraw');
+const chooseCancel = $<HTMLButtonElement>('chooseCancel');
 
 // Result-mode "edit the grid by hand" button (top bar); always available so any
 // grid — even a well-detected one — can be adjusted.
@@ -153,11 +153,10 @@ let cv: any = null;
 let lastCapture: HTMLCanvasElement | null = null;
 let lastResult: GridResult | null = null;
 let showingResult = false; // true while a captured photo + overlay is shown
-// Whether the current grid is trustworthy enough to DRAW and build tactics on.
-// When false (low confidence: strong perspective / noise / distractors, or a
-// degenerate sub-pitch fit) we do NOT draw a wrong grid — the fallback panel
-// (retake / manual grid) is shown over the photo instead. A manual grid sets
-// this true. See MIN_GRID_CONFIDENCE.
+// Whether a grid is currently drawn (and tactics can build on it). True when the
+// detector actually found one (both families detected, not a broken/degenerate fit),
+// or the user placed a manual one. When false we simply show the photo alone — there
+// is NO automatic fallback panel; the user edits or retakes from the top-bar buttons.
 let gridReliable = false;
 
 // Tactical state.
@@ -390,7 +389,7 @@ function processImage(canvas: HTMLCanvasElement) {
   manualActive = false;
   manualQuad = null;
   showManualBar(false);
-  gridFail.hidden = true;
+  editChooser.hidden = true;
   if (placeMode !== 'none') setPlaceMode('none'); // turn off any active placement
   fabWrap.hidden = false; // the "add" FAB is available once there's a grid
   runDetection();
@@ -411,11 +410,9 @@ const nextFrame = () =>
 
 let detecting = false;
 
-// Minimum detection confidence to DRAW the auto grid (else → manual fallback). 0.5 =
-// at least 4 detected lines per family. Calibrated against the user's labels on the
-// 16-photo corpus: the correct grids scored ≥ 0.75, the wrong ones ≤ 0.25 (bar one
-// confident-but-wrong outlier no metric catches).
-const MIN_GRID_CONFIDENCE = 0.5;
+// Max ratio between the two families' cell pitches before a fit is treated as "not a
+// grid" (one family collapsed → micro one way / macro the other).
+const MAX_CELL_ASPECT = 6;
 
 async function runDetection() {
   // One detection at a time — the pipeline is heavy and holds OpenCV Mats.
@@ -437,13 +434,20 @@ async function runDetection() {
     setProcessing('Quasi pronto…', 1);
     lastResult = step.value;
 
-    // Show the auto grid only when the detection is CONFIDENT. On a labelled 16-photo
-    // corpus, confidence separated correct from wrong almost perfectly: the correct
-    // grids scored ≥ 0.75, and every wrong one scored ≤ 0.25 — except a single
-    // confident-but-wrong outlier that no available metric distinguishes from a good
-    // grid. So a confidence gate is right ~15/16; everything below goes to the manual
-    // fallback. (A looser "not-degenerate" gate showed several wrong grids — worse.)
-    gridReliable = !!lastResult && lastResult.info.confidence >= MIN_GRID_CONFIDENCE;
+    // Draw whatever grid the detector actually FOUND — or nothing if it didn't. The
+    // user decides if it's good (they can edit it or retake); we no longer auto-hide
+    // low-confidence grids behind a panel. "Found a grid" = both families really
+    // detected (≥ 2 lines each) and not a broken fit (degenerate sub-pitch, or one
+    // family collapsed → extreme cell-aspect). Otherwise show the photo alone.
+    gridReliable = false;
+    if (lastResult) {
+      const i = lastResult.info;
+      const aspect =
+        i.spacingA > 0 && i.spacingB > 0
+          ? Math.max(i.spacingA / i.spacingB, i.spacingB / i.spacingA)
+          : Infinity;
+      gridReliable = i.detectedA >= 2 && i.detectedB >= 2 && !i.degenerate && aspect <= MAX_CELL_ASPECT;
+    }
 
     // Grid↔image mapping for tactical overlays — only for a reliable grid.
     gridMap = null;
@@ -458,7 +462,12 @@ async function runDetection() {
     const dt = Math.round(performance.now() - t0);
     draw();
     reportStatus(dt);
-    updateGridFallback(); // show the retake-or-manual panel when the grid is unreliable
+    updateResultChrome();
+    // No grid found → the photo shows alone; nudge the user toward the controls
+    // rather than leaving them wondering.
+    if (!gridReliable) {
+      showToast('Nessuna griglia rilevata — tocca ✎ per crearla a mano o ↺ per riscattare.');
+    }
   } catch (err) {
     console.error(err);
     setStatus('Errore analisi: ' + (err as Error).message);
@@ -482,18 +491,14 @@ function hideProcessing() {
   processing.hidden = true;
 }
 
-// Show the retake-or-manual panel when the current result is an unreliable grid
-// (and we're not already editing a manual one). While it's up, the tactical tools
-// (FAB / HUD) are hidden — there's no usable grid to build on yet.
-function updateGridFallback() {
-  const show = showingResult && !gridReliable && !manualActive;
-  gridFail.hidden = !show;
-  if (show) {
-    fabWrap.hidden = true;
-    hud.hidden = true;
-    hideToast();
-  } else if (showingResult && !manualActive) {
-    fabWrap.hidden = false;
+// Result-mode chrome: there is NO automatic fallback panel. The FAB (place tokens)
+// only makes sense when a grid was found; the edit button + retake are always
+// available so the user can create/replace the grid or reshoot at will.
+function updateResultChrome() {
+  editChooser.hidden = true; // only opened explicitly by the edit button
+  if (showingResult && !manualActive) {
+    fabWrap.hidden = !gridReliable;
+    if (!gridReliable) hud.hidden = true;
   }
   updateEditGridButton();
 }
@@ -740,7 +745,7 @@ function applyManualBarMode() {
 function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
   if (!lastCapture || !lastResult) return;
   manualActive = true;
-  gridFail.hidden = true;
+  editChooser.hidden = true;
   fabWrap.hidden = true;
   hud.hidden = true;
   btnEditGrid.hidden = true;
@@ -845,7 +850,7 @@ function exitManualMode(keep: boolean) {
     deselectCell();
   }
   draw();
-  updateGridFallback();
+  updateResultChrome();
 }
 
 /** Show the top-bar "edit grid" button whenever a result is on screen and we're not
@@ -2496,7 +2501,7 @@ function retake() {
   manualQuad = null;
   gridReliable = false;
   showManualBar(false);
-  gridFail.hidden = true;
+  editChooser.hidden = true;
   fabWrap.hidden = true;
   btnEditGrid.hidden = true;
   topActions.hidden = true; // leaving result mode → hide Pulisci / Rifai
@@ -2519,21 +2524,17 @@ btnRetake.addEventListener('click', () => {
   if (showingResult) history.back();
   else retake();
 });
-// Fallback panel: "Scatta un'altra foto" mirrors the top-bar retake.
-failRetake.addEventListener('click', () => {
-  gridFail.hidden = true;
-  if (showingResult) history.back();
-  else retake();
-});
-// Fallback panel: two ways into the manual editor — adapt a (default/current) grid,
-// or draw one cell and expand from it.
-failAdapt.addEventListener('click', () => {
-  gridFail.hidden = true;
+// Manual-grid chooser (opened by the top-bar edit button): two ways in.
+chooseAdapt.addEventListener('click', () => {
+  editChooser.hidden = true;
   enterManualMode('adapt');
 });
-failDraw.addEventListener('click', () => {
-  gridFail.hidden = true;
+chooseDraw.addEventListener('click', () => {
+  editChooser.hidden = true;
   enterManualMode('draw');
+});
+chooseCancel.addEventListener('click', () => {
+  editChooser.hidden = true;
 });
 
 // Manual-grid bar controls.
@@ -2581,8 +2582,11 @@ manualReset.addEventListener('click', () => {
   strokeEnd = null;
   regenerateFromStrokes();
 });
-// Top-bar "edit grid" — adjust any current grid (or start from a default) by hand.
-btnEditGrid.addEventListener('click', () => enterManualMode());
+// Top-bar "edit grid" — open the chooser (adapt a grid / draw one by hand).
+btnEditGrid.addEventListener('click', () => {
+  if (!showingResult) return;
+  editChooser.hidden = false;
+});
 window.addEventListener('popstate', () => {
   if (showingResult) retake();
 });

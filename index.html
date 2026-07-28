@@ -164,19 +164,19 @@
           <span class="processing-pct" id="processingPct">0%</span>
         </div>
 
-        <!-- Fallback panel: shown over the photo when the auto grid is too
-             unreliable to draw (low confidence). The photo stays visible behind so
-             the user can judge whether it's a bad shot, then choose to retake or
-             place a manual grid. -->
-        <div id="gridFail" class="grid-fail" hidden>
+        <!-- Manual-grid chooser: shown only when the user taps the top-bar edit
+             button. Lets them pick how to make/replace the grid by hand. (There is no
+             automatic fallback panel — a found grid is always drawn, and the user
+             decides whether to edit it or retake.) -->
+        <div id="editChooser" class="grid-fail" hidden>
           <div class="grid-fail-card">
-            <p class="grid-fail-title">Griglia non rilevata in modo affidabile</p>
-            <p class="grid-fail-sub">La foto potrebbe essere poco nitida, storta o senza una griglia chiara. Riprova, oppure posiziona la griglia a mano.</p>
+            <p class="grid-fail-title">Griglia manuale</p>
+            <p class="grid-fail-sub">Come vuoi crearla?</p>
             <div class="grid-fail-actions">
-              <button id="failRetake" class="btn btn-primary" type="button">Scatta un'altra foto</button>
-              <button id="failAdapt" class="btn btn-ghost" type="button">Griglia da adattare</button>
-              <button id="failDraw" class="btn btn-ghost" type="button">Disegna a mano</button>
+              <button id="chooseAdapt" class="btn btn-primary" type="button">Griglia da adattare</button>
+              <button id="chooseDraw" class="btn btn-ghost" type="button">Disegna a mano</button>
             </div>
+            <button id="chooseCancel" class="btn-link" type="button">Annulla</button>
           </div>
         </div>
 

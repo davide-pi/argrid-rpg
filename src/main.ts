@@ -13,6 +13,8 @@ import {
 import { attachZoomPan } from './zoom';
 import {
   makeGridMap,
+  solveHomography,
+  applyH,
   areaCells,
   moveCells,
   movePareto,
@@ -70,6 +72,22 @@ const btnRetake = $<HTMLButtonElement>('btnRetake');
 // The retake (camera) button lives in the top bar and shows only in result mode.
 const topActions = $<HTMLDivElement>('topActions');
 
+// Fallback panel (shown over the photo when the auto grid is unreliable).
+const gridFail = $<HTMLDivElement>('gridFail');
+const failRetake = $<HTMLButtonElement>('failRetake');
+const failManual = $<HTMLButtonElement>('failManual');
+
+// Manual-grid editor bar.
+const manualBar = $<HTMLDivElement>('manualBar');
+const colsMinus = $<HTMLButtonElement>('colsMinus');
+const colsPlus = $<HTMLButtonElement>('colsPlus');
+const colsVal = $<HTMLSpanElement>('colsVal');
+const rowsMinus = $<HTMLButtonElement>('rowsMinus');
+const rowsPlus = $<HTMLButtonElement>('rowsPlus');
+const rowsVal = $<HTMLSpanElement>('rowsVal');
+const manualDone = $<HTMLButtonElement>('manualDone');
+const manualCancel = $<HTMLButtonElement>('manualCancel');
+
 // Debug has no on-screen switch — it's a hidden state toggled by triple-tapping
 // the logo. When on, detection draws its edge/line diagnostics and a verbose status.
 let debug = false;
@@ -113,11 +131,24 @@ const camera = new Camera(video);
 // so the gesture only turns/moves that thing.
 let ringRotating = false;
 let dragKind: 'origin' | 'target' | 'piece' | null = null;
-const zoom = attachZoomPan(view, { suppress: () => ringRotating || dragKind !== null });
+// Manual-grid editing: which handle is being dragged (0..3 corner, 4 = translate).
+let manualDrag: number | null = null;
+const zoom = attachZoomPan(view, {
+  suppress: () => ringRotating || dragKind !== null || manualDrag !== null,
+});
 let cv: any = null;
 let lastCapture: HTMLCanvasElement | null = null;
 let lastResult: GridResult | null = null;
 let showingResult = false; // true while a captured photo + overlay is shown
+// Whether the current grid is trustworthy enough to DRAW and build tactics on.
+// When false (low confidence: strong perspective / noise / distractors, or a
+// degenerate sub-pitch fit) we do NOT draw a wrong grid — the fallback panel
+// (retake / manual grid) is shown over the photo instead. A manual grid sets
+// this true. See MIN_GRID_CONFIDENCE.
+let gridReliable = false;
+// True while the user is editing a manual grid (so the fallback panel stays hidden
+// over it). Set by the manual-grid editor.
+let manualActive = false;
 
 // Tactical state.
 let gridMap: GridMap | null = null; // grid<->image mapping for the current grid
@@ -345,6 +376,11 @@ function processImage(canvas: HTMLCanvasElement) {
   zoom.reset(); // start each new capture unzoomed
   deselectCell(); // a new photo → drop the previous overlay and selection
   tokens = []; // …and the previous board tokens
+  // A new photo → drop any manual grid / fallback state from the previous one.
+  manualActive = false;
+  manualQuad = null;
+  showManualBar(false);
+  gridFail.hidden = true;
   if (placeMode !== 'none') setPlaceMode('none'); // turn off any active placement
   fabWrap.hidden = false; // the "add" FAB is available once there's a grid
   runDetection();
@@ -364,6 +400,11 @@ const nextFrame = () =>
   new Promise<void>((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
 
 let detecting = false;
+
+// Below this detection confidence the auto grid is treated as unreliable: we hide
+// it and show the fallback panel instead of drawing a wrong grid. (Matches the
+// existing weak-grid warning threshold.)
+const MIN_GRID_CONFIDENCE = 0.35;
 
 async function runDetection() {
   // One detection at a time — the pipeline is heavy and holds OpenCV Mats.
@@ -385,9 +426,18 @@ async function runDetection() {
     setProcessing('Quasi pronto…', 1);
     lastResult = step.value;
 
-    // Grid↔image mapping for tactical overlays (unchanged across toggles).
+    // Trust the auto grid enough to draw + build tactics on it? A degenerate or
+    // mostly-extrapolated fit scores low confidence — rather than draw a wrong grid
+    // we show the fallback panel (retake / manual grid) over the photo.
+    gridReliable =
+      !!lastResult &&
+      lastResult.familyA.length >= 2 &&
+      lastResult.familyB.length >= 2 &&
+      lastResult.info.confidence >= MIN_GRID_CONFIDENCE;
+
+    // Grid↔image mapping for tactical overlays — only for a reliable grid.
     gridMap = null;
-    if (lastResult && lastResult.familyA.length >= 2 && lastResult.familyB.length >= 2) {
+    if (gridReliable && lastResult) {
       gridMap = makeGridMap(lastResult.familyA, lastResult.familyB);
       gridDims = { na: lastResult.familyA.length, nb: lastResult.familyB.length };
     }
@@ -398,6 +448,7 @@ async function runDetection() {
     const dt = Math.round(performance.now() - t0);
     draw();
     reportStatus(dt);
+    updateGridFallback(); // show the retake-or-manual panel when the grid is unreliable
   } catch (err) {
     console.error(err);
     setStatus('Errore analisi: ' + (err as Error).message);
@@ -419,6 +470,227 @@ function setProcessing(label: string, frac: number) {
 }
 function hideProcessing() {
   processing.hidden = true;
+}
+
+// Show the retake-or-manual panel when the current result is an unreliable grid
+// (and we're not already editing a manual one). While it's up, the tactical tools
+// (FAB / HUD) are hidden — there's no usable grid to build on yet.
+function updateGridFallback() {
+  const show = showingResult && !gridReliable && !manualActive;
+  gridFail.hidden = !show;
+  if (show) {
+    fabWrap.hidden = true;
+    hud.hidden = true;
+    hideToast();
+  } else if (showingResult && !manualActive) {
+    fabWrap.hidden = false;
+  }
+}
+
+// --- Manual grid editor -----------------------------------------------
+// When auto-detection is unreliable the user can place a grid by hand: a quad
+// (4 draggable corners) over the photo, tiled into `manualNa × manualNb` cells.
+// The quad → unit-square homography gives projective (perspective-correct) cell
+// nodes, from which we build the same familyA/familyB Line2[] the detector would,
+// so drawing + all tactical tools work unchanged.
+type ImgPt = { x: number; y: number };
+let manualQuad: ImgPt[] | null = null; // [TL, TR, BR, BL] in image coordinates
+let manualNa = 10; // cells along the top/bottom edge (columns)
+let manualNb = 10; // cells along the left/right edge (rows)
+let manualDragLast: ImgPt | null = null;
+
+/** Client → image-pixel coordinates (accounts for CSS sizing + the zoom transform,
+ * since the canvas backing store is in image pixels). */
+function pointerToImage(clientX: number, clientY: number): ImgPt | null {
+  const rect = view.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  return {
+    x: ((clientX - rect.left) / rect.width) * view.width,
+    y: ((clientY - rect.top) / rect.height) * view.height,
+  };
+}
+
+/** Line2 (normal form) through two image points. */
+function lineThrough(p1: ImgPt, p2: ImgPt): Line2 {
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len;
+  const ny = dx / len;
+  return { nx, ny, d: nx * p1.x + ny * p1.y };
+}
+
+/** Build the two line families from the current quad + cell counts. */
+function manualToFamilies(): { A: Line2[]; B: Line2[] } | null {
+  if (!manualQuad) return null;
+  const [TL, TR, BR, BL] = manualQuad;
+  const H = solveHomography(
+    [[0, 0], [1, 0], [1, 1], [0, 1]],
+    [[TL.x, TL.y], [TR.x, TR.y], [BR.x, BR.y], [BL.x, BL.y]],
+  );
+  if (!H) return null;
+  const node = (i: number, j: number): ImgPt => {
+    const [x, y] = applyH(H, i / manualNa, j / manualNb);
+    return { x, y };
+  };
+  const A: Line2[] = []; // constant i (columns): na+1 lines
+  for (let i = 0; i <= manualNa; i++) A.push(lineThrough(node(i, 0), node(i, manualNb)));
+  const B: Line2[] = []; // constant j (rows): nb+1 lines
+  for (let j = 0; j <= manualNb; j++) B.push(lineThrough(node(0, j), node(manualNa, j)));
+  return { A, B };
+}
+
+/** Recompute families + grid map from the quad and redraw. */
+function applyManual() {
+  const fam = manualToFamilies();
+  if (!fam || !lastResult) return;
+  lastResult.familyA = fam.A;
+  lastResult.familyB = fam.B;
+  gridMap = makeGridMap(fam.A, fam.B);
+  gridDims = { na: fam.A.length, nb: fam.B.length };
+  gridReliable = true;
+  draw();
+}
+
+/** Radius (image px) within which a tap grabs a corner handle. */
+function manualHandleRadius(): number {
+  const W = lastResult?.width ?? view.width;
+  const H = lastResult?.height ?? view.height;
+  return Math.max(W, H) * 0.045;
+}
+
+function pointInQuad(p: ImgPt, q: ImgPt[]): boolean {
+  let inside = false;
+  for (let i = 0, j = 3; i < 4; j = i++) {
+    const a = q[i];
+    const b = q[j];
+    if ((a.y > p.y) !== (b.y > p.y) && p.x < ((b.x - a.x) * (p.y - a.y)) / (b.y - a.y) + a.x)
+      inside = !inside;
+  }
+  return inside;
+}
+
+function showManualBar(show: boolean) {
+  manualBar.hidden = !show;
+}
+function updateManualBar() {
+  colsVal.textContent = String(manualNa);
+  rowsVal.textContent = String(manualNb);
+}
+
+function enterManualMode() {
+  if (!lastCapture || !lastResult) return;
+  manualActive = true;
+  gridFail.hidden = true;
+  fabWrap.hidden = true;
+  hud.hidden = true;
+  hideToast();
+  const W = lastResult.width;
+  const H = lastResult.height;
+  const mx = W * 0.12;
+  const my = H * 0.12;
+  manualQuad = [
+    { x: mx, y: my },
+    { x: W - mx, y: my },
+    { x: W - mx, y: H - my },
+    { x: mx, y: H - my },
+  ];
+  // Default counts: aim for roughly square cells filling the default quad.
+  const cell = Math.min(W - 2 * mx, H - 2 * my) / 10;
+  manualNa = Math.max(2, Math.round((W - 2 * mx) / cell));
+  manualNb = Math.max(2, Math.round((H - 2 * my) / cell));
+  updateManualBar();
+  showManualBar(true);
+  applyManual();
+}
+
+/** Leave manual editing. keep=true commits the grid; false discards it (back to the
+ * fallback panel). */
+function exitManualMode(keep: boolean) {
+  manualActive = false;
+  manualDrag = null;
+  manualDragLast = null;
+  showManualBar(false);
+  if (keep) {
+    // gridReliable / gridMap already set by applyManual — just show the tools.
+    fabWrap.hidden = false;
+  } else {
+    manualQuad = null;
+    gridReliable = false;
+    gridMap = null;
+    deselectCell();
+  }
+  draw();
+  updateGridFallback();
+}
+
+// Pointer gestures while editing a manual grid (routed from the map handlers).
+function manualPointerDown(e: PointerEvent) {
+  if (!manualQuad) return;
+  activePointers.add(e.pointerId);
+  if (activePointers.size !== 1) {
+    manualDrag = null; // second finger → let the zoom controller pinch/pan
+    return;
+  }
+  const p = pointerToImage(e.clientX, e.clientY);
+  if (!p) return;
+  const r = manualHandleRadius();
+  let hit = -1;
+  for (let i = 0; i < 4; i++) {
+    if (Math.hypot(manualQuad[i].x - p.x, manualQuad[i].y - p.y) <= r) {
+      hit = i;
+      break;
+    }
+  }
+  if (hit < 0 && pointInQuad(p, manualQuad)) hit = 4; // inside → translate the whole grid
+  if (hit < 0) return;
+  manualDrag = hit;
+  manualDragLast = p;
+  capturePointer(e.pointerId);
+}
+function manualPointerMove(e: PointerEvent) {
+  if (manualDrag === null || !manualQuad || !manualDragLast) return;
+  const p = pointerToImage(e.clientX, e.clientY);
+  if (!p) return;
+  e.preventDefault();
+  if (manualDrag < 4) {
+    manualQuad[manualDrag] = p;
+  } else {
+    const dx = p.x - manualDragLast.x;
+    const dy = p.y - manualDragLast.y;
+    for (const c of manualQuad) {
+      c.x += dx;
+      c.y += dy;
+    }
+  }
+  manualDragLast = p;
+  applyManual();
+}
+function manualPointerUp(e: PointerEvent) {
+  activePointers.delete(e.pointerId);
+  manualDrag = null;
+  manualDragLast = null;
+}
+
+/** Draw the 4 corner handles over the manual grid. */
+function drawManualHandles(ctx: CanvasRenderingContext2D) {
+  if (!manualQuad) return;
+  const r = manualHandleRadius() * 0.5;
+  ctx.save();
+  for (const c of manualQuad) {
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(34, 211, 238, 0.28)';
+    ctx.fill();
+    ctx.lineWidth = Math.max(2, r * 0.22);
+    ctx.strokeStyle = '#22d3ee';
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, Math.max(2, r * 0.18), 0, Math.PI * 2);
+    ctx.fillStyle = '#eaf1fb';
+    ctx.fill();
+  }
+  ctx.restore();
 }
 
 function reportStatus(dt: number) {
@@ -481,8 +753,18 @@ function draw() {
   // other family), so lines don't protrude past the outer rows/columns. Both
   // directions share one colour — a soft white — since we don't distinguish them.
   const gridColor = '#eaf1fb';
-  drawFamily(ctx, r.familyA, r.familyB, r.width, r.height, gridColor, lw);
-  drawFamily(ctx, r.familyB, r.familyA, r.width, r.height, gridColor, lw);
+  // Draw the grid when it's trustworthy, or while the user is placing one by hand.
+  // An unreliable auto fit shows the photo alone under the fallback panel, not a
+  // wrong grid.
+  if (gridReliable || manualActive) {
+    drawFamily(ctx, r.familyA, r.familyB, r.width, r.height, gridColor, lw);
+    drawFamily(ctx, r.familyB, r.familyA, r.width, r.height, gridColor, lw);
+  }
+
+  if (manualActive) {
+    drawManualHandles(ctx);
+    return; // no tactical layer while editing the grid
+  }
 
   // Tactical layer: overlay → path preview → threat/counters → flanking → tokens
   // → blocked squares → selection + ring.
@@ -1524,6 +1806,10 @@ const capturePointer = (id: number) => {
   }
 };
 view.addEventListener('pointerdown', (e) => {
+  if (manualActive) {
+    manualPointerDown(e);
+    return;
+  }
   activePointers.add(e.pointerId);
   if (activePointers.size !== 1) {
     tapCandidate = false; // multi-touch → pinch, not a tap/drag
@@ -1574,6 +1860,10 @@ view.addEventListener('pointerdown', (e) => {
   }
 });
 view.addEventListener('pointermove', (e) => {
+  if (manualActive) {
+    manualPointerMove(e);
+    return;
+  }
   if (ringRotating) {
     e.preventDefault();
     rotateFromPointer(e.clientX, e.clientY);
@@ -1587,6 +1877,10 @@ view.addEventListener('pointermove', (e) => {
   }
 });
 view.addEventListener('pointerup', (e) => {
+  if (manualActive) {
+    manualPointerUp(e);
+    return;
+  }
   activePointers.delete(e.pointerId);
   clearLongPress();
   if (ringRotating) {
@@ -1634,6 +1928,10 @@ view.addEventListener('pointerup', (e) => {
   longPressFired = false;
 });
 view.addEventListener('pointercancel', (e) => {
+  if (manualActive) {
+    manualPointerUp(e);
+    return;
+  }
   activePointers.delete(e.pointerId);
   clearLongPress();
   ringRotating = false;
@@ -1756,6 +2054,13 @@ function retake() {
   deselectCell();
   zoom.reset();
   view.hidden = true;
+  // Clear any manual-grid / fallback UI from the previous result.
+  manualActive = false;
+  manualQuad = null;
+  gridReliable = false;
+  showManualBar(false);
+  gridFail.hidden = true;
+  fabWrap.hidden = true;
   topActions.hidden = true; // leaving result mode → hide Pulisci / Rifai
   startCamera().catch(() => {
     setStatus('Fotocamera non disponibile — tocca lo schermo per riprovare');
@@ -1776,6 +2081,34 @@ btnRetake.addEventListener('click', () => {
   if (showingResult) history.back();
   else retake();
 });
+// Fallback panel: "Scatta un'altra foto" mirrors the top-bar retake.
+failRetake.addEventListener('click', () => {
+  gridFail.hidden = true;
+  if (showingResult) history.back();
+  else retake();
+});
+// Fallback panel: "Griglia manuale" drops into the manual-grid editor.
+failManual.addEventListener('click', () => {
+  gridFail.hidden = true;
+  enterManualMode();
+});
+
+// Manual-grid bar controls.
+const MANUAL_MIN_CELLS = 1;
+const MANUAL_MAX_CELLS = 60;
+function bumpManual(which: 'cols' | 'rows', delta: number) {
+  if (which === 'cols')
+    manualNa = Math.max(MANUAL_MIN_CELLS, Math.min(MANUAL_MAX_CELLS, manualNa + delta));
+  else manualNb = Math.max(MANUAL_MIN_CELLS, Math.min(MANUAL_MAX_CELLS, manualNb + delta));
+  updateManualBar();
+  applyManual();
+}
+colsMinus.addEventListener('click', () => bumpManual('cols', -1));
+colsPlus.addEventListener('click', () => bumpManual('cols', +1));
+rowsMinus.addEventListener('click', () => bumpManual('rows', -1));
+rowsPlus.addEventListener('click', () => bumpManual('rows', +1));
+manualDone.addEventListener('click', () => exitManualMode(true));
+manualCancel.addEventListener('click', () => exitManualMode(false));
 window.addEventListener('popstate', () => {
   if (showingResult) retake();
 });

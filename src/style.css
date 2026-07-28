@@ -570,6 +570,171 @@ body {
   transform: none;
 }
 
+/* --- Grid fallback panel (unreliable auto-detection) ---------------- */
+/* Shown over the captured photo when the auto grid is too unreliable to draw.
+   A bottom scrim keeps the photo visible up top (so the user can judge the shot)
+   while the card offers "retake" or "manual grid". */
+.grid-fail {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 18px;
+  padding-bottom: calc(18px + env(safe-area-inset-bottom));
+  background: linear-gradient(
+    180deg,
+    rgba(10, 14, 19, 0) 0%,
+    rgba(10, 14, 19, 0.35) 45%,
+    rgba(10, 14, 19, 0.78) 100%
+  );
+  pointer-events: none; /* let the scrim show the photo; the card re-enables */
+}
+.grid-fail[hidden] {
+  display: none;
+}
+.grid-fail-card {
+  pointer-events: auto;
+  width: min(420px, 100%);
+  padding: 18px;
+  border-radius: var(--radius);
+  background: rgba(19, 28, 39, 0.94);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+  text-align: center;
+}
+.grid-fail-title {
+  margin: 0 0 6px;
+  font-size: 15.5px;
+  font-weight: 700;
+  color: var(--fg);
+}
+.grid-fail-sub {
+  margin: 0 0 14px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+.grid-fail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+}
+.btn {
+  appearance: none;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 11px 20px;
+  font-size: 14.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.06s, filter 0.15s, background 0.15s;
+}
+.btn:active {
+  transform: translateY(1px) scale(0.99);
+}
+.btn-primary {
+  color: var(--accent-ink);
+  background: linear-gradient(135deg, var(--accent), #16b8d4);
+  box-shadow: 0 6px 18px rgba(34, 211, 238, 0.28);
+}
+.btn-primary:hover {
+  filter: brightness(1.05);
+}
+.btn-ghost {
+  color: var(--fg);
+  background: var(--panel-2);
+  border-color: var(--line);
+}
+.btn-ghost:hover {
+  background: #1f2b3b;
+}
+
+/* --- Manual grid editor bar ---------------------------------------- */
+.manual-bar {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: calc(14px + env(safe-area-inset-bottom));
+  z-index: 42;
+  width: min(460px, calc(100% - 24px));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  background: rgba(19, 28, 39, 0.95);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+}
+.manual-bar[hidden] {
+  display: none;
+}
+.manual-bar-hint {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--muted);
+  text-align: center;
+}
+.manual-bar-row {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.stepper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+}
+.stepper-lbl {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 0 2px;
+}
+.stepper-btn {
+  appearance: none;
+  border: none;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: #223247;
+  color: var(--fg);
+  font-size: 19px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.stepper-btn:active {
+  transform: scale(0.94);
+}
+.stepper-val {
+  min-width: 24px;
+  text-align: center;
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+}
+.manual-bar-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+}
+
 /* --- Build version badge (overlaid, bottom-left) -------------------- */
 .version-badge {
   position: absolute;

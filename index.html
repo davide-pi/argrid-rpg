@@ -67,6 +67,12 @@
               <option value="m">m</option>
               <option value="ft">ft</option>
             </select>
+            <button id="btnEditGrid" class="icon-btn" type="button" aria-label="Modifica la griglia a mano" title="Modifica la griglia a mano" hidden>
+              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="3" width="18" height="18" rx="1" />
+                <path d="M3 9h18M3 15h18M9 3v18M15 3v18" />
+              </svg>
+            </button>
             <button id="btnRetake" class="icon-btn" type="button" aria-label="Rifai la foto" title="Rifai la foto">
               <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z" />
@@ -173,28 +179,39 @@
           </div>
         </div>
 
-        <!-- Manual-grid editor bar: shown while the user adjusts a manual grid.
-             Drag the corner handles on the map to fit the grid; the ± controls set
-             how many cells it has. -->
+        <!-- Manual-grid editor bar: shown (at the TOP, collapsible) while the user
+             adjusts a manual grid. Drag the corner handles on the map to fit the
+             grid; the ± / numeric inputs set how many cells it has. Collapsible so it
+             never hides a corner handle the user needs to reach. -->
         <div id="manualBar" class="manual-bar" hidden>
-          <p class="manual-bar-hint">Trascina gli angoli per adattare la griglia · trascina il centro per spostarla.</p>
-          <div class="manual-bar-row">
-            <div class="stepper" aria-label="Numero di colonne">
-              <span class="stepper-lbl">Colonne</span>
-              <button id="colsMinus" class="stepper-btn" type="button" aria-label="Meno colonne">−</button>
-              <span id="colsVal" class="stepper-val">10</span>
-              <button id="colsPlus" class="stepper-btn" type="button" aria-label="Più colonne">+</button>
-            </div>
-            <div class="stepper" aria-label="Numero di righe">
-              <span class="stepper-lbl">Righe</span>
-              <button id="rowsMinus" class="stepper-btn" type="button" aria-label="Meno righe">−</button>
-              <span id="rowsVal" class="stepper-val">10</span>
-              <button id="rowsPlus" class="stepper-btn" type="button" aria-label="Più righe">+</button>
+          <div class="manual-bar-head">
+            <span class="manual-bar-title">Griglia manuale</span>
+            <div class="manual-bar-head-actions">
+              <button id="manualCancel" class="btn btn-ghost btn-mini" type="button">Annulla</button>
+              <button id="manualDone" class="btn btn-primary btn-mini" type="button">Fatto</button>
+              <button id="manualCollapse" class="hud-icon" type="button" aria-label="Riduci o espandi i controlli">
+                <svg class="chev" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+              </button>
             </div>
           </div>
-          <div class="manual-bar-actions">
-            <button id="manualCancel" class="btn btn-ghost" type="button">Annulla</button>
-            <button id="manualDone" class="btn btn-primary" type="button">Fatto</button>
+          <div class="manual-bar-body">
+            <p class="manual-bar-hint">Trascina gli angoli per adattare la griglia · trascina il centro per spostarla.</p>
+            <div class="manual-bar-row">
+              <div class="stepper" aria-label="Numero di colonne">
+                <span class="stepper-lbl">Colonne</span>
+                <button id="colsMinus" class="stepper-btn" type="button" aria-label="Meno colonne">−</button>
+                <input id="colsInput" class="stepper-input" type="number" inputmode="numeric" min="1" max="60" step="1" value="10" aria-label="Numero di colonne" />
+                <button id="colsPlus" class="stepper-btn" type="button" aria-label="Più colonne">+</button>
+              </div>
+              <div class="stepper" aria-label="Numero di righe">
+                <span class="stepper-lbl">Righe</span>
+                <button id="rowsMinus" class="stepper-btn" type="button" aria-label="Meno righe">−</button>
+                <input id="rowsInput" class="stepper-input" type="number" inputmode="numeric" min="1" max="60" step="1" value="10" aria-label="Numero di righe" />
+                <button id="rowsPlus" class="stepper-btn" type="button" aria-label="Più righe">+</button>
+              </div>
+            </div>
           </div>
         </div>
 

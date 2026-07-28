@@ -653,18 +653,18 @@ body {
   background: #1f2b3b;
 }
 
-/* --- Manual grid editor bar ---------------------------------------- */
+/* --- Manual grid editor bar (top, collapsible) --------------------- */
 .manual-bar {
   position: absolute;
   left: 50%;
   transform: translateX(-50%);
-  bottom: calc(14px + env(safe-area-inset-bottom));
+  top: calc(10px + env(safe-area-inset-top));
   z-index: 42;
-  width: min(460px, calc(100% - 24px));
+  width: min(460px, calc(100% - 20px));
   display: flex;
   flex-direction: column;
-  gap: 12px;
-  padding: 14px 16px;
+  gap: 10px;
+  padding: 10px 14px;
   border-radius: var(--radius);
   background: rgba(19, 28, 39, 0.95);
   border: 1px solid var(--line);
@@ -673,6 +673,34 @@ body {
 }
 .manual-bar[hidden] {
   display: none;
+}
+.manual-bar-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.manual-bar-title {
+  flex: 1;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--fg);
+}
+.manual-bar-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* When collapsed, only the head row (with Fatto/Annulla) stays. */
+.manual-bar.collapsed .manual-bar-body {
+  display: none;
+}
+.manual-bar.collapsed .manual-bar-head .chev {
+  transform: rotate(-90deg);
+}
+.manual-bar-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 .manual-bar-hint {
   margin: 0;
@@ -686,6 +714,30 @@ body {
   gap: 12px;
   justify-content: center;
   flex-wrap: wrap;
+}
+.btn-mini {
+  padding: 7px 14px;
+  font-size: 13px;
+}
+.stepper-input {
+  width: 46px;
+  height: 30px;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-2);
+  color: var(--fg);
+  font-size: 15px;
+  font-weight: 700;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+.stepper-input::-webkit-outer-spin-button,
+.stepper-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
 }
 .stepper {
   display: flex;

@@ -77,16 +77,20 @@ const gridFail = $<HTMLDivElement>('gridFail');
 const failRetake = $<HTMLButtonElement>('failRetake');
 const failManual = $<HTMLButtonElement>('failManual');
 
+// Result-mode "edit the grid by hand" button (top bar); always available so any
+// grid — even a well-detected one — can be adjusted.
+const btnEditGrid = $<HTMLButtonElement>('btnEditGrid');
 // Manual-grid editor bar.
 const manualBar = $<HTMLDivElement>('manualBar');
 const colsMinus = $<HTMLButtonElement>('colsMinus');
 const colsPlus = $<HTMLButtonElement>('colsPlus');
-const colsVal = $<HTMLSpanElement>('colsVal');
+const colsInput = $<HTMLInputElement>('colsInput');
 const rowsMinus = $<HTMLButtonElement>('rowsMinus');
 const rowsPlus = $<HTMLButtonElement>('rowsPlus');
-const rowsVal = $<HTMLSpanElement>('rowsVal');
+const rowsInput = $<HTMLInputElement>('rowsInput');
 const manualDone = $<HTMLButtonElement>('manualDone');
 const manualCancel = $<HTMLButtonElement>('manualCancel');
+const manualCollapse = $<HTMLButtonElement>('manualCollapse');
 
 // Debug has no on-screen switch — it's a hidden state toggled by triple-tapping
 // the logo. When on, detection draws its edge/line diagnostics and a verbose status.
@@ -485,6 +489,7 @@ function updateGridFallback() {
   } else if (showingResult && !manualActive) {
     fabWrap.hidden = false;
   }
+  updateEditGridButton();
 }
 
 // --- Manual grid editor -----------------------------------------------
@@ -498,6 +503,7 @@ let manualQuad: ImgPt[] | null = null; // [TL, TR, BR, BL] in image coordinates
 let manualNa = 10; // cells along the top/bottom edge (columns)
 let manualNb = 10; // cells along the left/right edge (rows)
 let manualDragLast: ImgPt | null = null;
+let manualCollapsed = false; // the editor bar can collapse to free the corners under it
 
 /** Client → image-pixel coordinates (accounts for CSS sizing + the zoom transform,
  * since the canvas backing store is in image pixels). */
@@ -572,19 +578,39 @@ function pointInQuad(p: ImgPt, q: ImgPt[]): boolean {
 
 function showManualBar(show: boolean) {
   manualBar.hidden = !show;
+  manualBar.classList.toggle('collapsed', manualCollapsed);
 }
 function updateManualBar() {
-  colsVal.textContent = String(manualNa);
-  rowsVal.textContent = String(manualNb);
+  colsInput.value = String(manualNa);
+  rowsInput.value = String(manualNb);
 }
 
-function enterManualMode() {
-  if (!lastCapture || !lastResult) return;
-  manualActive = true;
-  gridFail.hidden = true;
-  fabWrap.hidden = true;
-  hud.hidden = true;
-  hideToast();
+/** Seed the editable quad + counts from the CURRENT grid (its outer lines), so the
+ * user edits the existing grid rather than a fresh default. Returns false if there's
+ * no usable grid to seed from. */
+function seedQuadFromCurrentGrid(): boolean {
+  if (!lastResult) return false;
+  const A = lastResult.familyA;
+  const B = lastResult.familyB;
+  if (A.length < 2 || B.length < 2) return false;
+  const c00 = intersect(A[0], B[0]);
+  const c10 = intersect(A[A.length - 1], B[0]);
+  const c11 = intersect(A[A.length - 1], B[B.length - 1]);
+  const c01 = intersect(A[0], B[B.length - 1]);
+  if (!c00 || !c10 || !c11 || !c01) return false;
+  manualQuad = [
+    { x: c00.x, y: c00.y },
+    { x: c10.x, y: c10.y },
+    { x: c11.x, y: c11.y },
+    { x: c01.x, y: c01.y },
+  ];
+  manualNa = Math.max(1, A.length - 1);
+  manualNb = Math.max(1, B.length - 1);
+  return true;
+}
+
+function manualDefaultQuad() {
+  if (!lastResult) return;
   const W = lastResult.width;
   const H = lastResult.height;
   const mx = W * 0.12;
@@ -599,6 +625,20 @@ function enterManualMode() {
   const cell = Math.min(W - 2 * mx, H - 2 * my) / 10;
   manualNa = Math.max(2, Math.round((W - 2 * mx) / cell));
   manualNb = Math.max(2, Math.round((H - 2 * my) / cell));
+}
+
+function enterManualMode() {
+  if (!lastCapture || !lastResult) return;
+  manualActive = true;
+  gridFail.hidden = true;
+  fabWrap.hidden = true;
+  hud.hidden = true;
+  btnEditGrid.hidden = true;
+  hideToast();
+  // Start from the current grid when it's a usable one, else a default quad — so a
+  // well-detected grid is only tweaked, but a bad/absent one starts from scratch.
+  if (!gridReliable || !seedQuadFromCurrentGrid()) manualDefaultQuad();
+  manualCollapsed = false;
   updateManualBar();
   showManualBar(true);
   applyManual();
@@ -622,6 +662,12 @@ function exitManualMode(keep: boolean) {
   }
   draw();
   updateGridFallback();
+}
+
+/** Show the top-bar "edit grid" button whenever a result is on screen and we're not
+ * already editing (so any grid can be adjusted by hand at any time). */
+function updateEditGridButton() {
+  btnEditGrid.hidden = !(showingResult && !manualActive);
 }
 
 // Pointer gestures while editing a manual grid (routed from the map handlers).
@@ -2061,6 +2107,7 @@ function retake() {
   showManualBar(false);
   gridFail.hidden = true;
   fabWrap.hidden = true;
+  btnEditGrid.hidden = true;
   topActions.hidden = true; // leaving result mode → hide Pulisci / Rifai
   startCamera().catch(() => {
     setStatus('Fotocamera non disponibile — tocca lo schermo per riprovare');
@@ -2096,19 +2143,44 @@ failManual.addEventListener('click', () => {
 // Manual-grid bar controls.
 const MANUAL_MIN_CELLS = 1;
 const MANUAL_MAX_CELLS = 60;
-function bumpManual(which: 'cols' | 'rows', delta: number) {
-  if (which === 'cols')
-    manualNa = Math.max(MANUAL_MIN_CELLS, Math.min(MANUAL_MAX_CELLS, manualNa + delta));
-  else manualNb = Math.max(MANUAL_MIN_CELLS, Math.min(MANUAL_MAX_CELLS, manualNb + delta));
+/** Clamp + apply a cell count, syncing the input fields. */
+function setManualCount(which: 'cols' | 'rows', value: number) {
+  const v = Math.max(MANUAL_MIN_CELLS, Math.min(MANUAL_MAX_CELLS, Math.round(value)));
+  if (which === 'cols') manualNa = v;
+  else manualNb = v;
   updateManualBar();
   applyManual();
+}
+function bumpManual(which: 'cols' | 'rows', delta: number) {
+  setManualCount(which, (which === 'cols' ? manualNa : manualNb) + delta);
 }
 colsMinus.addEventListener('click', () => bumpManual('cols', -1));
 colsPlus.addEventListener('click', () => bumpManual('cols', +1));
 rowsMinus.addEventListener('click', () => bumpManual('rows', -1));
 rowsPlus.addEventListener('click', () => bumpManual('rows', +1));
+// Direct numeric entry: apply live while a valid number is typed, normalise (clamp +
+// rewrite the field) on commit.
+const liveCount = (which: 'cols' | 'rows', el: HTMLInputElement) => () => {
+  const n = parseInt(el.value, 10);
+  if (Number.isFinite(n) && n >= MANUAL_MIN_CELLS) {
+    const v = Math.min(MANUAL_MAX_CELLS, n);
+    if (which === 'cols') manualNa = v;
+    else manualNb = v;
+    applyManual();
+  }
+};
+colsInput.addEventListener('input', liveCount('cols', colsInput));
+rowsInput.addEventListener('input', liveCount('rows', rowsInput));
+colsInput.addEventListener('change', () => setManualCount('cols', parseInt(colsInput.value, 10) || manualNa));
+rowsInput.addEventListener('change', () => setManualCount('rows', parseInt(rowsInput.value, 10) || manualNb));
+manualCollapse.addEventListener('click', () => {
+  manualCollapsed = !manualCollapsed;
+  manualBar.classList.toggle('collapsed', manualCollapsed);
+});
 manualDone.addEventListener('click', () => exitManualMode(true));
 manualCancel.addEventListener('click', () => exitManualMode(false));
+// Top-bar "edit grid" — adjust any current grid (or start from a default) by hand.
+btnEditGrid.addEventListener('click', () => enterManualMode());
 window.addEventListener('popstate', () => {
   if (showingResult) retake();
 });

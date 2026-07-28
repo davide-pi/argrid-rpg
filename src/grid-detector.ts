@@ -41,6 +41,10 @@ export interface DetectorParams {
    *              border the detector missed (e.g. a colour-only map edge)
    *   'frame'  — tile the whole frame with the inferred grid (virtual grid) */
   extend: 'off' | 'border' | 'frame';
+  /** Also detect CHROMATIC edges (grid vs background differ in hue but not
+   * luminance, so grayscale Canny misses them): OR the Lab a/b edge map into the
+   * luminance Canny before Hough. A near-neutral channel contributes nothing. */
+  colorEdges: boolean;
 }
 
 export const DEFAULT_PARAMS: DetectorParams = {
@@ -52,6 +56,7 @@ export const DEFAULT_PARAMS: DetectorParams = {
   reconstruct: true,
   lineMorph: true,
   extend: 'frame',
+  colorEdges: true,
 };
 
 /** A line as normal form: nx*x + ny*y = d, with (nx,ny) a unit vector. */
@@ -217,6 +222,17 @@ export function detectGridFromMat(
 
   const cannyEdges = new cv.Mat();
   cv.Canny(blurred, cannyEdges, cannyLow, cannyHigh);
+
+  // Chromatic edges: a grid that differs from its background in HUE but not in
+  // brightness (e.g. a coloured map on a similarly-light surface) leaves no
+  // luminance edge, so grayscale Canny misses it. Add the colour-only edges from
+  // the Lab a/b channels. Only when the source has colour (RGBA) and the channel
+  // actually carries chroma (near-neutral channels contribute nothing).
+  if (params.colorEdges && work.channels && work.channels() === 4) {
+    const chroma = chromaEdges(cv, work);
+    cv.bitwise_or(cannyEdges, chroma, cannyEdges);
+    chroma.delete();
+  }
 
   // Focus gating (off by default): the grid sits in the focal plane, so it is
   // sharper than an out-of-focus background; suppress edges whose local sharpness
@@ -405,6 +421,55 @@ function enhanceGridLines(cv: any, gray: any): any {
   [blur, inv, hSE, vSE, sq, oH, oV, oS, rH, rV, hSE2, vSE2, hSEc, vSEc, bH, bV, d3].forEach((x) => x.delete());
   if (tempG) tempG.delete();
   return mask;
+}
+
+/** Below this std (0..255) a Lab chroma channel is treated as neutral (no colour
+ * information) and skipped, so a near-grayscale photo adds no chromatic edges. */
+const CHROMA_MIN_STD = 3;
+
+/**
+ * Colour-only edge mask from the Lab chroma channels (a, b) of an RGBA image.
+ * Luminance (L) is already handled by the grayscale Canny path; here we pick up
+ * edges where only the hue changes. Each chroma channel is auto-Canny'd (Otsu,
+ * mirroring the luminance path) and the two are OR'd. A near-neutral channel
+ * (std < CHROMA_MIN_STD) is skipped. Returns an 8U mask at `work`'s resolution
+ * (the caller ORs it into the luminance edges and deletes it).
+ */
+function chromaEdges(cv: any, work: any): any {
+  const out = cv.Mat.zeros(work.rows, work.cols, cv.CV_8U);
+  const rgb = new cv.Mat();
+  cv.cvtColor(work, rgb, cv.COLOR_RGBA2RGB);
+  const lab = new cv.Mat();
+  cv.cvtColor(rgb, lab, cv.COLOR_RGB2Lab);
+  rgb.delete();
+  const chans = new cv.MatVector();
+  cv.split(lab, chans);
+  lab.delete();
+  for (const idx of [1, 2]) {
+    // a (1) and b (2) are the chroma channels; L (0) is luminance, already used.
+    const ch = chans.get(idx);
+    const me = new cv.Mat();
+    const st = new cv.Mat();
+    cv.meanStdDev(ch, me, st);
+    const sigma = st.data64F[0];
+    me.delete();
+    st.delete();
+    if (sigma >= CHROMA_MIN_STD) {
+      const blur = new cv.Mat();
+      cv.GaussianBlur(ch, blur, new cv.Size(3, 3), 0);
+      const otsuTmp = new cv.Mat();
+      const otsu = cv.threshold(blur, otsuTmp, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+      otsuTmp.delete();
+      const e = new cv.Mat();
+      cv.Canny(blur, e, Math.max(1, Math.round(0.5 * otsu)), Math.max(1, Math.round(otsu)));
+      cv.max(out, e, out);
+      blur.delete();
+      e.delete();
+    }
+    ch.delete();
+  }
+  chans.delete();
+  return out;
 }
 
 /**

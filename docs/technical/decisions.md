@@ -35,6 +35,20 @@ normal, `d = mean(rho·cos(θ − θ̄))` (`src/grid-detector.ts:244`, `mergeDup
 rho collapses it to ~0. Projection is sign-consistent. Unit tests with exact synthetic
 θ do not catch this — only real Hough output does.
 
+### Chromatic edges added to the luminance Canny (`colorEdges: true`)
+**Decision:** besides the grayscale Canny, auto-Canny the Lab **a/b** chroma channels and
+OR them into the edge map before Hough; a near-neutral channel (std < `CHROMA_MIN_STD`)
+contributes nothing (`chromaEdges`, wired in `detectGridFromMat` `src/grid-detector.ts`).
+**Why:** the pipeline works on luminance (`COLOR_RGBA2GRAY`), so a grid separated from its
+background only by **hue** at similar brightness leaves no luminance edge and is missed
+entirely. The Lab a/b channels carry exactly that colour information.
+**Cost/scope:** a couple of extra Canny passes on the chroma channels (a few ms). It is
+**orthogonal** to the noisy-texture fallback: colour recovers hue-contrast grids, the
+morphological path recovers low-contrast texture — neither replaces the other. Verified
+live: an **iso-luminance** grid (magenta lines on a gray of identical Y) is `0×0` with
+`colorEdges:false` and the full grid with it on; clean gray grids and the dirt photo are
+unchanged (near-neutral chroma adds nothing).
+
 ### Grid extrapolated to the whole frame by default (`extend: 'frame'`)
 **Decision:** after fitting the regular lattice, continue it `a + b·k` outward past the
 detected extent and tile the **entire image frame** with the inferred grid; extrapolated

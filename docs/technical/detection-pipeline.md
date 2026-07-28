@@ -19,12 +19,14 @@ Entry points (all funnel into `detectGridFromMat`):
 | 1 | Downscale to `maxDim` | `detectGrid` / `…FromMat` | `INTER_AREA`; `scale` is carried so lines map back to original coords (`grid-detector.ts:109`). |
 | 2 | Grayscale → **CLAHE** (local contrast) | `grid-detector.ts:190` | `cv.CLAHE(2.0, 8×8)` so faint / unevenly-lit grids still yield edges. |
 | 3 | Gaussian blur 3×3 | `grid-detector.ts:195` | |
-| 4 | **Auto-Canny** from Otsu | `grid-detector.ts:199` | `high = round(otsu)`, `low = round(0.5·otsu)` (`:207`), then `cv.Canny` (`:211`). |
-| 5 | Focus gating (optional) | `gateEdgesByFocus` `grid-detector.ts:296` | **Off by default**; suppresses blurry, out-of-plane edges by local `|Laplacian|` vs the median. Called at `:221`. |
-| 6 | **Adaptive Hough** | `grid-detector.ts:229` | `cv.HoughLines`, 0.5° resolution (`:230`); threshold starts at `max(30, minDim·0.3)` and self-tunes over ≤8 tries (too few → relax, >600 → tighten). |
-| 7 | Parse raw lines, **rho kept SIGNED** | `grid-detector.ts:244` | θ→`[0,180)`; rho stays signed so the 0/180° wrap doesn't collapse two parallel lines. See the wrap note below. |
-| 8 | Build the 2-D lattice | `buildGrid` `grid-detector.ts:424` | The rest of this section. |
-| 9 | Debug edges (optional) | `grid-detector.ts:261` | When `wantEdges`, packs the Canny mask into an RGBA `ImageData` (DOM-free). |
+| 4 | **Auto-Canny** from Otsu | `grid-detector.ts:199` | `high = round(otsu)`, `low = round(0.5·otsu)`, then `cv.Canny`. |
+| 5 | **Chromatic edges** (optional) | `chromaEdges` | On (`colorEdges`) and when the source is RGBA: auto-Canny the Lab **a/b** channels and OR into the luminance edges, so a grid that differs from its background only in **hue** (no luminance edge) is still found. A near-neutral channel (std < `CHROMA_MIN_STD` = 3) is skipped. |
+| 6 | Focus gating (optional) | `gateEdgesByFocus` | **Off by default**; suppresses blurry, out-of-plane edges by local `|Laplacian|` vs the median. |
+| 7 | **Adaptive Hough** | `houghToGrid` | `cv.HoughLines`, 0.5° resolution; threshold starts at `max(30, minDim·0.3)` and self-tunes over ≤8 tries (too few → relax, >600 → tighten). |
+| — | **Noisy fallback** (optional) | `enhanceGridLines` | If the standard path detects `< 3` lines per family and `lineMorph` is on, retry Hough on a morphological line mask (directional openings that suppress isotropic texture) and keep it if it detects more. |
+| 8 | Parse raw lines, **rho kept SIGNED** | `grid-detector.ts:244` | θ→`[0,180)`; rho stays signed so the 0/180° wrap doesn't collapse two parallel lines. See the wrap note below. |
+| 9 | Build the 2-D lattice | `buildGrid` | The rest of this section (incl. the `extend` extrapolation, step 7 there). |
+| 10 | Debug edges (optional) | `grid-detector.ts:261` | When `wantEdges`, packs the (combined) edge mask into an RGBA `ImageData` (DOM-free). |
 
 ## `buildGrid` — from lines to a lattice (`grid-detector.ts:424`)
 
@@ -85,6 +87,7 @@ exact synthetic θ do **not** catch it — only real Hough output does.
 | `reconstruct` | `true` | Rebuild the regular lattice and drop off-lattice lines; if off, only detected offsets are used. |
 | `lineMorph` | `true` | Noisy/low-contrast fallback (grid on dirt/cork): if the plain Canny path detects `< 3` lines per family, retry on a morphological line mask (`enhanceGridLines`) and keep it if it detects more. Strength is counted from **detected** lines only, so fill/extension can't mask a weak detection. |
 | `extend` | `'frame'` | Extrapolate the fitted lattice past the detected lines (step 7): `'off'` none, `'border'` a couple of cells to recover a missed outer edge, `'frame'` tile the whole frame (virtual grid). |
+| `colorEdges` | `true` | Also detect **chromatic** edges (Lab a/b) and OR them into the luminance Canny, so a grid distinguished from its background by hue (not brightness) is found (`chromaEdges`, stage 5). |
 
 ## `GridResult.info` (diagnostics, `grid-detector.ts:52`)
 

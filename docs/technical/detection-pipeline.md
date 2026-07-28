@@ -13,9 +13,8 @@ Entry points (all funnel into the generator `detectGridFromMatSteps`):
   tick before each heavy stage and `return`s the `GridResult`. The app drives it with a frame
   yield between steps (`runDetection` in `main.ts`) to paint the progress bar / keep the loading
   die spinning while the still-synchronous OpenCV stages briefly block the main thread.
-- `detectGridFromImageData(cv, imageData, …)` — sync, DOM-free, for a Worker.
-- `detectGridFromMat(cv, work, W0, H0, scale, …)` — sync wrapper that drives
-  `detectGridFromMatSteps` to completion (tests, the DEV hook).
+- `detectGridFromMat(cv, work, W0, H0, scale, …)` — sync wrapper (on an already-scaled
+  Mat) that drives `detectGridFromMatSteps` to completion (tests, the DEV hook).
 
 ## Stages
 
@@ -85,8 +84,7 @@ exact synthetic θ do **not** catch it — only real Hough output does.
 | Knob | Default | Effect |
 | --- | --- | --- |
 | `maxDim` | `1600` | Longest side after downscale (speed/robustness). |
-| `angleTolDeg` | `24` | Family-axis tolerance (kept for callers; the split itself uses nearest-axis, no hard cut). |
-| `mergeFrac` | `0.012` | Offset merge distance as a fraction of `maxDim` (`:491`). |
+| `mergeFrac` | `0.012` | Offset merge distance as a fraction of `maxDim`. |
 | `fillGrid` | `true` | Emit occluded rows/cols as `filled` lines (`:798`). UI forces this on (`main.ts:233`). |
 | `focusGating` | `false` | Suppress out-of-focus edges before Hough. Off — it erased faint/hand-drawn grids. |
 | `reconstruct` | `true` | Rebuild the regular lattice and drop off-lattice lines; if off, only detected offsets are used. |

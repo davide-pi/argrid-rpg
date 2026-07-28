@@ -19,8 +19,6 @@
 export interface DetectorParams {
   /** Downscale so the longest side is at most this many px (speed/robustness). */
   maxDim: number;
-  /** How far (deg) a line may sit from a family axis to still belong to it. */
-  angleTolDeg: number;
   /** Lines whose offsets differ by less than this fraction of maxDim merge. */
   mergeFrac: number;
   /** Interpolate missing interior lines from the estimated cell pitch. */
@@ -49,7 +47,6 @@ export interface DetectorParams {
 
 export const DEFAULT_PARAMS: DetectorParams = {
   maxDim: 1600,
-  angleTolDeg: 24,
   mergeFrac: 0.012,
   fillGrid: true,
   focusGating: false,
@@ -145,51 +142,16 @@ export interface DetectProgress {
   label: string;
 }
 
-/** Downscale `src` so its longest side is `maxDim`, then run the full pipeline;
- * synchronous (drains the staged generator). The caller owns `src`. */
-function runAtMaxDim(
-  cv: any,
-  src: any,
-  W0: number,
-  H0: number,
-  maxDim: number,
-  params: DetectorParams,
-  wantEdges: boolean,
-): GridResult {
+/** Downscale a full-resolution `src` Mat so its longest side is `maxDim`, into the
+ * caller-managed `work` Mat (INTER_AREA), returning the scale factor. */
+function scaleToWork(cv: any, src: any, work: any, W0: number, H0: number, maxDim: number): number {
   const scale = Math.min(1, maxDim / Math.max(W0, H0));
-  const work = new cv.Mat();
   if (scale < 1) {
     cv.resize(src, work, new cv.Size(Math.round(W0 * scale), Math.round(H0 * scale)), 0, 0, cv.INTER_AREA);
   } else {
     src.copyTo(work);
   }
-  const r = detectGridFromMat(cv, work, W0, H0, scale, params, wantEdges);
-  work.delete();
-  return r;
-}
-
-/** Generator form of `runAtMaxDim`, forwarding the pipeline's progress ticks. */
-function* runAtMaxDimSteps(
-  cv: any,
-  src: any,
-  W0: number,
-  H0: number,
-  maxDim: number,
-  params: DetectorParams,
-  wantEdges: boolean,
-): Generator<DetectProgress, GridResult, void> {
-  const scale = Math.min(1, maxDim / Math.max(W0, H0));
-  const work = new cv.Mat();
-  try {
-    if (scale < 1) {
-      cv.resize(src, work, new cv.Size(Math.round(W0 * scale), Math.round(H0 * scale)), 0, 0, cv.INTER_AREA);
-    } else {
-      src.copyTo(work);
-    }
-    return yield* detectGridFromMatSteps(cv, work, W0, H0, scale, params, wantEdges);
-  } finally {
-    work.delete();
-  }
+  return scale;
 }
 
 export function detectGrid(
@@ -201,10 +163,13 @@ export function detectGrid(
   const W0 = srcCanvas.width;
   const H0 = srcCanvas.height;
   const src = cv.imread(srcCanvas);
+  const work = new cv.Mat();
   try {
-    return runAtMaxDim(cv, src, W0, H0, params.maxDim, params, wantEdges);
+    const scale = scaleToWork(cv, src, work, W0, H0, params.maxDim);
+    return detectGridFromMat(cv, work, W0, H0, scale, params, wantEdges);
   } finally {
     src.delete();
+    work.delete();
   }
 }
 
@@ -224,30 +189,13 @@ export function* detectGridSteps(
   const W0 = srcCanvas.width;
   const H0 = srcCanvas.height;
   const src = cv.imread(srcCanvas);
+  const work = new cv.Mat();
   try {
-    return yield* runAtMaxDimSteps(cv, src, W0, H0, params.maxDim, params, wantEdges);
+    const scale = scaleToWork(cv, src, work, W0, H0, params.maxDim);
+    return yield* detectGridFromMatSteps(cv, work, W0, H0, scale, params, wantEdges);
   } finally {
     src.delete();
-  }
-}
-
-/**
- * Grid detection from an ImageData (no canvas/DOM needed) — used by the Web
- * Worker, where OpenCV runs off the main thread.
- */
-export function detectGridFromImageData(
-  cv: any,
-  imageData: ImageData,
-  params: DetectorParams = DEFAULT_PARAMS,
-  wantEdges = false,
-): GridResult {
-  const W0 = imageData.width;
-  const H0 = imageData.height;
-  const src = cv.matFromImageData(imageData);
-  try {
-    return runAtMaxDim(cv, src, W0, H0, params.maxDim, params, wantEdges);
-  } finally {
-    src.delete();
+    work.delete();
   }
 }
 
@@ -266,7 +214,7 @@ export function detectGridFromMat(
   wantEdges = false,
 ): GridResult {
   // Drive the staged generator straight to completion (synchronous callers:
-  // tests, the DEV hook, the Worker path).
+  // tests and the DEV hook).
   const g = detectGridFromMatSteps(cv, work, W0, H0, scale, params, wantEdges);
   let s = g.next();
   while (!s.done) s = g.next();

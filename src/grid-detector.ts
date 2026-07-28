@@ -30,6 +30,10 @@ export interface DetectorParams {
   focusGating: boolean;
   /** Rebuild the regular lattice and drop lines that don't fit it. */
   reconstruct: boolean;
+  /** Fallback for noisy/low-contrast photos (a grid drawn on a textured surface):
+   * if the plain Canny pipeline finds no grid, retry with a morphological line
+   * extractor that suppresses isotropic texture and keeps long thin lines. */
+  lineMorph: boolean;
 }
 
 export const DEFAULT_PARAMS: DetectorParams = {
@@ -39,6 +43,7 @@ export const DEFAULT_PARAMS: DetectorParams = {
   fillGrid: true,
   focusGating: false,
   reconstruct: true,
+  lineMorph: true,
 };
 
 /** A line as normal form: nx*x + ny*y = d, with (nx,ny) a unit vector. */
@@ -185,7 +190,7 @@ export function detectGridFromMat(
     cv.cvtColor(work, gray, cv.COLOR_RGBA2GRAY);
   }
 
-  // Local-contrast equalization so faint / unevenly lit grids still yield edges.
+  // --- Standard edge path: CLAHE local contrast -> blur -> auto-Canny (Otsu) ---
   const eq = new cv.Mat();
   const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
   clahe.apply(gray, eq);
@@ -196,33 +201,81 @@ export function detectGridFromMat(
 
   // Auto-Canny: derive thresholds from Otsu's global threshold.
   const otsuTmp = new cv.Mat();
-  const otsu = cv.threshold(
-    blurred,
-    otsuTmp,
-    0,
-    255,
-    cv.THRESH_BINARY + cv.THRESH_OTSU,
-  );
+  const otsu = cv.threshold(blurred, otsuTmp, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
   otsuTmp.delete();
   const cannyHigh = Math.max(1, Math.round(otsu));
   const cannyLow = Math.max(1, Math.round(0.5 * otsu));
 
-  const edges = new cv.Mat();
-  cv.Canny(blurred, edges, cannyLow, cannyHigh);
+  const cannyEdges = new cv.Mat();
+  cv.Canny(blurred, cannyEdges, cannyLow, cannyHigh);
 
-  // --- Focus gating -----------------------------------------------------
-  // The grid sits in the photo's focal plane, so it is SHARPER than the
-  // out-of-focus background. We measure local sharpness (mean |Laplacian| over
-  // a window) and suppress edges whose local sharpness is well below the
-  // typical (median) sharpness of the detected edges — i.e. blurry background
-  // lines, distant clutter, table edges out of the plane. Fully automatic and
-  // self-disabling: if the whole frame is uniformly sharp, every edge sits near
-  // the median and nothing is removed. Off by default (see DetectorParams).
-  if (params.focusGating) gateEdgesByFocus(cv, gray, edges);
-  const edgePixels = cv.countNonZero(edges);
+  // Focus gating (off by default): the grid sits in the focal plane, so it is
+  // sharper than an out-of-focus background; suppress edges whose local sharpness
+  // is well below the median among edges. Self-disabling when the frame is
+  // uniformly sharp. See DetectorParams.
+  if (params.focusGating) gateEdgesByFocus(cv, gray, cannyEdges);
+  eq.delete();
+  blurred.delete();
 
-  // Adaptive Hough: threshold is a fraction of the shorter side and self-tunes.
-  // Too few lines -> relax; way too many -> tighten.
+  // Hough + grid fit on the Canny edges.
+  let edges = cannyEdges;
+  let { result } = houghToGrid(cv, edges, work, scale, W0, H0, params);
+
+  // --- Fallback for noisy / low-contrast photos -------------------------
+  // When Canny drowns in background texture (a grid drawn on dirt/cork), it finds
+  // no grid. Retry with the morphological line extractor and keep it if it does
+  // better. Costs an extra pass only when the plain pipeline already failed.
+  const strength = (r: GridResult) => Math.min(r.info.aCount, r.info.bCount);
+  if (params.lineMorph && strength(result) < 3) {
+    const morphEdges = enhanceGridLines(cv, gray);
+    const alt = houghToGrid(cv, morphEdges, work, scale, W0, H0, params);
+    if (strength(alt.result) > strength(result)) {
+      result = alt.result;
+      cannyEdges.delete();
+      edges = morphEdges;
+    } else {
+      morphEdges.delete();
+    }
+  }
+
+  result.info.cannyHigh = cannyHigh;
+  result.info.edgePixels = cv.countNonZero(edges);
+
+  if (wantEdges) {
+    // Build an RGBA ImageData from the single-channel edge mask (DOM-free, so it
+    // also works inside a Web Worker).
+    const ew = edges.cols;
+    const eh = edges.rows;
+    const buf = new Uint8ClampedArray(ew * eh * 4);
+    const em = edges.data as Uint8Array;
+    for (let i = 0; i < ew * eh; i++) {
+      const v = em[i];
+      buf[i * 4] = v;
+      buf[i * 4 + 1] = v;
+      buf[i * 4 + 2] = v;
+      buf[i * 4 + 3] = 255;
+    }
+    result.edges = new ImageData(buf, ew, eh);
+  }
+
+  gray.delete();
+  edges.delete();
+
+  return result;
+}
+
+/** Adaptive Hough on an edge mask + grid fit. The accumulator threshold is a
+ * fraction of the shorter side and self-tunes: too few lines -> relax; far too
+ * many -> tighten. Shared by the Canny path and the morphological fallback. */
+function houghToGrid(
+  cv: any,
+  edges: any,
+  work: any,
+  scale: number,
+  W0: number,
+  H0: number,
+  params: DetectorParams,
+): { result: GridResult; usedHough: number } {
   const minDim = Math.min(work.cols, work.rows);
   const linesMat = new cv.Mat();
   let usedHough = Math.max(30, Math.round(minDim * 0.3));
@@ -239,49 +292,107 @@ export function detectGridFromMat(
     }
     break;
   }
-
   const raw: RawLine[] = [];
   for (let i = 0; i < linesMat.rows; i++) {
     const rho = linesMat.data32F[i * 2];
     const theta = linesMat.data32F[i * 2 + 1];
-    // OpenCV's convention: theta in [0,pi) and rho SIGNED. Keep rho signed —
-    // the offset projection (rho*cos(theta-mean)) is already sign-correct, and
-    // flipping rho to positive would collapse two distinct parallel lines onto
-    // the same representation.
+    // OpenCV's convention: theta in [0,pi) and rho SIGNED. Keep rho signed — the
+    // offset projection (rho*cos(theta-mean)) is already sign-correct, and forcing
+    // rho positive would collapse two distinct parallel lines onto one.
     let thetaDeg = theta * DEG;
     thetaDeg = ((thetaDeg % 180) + 180) % 180;
     raw.push({ rho, thetaDeg });
   }
-
+  linesMat.delete();
   const result = buildGrid(raw, scale, W0, H0, params);
   result.info.usedHough = usedHough;
-  result.info.cannyHigh = cannyHigh;
-  result.info.edgePixels = edgePixels;
+  return { result, usedHough };
+}
 
-  if (wantEdges) {
-    // Build an RGBA ImageData from the single-channel edge mask (DOM-free, so
-    // it also works inside a Web Worker).
-    const ew = edges.cols;
-    const eh = edges.rows;
-    const buf = new Uint8ClampedArray(ew * eh * 4);
-    const em = edges.data as Uint8Array;
-    for (let i = 0; i < ew * eh; i++) {
-      const v = em[i];
-      buf[i * 4] = v;
-      buf[i * 4 + 1] = v;
-      buf[i * 4 + 2] = v;
-      buf[i * 4 + 3] = 255;
-    }
-    result.edges = new ImageData(buf, ew, eh);
+/** Morphological line extractor for noisy / low-contrast photos (e.g. a grid drawn
+ * on a dirt or cork texture) where Canny drowns in speckle. Isotropic texture is
+ * suppressed and long thin dark lines are kept, giving a clean edge mask for Hough.
+ * Returns a binary mask at `gray`'s resolution (the caller deletes it).
+ *
+ * How it works: downscale (fine speckle averages out, lines survive) -> invert
+ * (dark lines become bright ridges) -> for the horizontal and vertical directions,
+ * a directional opening MINUS an isotropic opening = a line-only response in which
+ * the background and speckle cancel -> threshold at mean + K·σ -> re-open ALONG the
+ * line to drop residual blobs -> combine -> dilate. Broken lines are fine: Hough
+ * sums the fragments that share a (rho, theta), and the lattice fit rebuilds gaps. */
+function enhanceGridLines(cv: any, gray: any): any {
+  const MW = 1000; // work around ~1000px on the longer side
+  const down = Math.min(1, MW / Math.max(gray.cols, gray.rows));
+  let g = gray;
+  let tempG: any = null;
+  if (down < 1) {
+    tempG = new cv.Mat();
+    cv.resize(gray, tempG, new cv.Size(Math.round(gray.cols * down), Math.round(gray.rows * down)), 0, 0, cv.INTER_AREA);
+    g = tempG;
+  }
+  const minDim = Math.min(g.cols, g.rows);
+  const L = Math.max(9, Math.round(minDim / 23)); // line-probe length
+  const L2 = Math.max(12, Math.round(minDim / 14)); // min line run to keep
+  const LC = Math.max(24, Math.round(minDim / 7)); // bridge collinear fragments
+  const K = 2.0; // threshold = mean + K·σ of the line response
+
+  const blur = new cv.Mat();
+  cv.GaussianBlur(g, blur, new cv.Size(3, 3), 0);
+  const inv = new cv.Mat();
+  cv.bitwise_not(blur, inv);
+
+  const hSE = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(L, 1));
+  const vSE = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, L));
+  const sq = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(L, L));
+  const oH = new cv.Mat();
+  const oV = new cv.Mat();
+  const oS = new cv.Mat();
+  cv.morphologyEx(inv, oH, cv.MORPH_OPEN, hSE);
+  cv.morphologyEx(inv, oV, cv.MORPH_OPEN, vSE);
+  cv.morphologyEx(inv, oS, cv.MORPH_OPEN, sq);
+  const rH = new cv.Mat();
+  const rV = new cv.Mat();
+  cv.subtract(oH, oS, rH);
+  cv.subtract(oV, oS, rV);
+
+  const hSE2 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(L2, 1));
+  const vSE2 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, L2));
+  const hSEc = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(LC, 1));
+  const vSEc = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, LC));
+  // Threshold the line response, open ALONG the line to drop residual blobs, then
+  // close ALONG the line to bridge the gaps the speckle left — turning broken faint
+  // lines into continuous ones so Hough forms a strong single peak per grid line.
+  const binDir = (r: any, seOpen: any, seClose: any): any => {
+    const me = new cv.Mat();
+    const st = new cv.Mat();
+    cv.meanStdDev(r, me, st);
+    const t = me.data64F[0] + K * st.data64F[0];
+    me.delete();
+    st.delete();
+    const b = new cv.Mat();
+    cv.threshold(r, b, t, 255, cv.THRESH_BINARY);
+    cv.morphologyEx(b, b, cv.MORPH_OPEN, seOpen);
+    cv.morphologyEx(b, b, cv.MORPH_CLOSE, seClose);
+    return b;
+  };
+  const bH = binDir(rH, hSE2, hSEc);
+  const bV = binDir(rV, vSE2, vSEc);
+  let mask = new cv.Mat();
+  cv.max(bH, bV, mask);
+  const d3 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
+  cv.dilate(mask, mask, d3);
+
+  // Back up to the caller's (work) resolution so Hough shares the same scale.
+  if (down < 1) {
+    const up = new cv.Mat();
+    cv.resize(mask, up, new cv.Size(gray.cols, gray.rows), 0, 0, cv.INTER_NEAREST);
+    mask.delete();
+    mask = up;
   }
 
-  gray.delete();
-  eq.delete();
-  blurred.delete();
-  edges.delete();
-  linesMat.delete();
-
-  return result;
+  [blur, inv, hSE, vSE, sq, oH, oV, oS, rH, rV, hSE2, vSE2, hSEc, vSEc, bH, bV, d3].forEach((x) => x.delete());
+  if (tempG) tempG.delete();
+  return mask;
 }
 
 /**

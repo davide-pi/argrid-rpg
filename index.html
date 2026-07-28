@@ -146,6 +146,18 @@
           </div>
         </div>
 
+        <!-- Processing overlay: shown while a captured photo is being analysed.
+             The die spins (compositor-driven, so it keeps turning even while the
+             synchronous OpenCV stages briefly block the main thread) and the bar
+             advances in steps as the detector reports progress. -->
+        <div id="processing" class="processing" hidden>
+          <img class="loader-die" src="/loading.png" alt="" aria-hidden="true" />
+          <p class="processing-msg" id="processingMsg">Analisi dell'immagine…</p>
+          <p class="processing-sub">Individuo la griglia nella foto, riempio le linee occluse ed estendo la griglia al resto dell'immagine.</p>
+          <div class="processing-bar"><div id="processingFill" class="processing-fill"></div></div>
+          <span class="processing-pct" id="processingPct">0%</span>
+        </div>
+
         <!-- Transient hint (e.g. entering placement mode), bottom-left near the FAB. -->
         <div class="toast" id="toast" hidden></div>
 

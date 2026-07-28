@@ -137,6 +137,65 @@ body {
   filter: grayscale(0.7) drop-shadow(0 0 8px rgba(239, 68, 68, 0.5));
 }
 
+/* --- Processing overlay (per-photo analysis) ------------------------- */
+/* Covers the map (not the header) while a captured photo is analysed. The die
+   reuses the loader's compositor-driven spin, so it keeps turning even while a
+   synchronous OpenCV stage briefly blocks the main thread; the bar advances in
+   steps between stages. */
+.processing {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+  background: rgba(10, 14, 19, 0.82);
+  backdrop-filter: blur(2px);
+}
+.processing[hidden] {
+  display: none;
+}
+.processing .loader-die {
+  width: min(88px, 24vw);
+  margin-bottom: 4px;
+}
+.processing-msg {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.processing-sub {
+  margin: 0;
+  max-width: 34ch;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: #9fb0c0;
+}
+.processing-bar {
+  width: min(280px, 70vw);
+  height: 8px;
+  border-radius: 999px;
+  background: #1c2a38;
+  overflow: hidden;
+}
+.processing-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--tactic-2));
+  transition: width 0.2s ease;
+}
+.processing-pct {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: #9fb0c0;
+}
+
 /* --- Top bar --------------------------------------------------------- */
 .topbar {
   display: flex;

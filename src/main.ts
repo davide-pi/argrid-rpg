@@ -2,6 +2,7 @@ import './style.css';
 import { Camera } from './camera';
 import {
   detectGrid,
+  detectGridSteps,
   clipLineToRect,
   intersect,
   DEFAULT_PARAMS,
@@ -57,6 +58,12 @@ const hint = $<HTMLDivElement>('hint');
 const loader = $<HTMLDivElement>('loader');
 const loaderMsg = $<HTMLParagraphElement>('loaderMsg');
 const loaderFill = $<HTMLDivElement>('loaderFill');
+
+// Processing overlay (shown while a captured photo is being analysed).
+const processing = $<HTMLDivElement>('processing');
+const processingMsg = $<HTMLParagraphElement>('processingMsg');
+const processingFill = $<HTMLDivElement>('processingFill');
+const processingPct = $<HTMLSpanElement>('processingPct');
 
 const btnCapture = $<HTMLButtonElement>('btnCapture');
 const btnRetake = $<HTMLButtonElement>('btnRetake');
@@ -351,32 +358,67 @@ function processImage(canvas: HTMLCanvasElement) {
   }
 }
 
-function runDetection() {
-  if (!cv || !lastCapture) return;
-  setStatus('Analisi…');
-  // Defer so 'Analisi…' paints before the synchronous CV work.
-  requestAnimationFrame(() => {
-    try {
-      const t0 = performance.now();
-      lastResult = detectGrid(cv, lastCapture!, currentParams(), debug);
-      // Grid↔image mapping for tactical overlays (unchanged across toggles).
-      gridMap = null;
-      if (lastResult && lastResult.familyA.length >= 2 && lastResult.familyB.length >= 2) {
-        gridMap = makeGridMap(lastResult.familyA, lastResult.familyB);
-        gridDims = { na: lastResult.familyA.length, nb: lastResult.familyB.length };
-      }
-      if (selectedCell) {
-        const [i, j] = selectedCell;
-        if (!gridMap || i >= gridDims.na - 1 || j >= gridDims.nb - 1) deselectCell();
-      }
-      const dt = Math.round(performance.now() - t0);
-      draw();
-      reportStatus(dt);
-    } catch (err) {
-      console.error(err);
-      setStatus('Errore analisi: ' + (err as Error).message);
+// Yield to the browser so it paints the overlay (bar + message) and keeps the
+// die's compositor animation running before we block on the next heavy stage.
+const nextFrame = () =>
+  new Promise<void>((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+
+let detecting = false;
+
+async function runDetection() {
+  // One detection at a time — the pipeline is heavy and holds OpenCV Mats.
+  if (!cv || !lastCapture || detecting) return;
+  detecting = true;
+  showProcessing("Analisi dell'immagine…", 0);
+  await nextFrame(); // paint the overlay before the first blocking stage
+  try {
+    const t0 = performance.now();
+    // Drive the staged detector: paint each step, yield a frame (die spins /
+    // bar advances), then run the next synchronous stage.
+    const gen = detectGridSteps(cv, lastCapture, currentParams(), debug);
+    let step = gen.next();
+    while (!step.done) {
+      setProcessing(step.value.label, step.value.frac);
+      await nextFrame();
+      step = gen.next();
     }
-  });
+    setProcessing('Quasi pronto…', 1);
+    lastResult = step.value;
+
+    // Grid↔image mapping for tactical overlays (unchanged across toggles).
+    gridMap = null;
+    if (lastResult && lastResult.familyA.length >= 2 && lastResult.familyB.length >= 2) {
+      gridMap = makeGridMap(lastResult.familyA, lastResult.familyB);
+      gridDims = { na: lastResult.familyA.length, nb: lastResult.familyB.length };
+    }
+    if (selectedCell) {
+      const [i, j] = selectedCell;
+      if (!gridMap || i >= gridDims.na - 1 || j >= gridDims.nb - 1) deselectCell();
+    }
+    const dt = Math.round(performance.now() - t0);
+    draw();
+    reportStatus(dt);
+  } catch (err) {
+    console.error(err);
+    setStatus('Errore analisi: ' + (err as Error).message);
+  } finally {
+    detecting = false;
+    hideProcessing();
+  }
+}
+
+function showProcessing(label: string, frac: number) {
+  processing.hidden = false;
+  setProcessing(label, frac);
+}
+function setProcessing(label: string, frac: number) {
+  processingMsg.textContent = label;
+  const pct = Math.max(0, Math.min(100, Math.round(frac * 100)));
+  processingFill.style.width = pct + '%';
+  processingPct.textContent = pct + '%';
+}
+function hideProcessing() {
+  processing.hidden = true;
 }
 
 function reportStatus(dt: number) {

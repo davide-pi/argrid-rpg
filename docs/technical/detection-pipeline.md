@@ -6,11 +6,16 @@ angle cut-off), and the grid is reconstructed as a true 2-D lattice via vanishin
 points + rectification. Output is plain data in **original image coordinates**, so the
 UI draws with Canvas 2D and no OpenCV.
 
-Entry points (all funnel into `detectGridFromMat`):
+Entry points (all funnel into the generator `detectGridFromMatSteps`):
 
-- `detectGrid(cv, srcCanvas, params, wantEdges)` — from a canvas (`grid-detector.ts:101`).
-- `detectGridFromImageData(cv, imageData, …)` — DOM-free, for a Worker (`grid-detector.ts:136`).
-- `detectGridFromMat(cv, work, W0, H0, scale, …)` — shared core (`grid-detector.ts:172`).
+- `detectGrid(cv, srcCanvas, params, wantEdges)` — sync, from a canvas.
+- `detectGridSteps(cv, srcCanvas, …)` — **generator**: `yield`s a `{frac,label}` `DetectProgress`
+  tick before each heavy stage and `return`s the `GridResult`. The app drives it with a frame
+  yield between steps (`runDetection` in `main.ts`) to paint the progress bar / keep the loading
+  die spinning while the still-synchronous OpenCV stages briefly block the main thread.
+- `detectGridFromImageData(cv, imageData, …)` — sync, DOM-free, for a Worker.
+- `detectGridFromMat(cv, work, W0, H0, scale, …)` — sync wrapper that drives
+  `detectGridFromMatSteps` to completion (tests, the DEV hook).
 
 ## Stages
 

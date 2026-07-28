@@ -117,6 +117,13 @@ function meanAngle180(anglesDeg: number[]): number {
   return m;
 }
 
+/** A coarse progress tick emitted between the heavy detection stages, so the UI
+ * can show a (jumpy) percentage and keep the loading die spinning. */
+export interface DetectProgress {
+  frac: number; // 0..1
+  label: string;
+}
+
 export function detectGrid(
   cv: any,
   srcCanvas: HTMLCanvasElement,
@@ -146,6 +153,44 @@ export function detectGrid(
   src.delete();
   work.delete();
   return result;
+}
+
+/**
+ * Staged detection from a canvas: same pipeline as `detectGrid`, but a GENERATOR
+ * that `yield`s a {frac,label} tick before each heavy stage and `return`s the
+ * `GridResult`. The caller (the app) drives it with a frame yield between steps so
+ * the progress bar paints and the loading die keeps spinning during the (still
+ * synchronous) OpenCV work, which otherwise blocks the main thread.
+ */
+export function* detectGridSteps(
+  cv: any,
+  srcCanvas: HTMLCanvasElement,
+  params: DetectorParams = DEFAULT_PARAMS,
+  wantEdges = false,
+): Generator<DetectProgress, GridResult, void> {
+  const W0 = srcCanvas.width;
+  const H0 = srcCanvas.height;
+  const scale = Math.min(1, params.maxDim / Math.max(W0, H0));
+  const src = cv.imread(srcCanvas);
+  const work = new cv.Mat();
+  try {
+    if (scale < 1) {
+      cv.resize(
+        src,
+        work,
+        new cv.Size(Math.round(W0 * scale), Math.round(H0 * scale)),
+        0,
+        0,
+        cv.INTER_AREA,
+      );
+    } else {
+      src.copyTo(work);
+    }
+    return yield* detectGridFromMatSteps(cv, work, W0, H0, scale, params, wantEdges);
+  } finally {
+    src.delete();
+    work.delete();
+  }
 }
 
 /**
@@ -197,6 +242,30 @@ export function detectGridFromMat(
   params: DetectorParams = DEFAULT_PARAMS,
   wantEdges = false,
 ): GridResult {
+  // Drive the staged generator straight to completion (synchronous callers:
+  // tests, the DEV hook, the Worker path).
+  const g = detectGridFromMatSteps(cv, work, W0, H0, scale, params, wantEdges);
+  let s = g.next();
+  while (!s.done) s = g.next();
+  return s.value;
+}
+
+/**
+ * The pipeline body as a GENERATOR: identical work to `detectGridFromMat`, but it
+ * `yield`s a {frac,label} tick before each heavy stage so a driver can paint a
+ * progress bar / keep the die spinning between stages. `detectGridFromMat` and
+ * `detectGridSteps` are the two entry points; the caller owns `work`.
+ */
+export function* detectGridFromMatSteps(
+  cv: any,
+  work: any,
+  W0: number,
+  H0: number,
+  scale: number,
+  params: DetectorParams = DEFAULT_PARAMS,
+  wantEdges = false,
+): Generator<DetectProgress, GridResult, void> {
+  yield { frac: 0.05, label: "Preparazione dell'immagine…" };
   const gray = new cv.Mat();
   if (work.channels && work.channels() === 1) {
     work.copyTo(gray);
@@ -220,6 +289,7 @@ export function detectGridFromMat(
   const cannyHigh = Math.max(1, Math.round(otsu));
   const cannyLow = Math.max(1, Math.round(0.5 * otsu));
 
+  yield { frac: 0.2, label: 'Rilevamento dei bordi…' };
   const cannyEdges = new cv.Mat();
   cv.Canny(blurred, cannyEdges, cannyLow, cannyHigh);
 
@@ -229,6 +299,7 @@ export function detectGridFromMat(
   // the Lab a/b channels. Only when the source has colour (RGBA) and the channel
   // actually carries chroma (near-neutral channels contribute nothing).
   if (params.colorEdges && work.channels && work.channels() === 4) {
+    yield { frac: 0.35, label: 'Analisi cromatica…' };
     const chroma = chromaEdges(cv, work);
     cv.bitwise_or(cannyEdges, chroma, cannyEdges);
     chroma.delete();
@@ -243,6 +314,7 @@ export function detectGridFromMat(
   blurred.delete();
 
   // Hough + grid fit on the Canny edges.
+  yield { frac: 0.55, label: 'Ricerca delle linee della griglia…' };
   let edges = cannyEdges;
   let { result } = houghToGrid(cv, edges, work, scale, W0, H0, params);
 
@@ -255,6 +327,7 @@ export function detectGridFromMat(
   const detected = (fam: Line2[]) => fam.reduce((n, l) => n + (l.filled ? 0 : 1), 0);
   const strength = (r: GridResult) => Math.min(detected(r.familyA), detected(r.familyB));
   if (params.lineMorph && strength(result) < 3) {
+    yield { frac: 0.75, label: 'Immagine complessa, riprovo…' };
     const morphEdges = enhanceGridLines(cv, gray);
     const alt = houghToGrid(cv, morphEdges, work, scale, W0, H0, params);
     if (strength(alt.result) > strength(result)) {
@@ -266,6 +339,7 @@ export function detectGridFromMat(
     }
   }
 
+  yield { frac: 0.9, label: 'Ricostruzione della griglia…' };
   result.info.cannyHigh = cannyHigh;
   result.info.edgePixels = cv.countNonZero(edges);
 

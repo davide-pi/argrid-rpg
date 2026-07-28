@@ -46,6 +46,16 @@ rotating the angle ring, editing an area — only mutates module state and calls
 `draw()` (`main.ts:403`). `draw()` repaints the photo plus the vector overlays; it
 does not touch OpenCV. This is what keeps the UI responsive on a phone.
 
+**Reliability gate + manual grid.** After detection, `runDetection` sets
+`gridReliable` from `info.confidence` (≥ `MIN_GRID_CONFIDENCE`). When it's false the
+grid and the tactical layer are **not** drawn — instead the fallback panel
+(`#gridFail`) offers *retake* or *manual grid*. The manual editor overlays a
+draggable **quad** tiled into N×M cells and, via the quad→unit-square homography,
+synthesises the same `familyA`/`familyB` `Line2[]` the detector emits, so `draw()`,
+`makeGridMap` and every tactical tool are agnostic to whether the grid came from CV or
+from the user's hand. See [decisions.md](decisions.md) ("Unreliable auto grid → fallback
+panel + manual grid").
+
 ## Boot path (why a classic script)
 
 OpenCV's Emscripten runtime does **not** initialize when driven from an ES module, so

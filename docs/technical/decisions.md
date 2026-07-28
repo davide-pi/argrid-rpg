@@ -49,12 +49,14 @@ live: an **iso-luminance** grid (magenta lines on a gray of identical Y) is `0×
 `colorEdges:false` and the full grid with it on; clean gray grids and the dirt photo are
 unchanged (near-neutral chroma adds nothing).
 
-### Perspective robustness: stable VP, independent split, sub-multiple rejection
-**Decision:** three cheap, pure-geometry fixes make the lattice fit survive strong
+### Perspective robustness: stable VP, orthogonal split, sub-multiple rejection
+**Decision:** two cheap, pure-geometry fixes make the lattice fit survive strong
 perspective (`buildGrid` / `ransacVP` / `fitFamilyGrid`, `src/grid-detector.ts`):
-- **Independent second axis** — `axisB` is a separate histogram mode ≥30° from `axisA`
-  (not a forced `axisA+90`); the two grid families are not orthogonal in the image under
-  perspective. Falls back to orthogonal when there is no distinct second peak.
+- **Orthogonal second axis** — `axisB = axisA + 90`. An earlier attempt made `axisB` an
+  *independent* histogram mode ≥30° from `axisA`, but on the real corpus it bought nothing
+  the guards below weren't already delivering and could latch `axisB` onto a spurious cluster
+  (hand-drawn walls, text, a dominant diagonal), tilting the drawn grid off-square on angled
+  shots — the user saw this as a regression, so it was reverted to the robust orthogonal prior.
 - **Guarded vanishing point** — `ransacVP` trusts a *finite* VP only when the inliers
   actually fan (`VP_MIN_FAN_DEG`) **and** the VP lands outside the frame (`VP_FRAME_MARGIN`);
   otherwise it uses the stable at-infinity VP. A near-parallel family's noisy far
@@ -77,6 +79,26 @@ whose spacing is below the floor drops `confidence` to 0 so the UI warns.
 compresses toward invisibility) is still only partially recovered — such cases come back with
 low confidence (warned) rather than a clean grid; a full fix (per-row TLS / node-based fit) is
 a larger task tracked for the corner-node fallback.
+
+### Unreliable auto grid → fallback panel + manual grid, never a wrong grid
+**Decision:** when the detection `confidence` is below `MIN_GRID_CONFIDENCE` (0.35,
+`src/main.ts`) the app does **not** draw the auto grid or build tactics on it. Instead it shows
+the photo alone under a fallback card (`#gridFail`) with two choices: **retake**, or **manual
+grid**. The manual editor (`src/main.ts`, "Manual grid editor") overlays a **quad** (4 draggable
+corner handles) tiled into N×M cells; the quad→unit-square homography (`solveHomography`/`applyH`
+from `overlays.ts`) yields projective, perspective-correct nodes, from which it builds the same
+`familyA`/`familyB` `Line2[]` the detector would — so drawing (`drawFamily`) and every tactical
+tool (`makeGridMap`, tokens, areas, movement) work unchanged. Grid drawing + the tactical layer
+are gated on `gridReliable` (or the editor being active); the FAB/HUD are hidden while a grid is
+unreliable or being edited.
+**Why:** on genuinely hard shots (strong perspective, noise, or distractors like a tiled floor)
+detection fails in *any* variant of the pipeline — and drawing the resulting degenerate
+micro/macro grid over the photo is what reads as a "drastic loss of precision". Showing the clean
+photo + an honest choice (retake / place it yourself) is far better than a confident-looking wrong
+grid. The confidence score already collapses to ~0 on degenerate fits, so it is the natural gate.
+**Deferred:** a second manual sub-mode — *freehand draw → the system recalculates/expands the
+lattice* — and improving auto recall on the hard cases (distractor rejection, stronger sub-pitch
+guard, corner-node / map-boundary-quad fallbacks).
 
 ### Grid extrapolated to the whole frame by default (`extend: 'frame'`)
 **Decision:** after fitting the regular lattice, continue it `a + b·k` outward past the

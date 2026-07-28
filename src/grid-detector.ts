@@ -711,15 +711,7 @@ export function buildGrid(
   let peak = 0;
   for (let i = 1; i < bins.length; i++) if (bins[i] > bins[peak]) peak = i;
   const axisA = peak * 2 + 1;
-  // Under perspective the two grid families are NOT orthogonal in the image, so
-  // axisB is an INDEPENDENT second histogram mode at least 30° from axisA rather
-  // than a forced axisA+90. Fall back to orthogonal when there is no distinct
-  // second peak (a clean fronto-parallel grid).
-  let peakB = -1;
-  for (let i = 0; i < bins.length; i++) {
-    if (angDist180(i * 2 + 1, axisA) >= 30 && (peakB < 0 || bins[i] > bins[peakB])) peakB = i;
-  }
-  const axisB = peakB >= 0 && bins[peakB] > 0 ? peakB * 2 + 1 : (axisA + 90) % 180;
+  const axisB = (axisA + 90) % 180;
 
   const famA: Line2[] = [];
   const famB: Line2[] = [];

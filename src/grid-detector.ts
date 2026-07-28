@@ -790,12 +790,18 @@ export function buildGrid(
   // Extension works in the centred coordinate frame used for fitting; a line
   // is worth extrapolating only while it still crosses the actual image frame.
   const crossesImage = (l: Line2): boolean => !!clipLineToRect(fromCentered(l), W0, H0);
+  const minCell = Math.min(W0, H0) / MAX_CELLS_ACROSS;
   const H = buildRectify(vA.vp, vB.vp);
-  const A = fitFamilyGrid(inA, H, params, crossesImage);
-  const B = fitFamilyGrid(inB, H, params, crossesImage);
+  const A = fitFamilyGrid(inA, H, params, crossesImage, minCell);
+  const B = fitFamilyGrid(inB, H, params, crossesImage, minCell);
 
   const familyA = A.lines.map(fromCentered);
   const familyB = B.lines.map(fromCentered);
+
+  // A degenerate (sub-pitch) fit has an implausibly small cell — reconstruction
+  // was already skipped for it; also drop its confidence to ~0 so the UI warns.
+  const degenerate =
+    (A.spacing > 0 && A.spacing < minCell) || (B.spacing > 0 && B.spacing < minCell);
 
   return {
     width: W0,
@@ -816,7 +822,7 @@ export function buildGrid(
       edgePixels: 0,
       detectedA: detectedCount(familyA),
       detectedB: detectedCount(familyB),
-      confidence: gridConfidence(familyA, familyB),
+      confidence: degenerate ? 0 : gridConfidence(familyA, familyB),
     },
   };
 }
@@ -979,6 +985,12 @@ const EXTEND_FRAME_CELLS = 120;
  * image centre — i.e. they are piling up toward a vanishing point. */
 const EXTEND_MIN_GAP_PX = 3;
 
+/** A real tactical grid spans at most ~this many cells across the frame. A fitted
+ * cell smaller than image/this is a degenerate lattice (a spurious sub-pitch the
+ * VP/rectify fit locked onto under strong perspective) — reconstruction is then
+ * skipped so it can't fill/extend into hundreds of bogus lines. */
+const MAX_CELLS_ACROSS = 50;
+
 /**
  * Fit ONE family's regular lattice in the rectified plane (where its lines are
  * parallel and evenly spaced) and rebuild the complete set of lines, mapping
@@ -992,6 +1004,7 @@ function fitFamilyGrid(
   H: M3,
   params: DetectorParams,
   crossesImage: (l: Line2) => boolean,
+  minCell: number,
 ): FamilyGrid {
   const HinvT = transpose3(inv3(H) ?? IDENTITY3);
   const HT = transpose3(H);
@@ -1104,9 +1117,19 @@ function fitFamilyGrid(
     return finalize(offs.map((o) => backToImage(o, meanNx, meanNy, false)));
   }
 
+  // Degeneracy guard: map the fitted pitch back to the image. If a cell is
+  // implausibly small (< image/MAX_CELLS_ACROSS) the fit is spurious — usually the
+  // VP/rectify locking onto a sub-pitch under strong perspective — so DON'T fill or
+  // extend it (that is what balloons into hundreds of bogus lines); keep only the
+  // detected lines. The low resulting spacing also drives confidence to ~0.
+  const imgCell = Math.abs(
+    backToImage(a + b, meanNx, meanNy, false).d - backToImage(a, meanNx, meanNy, false).d,
+  );
+  const degenerate = imgCell > 0 && imgCell < minCell;
+
   const kmin = Math.min(...detectedIdx);
   const kmax = Math.max(...detectedIdx);
-  const canFill = params.fillGrid && kmax - kmin <= 200;
+  const canFill = !degenerate && params.fillGrid && kmax - kmin <= 200;
   const core: Line2[] = [];
   for (let k = kmin; k <= kmax; k++) {
     if (detectedIdx.has(k)) core.push(backToImage(a + b * k, meanNx, meanNy, false));
@@ -1128,7 +1151,7 @@ function fitFamilyGrid(
         : 0;
   const lo: Line2[] = [];
   const hi: Line2[] = [];
-  if (cap > 0 && core.length >= 2) {
+  if (!degenerate && cap > 0 && core.length >= 2) {
     const extendFrom = (startK: number, step: number, out: Line2[]): void => {
       // (nx,ny) is constant across offsets for this family, so |Δd| at the image
       // centre is exactly the perpendicular gap — a clean crowding test.

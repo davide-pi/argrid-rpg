@@ -49,6 +49,20 @@ live: an **iso-luminance** grid (magenta lines on a gray of identical Y) is `0×
 `colorEdges:false` and the full grid with it on; clean gray grids and the dirt photo are
 unchanged (near-neutral chroma adds nothing).
 
+### Degenerate sub-pitch lattices are rejected (no fill/extend)
+**Decision:** in `fitFamilyGrid`, map the fitted pitch back to the image; if a cell is
+smaller than `image / MAX_CELLS_ACROSS` (50), the fit is degenerate — skip fill and
+extension for that family and keep only the detected lines. A family whose final spacing
+is below that floor also drops `confidence` to 0 (`src/grid-detector.ts`).
+**Why:** on real photos under **strong perspective** the vanishing-point / rectification
+fit can lock onto a spurious sub-pitch (e.g. 7–8 px on a 720 px frame). The regular-lattice
+reconstruction then fills/extends it into **hundreds** of bogus lines (measured 113×65 and
+202×73 on two perspective test photos), which floods the tactical homography and the draw.
+The guard caps that (→ 6× and 12× for the sub-pitch family) and the low confidence warns
+the user. **Accepted limitation:** it does not *fix* the perspective mis-fit (the other
+family can still be over-dense); a proper fix (better family split / VP under perspective)
+is a larger, separate task.
+
 ### Grid extrapolated to the whole frame by default (`extend: 'frame'`)
 **Decision:** after fitting the regular lattice, continue it `a + b·k` outward past the
 detected extent and tile the **entire image frame** with the inferred grid; extrapolated

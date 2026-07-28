@@ -518,6 +518,8 @@ let strokeStart: ImgPt | null = null; // in-progress stroke endpoints
 let strokeEnd: ImgPt | null = null;
 const DRAW_SENTINEL = 5; // manualDrag value while tracing a line
 const PINCH_SENTINEL = 6; // manualDrag value while pinch-resizing the grid
+const ENDPOINT_SENTINEL = 7; // manualDrag value while dragging a traced-line endpoint
+let drawEndpointDrag: { s: number; e: 0 | 1 } | null = null; // which stroke endpoint
 // Live pointer positions (image coords) during manual editing, for pinch.
 const manualPointerPos = new Map<number, ImgPt>();
 let pinchState: { startDist: number; startQuad: ImgPt[]; center: ImgPt } | null = null;
@@ -748,6 +750,7 @@ function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
   manualStrokes = [];
   strokeStart = null;
   strokeEnd = null;
+  drawEndpointDrag = null;
   manualPointerPos.clear();
   pinchState = null;
   setManualHint();
@@ -827,6 +830,7 @@ function exitManualMode(keep: boolean) {
   manualStrokes = [];
   strokeStart = null;
   strokeEnd = null;
+  drawEndpointDrag = null;
   manualPointerPos.clear();
   pinchState = null;
   manualBar.classList.remove('draw-mode');
@@ -876,6 +880,29 @@ function manualPointerDown(e: PointerEvent) {
   }
 
   if (manualDrawPending) {
+    // Hit an existing stroke's delete badge or endpoint first; else start a new line.
+    const hr = manualStrokeHandleRadius() * 0.6;
+    for (let si = manualStrokes.length - 1; si >= 0; si--) {
+      const [a, b] = manualStrokes[si];
+      if (Math.hypot(p.x - (a.x + b.x) / 2, p.y - (a.y + b.y) / 2) <= hr) {
+        manualStrokes.splice(si, 1); // delete badge (midpoint)
+        manualDrag = null;
+        regenerateFromStrokes();
+        return;
+      }
+      if (Math.hypot(p.x - a.x, p.y - a.y) <= hr) {
+        drawEndpointDrag = { s: si, e: 0 };
+        manualDrag = ENDPOINT_SENTINEL;
+        capturePointer(e.pointerId);
+        return;
+      }
+      if (Math.hypot(p.x - b.x, p.y - b.y) <= hr) {
+        drawEndpointDrag = { s: si, e: 1 };
+        manualDrag = ENDPOINT_SENTINEL;
+        capturePointer(e.pointerId);
+        return;
+      }
+    }
     strokeStart = p;
     strokeEnd = p;
     manualDrag = DRAW_SENTINEL;
@@ -916,6 +943,13 @@ function manualPointerMove(e: PointerEvent) {
     applyManual();
     return;
   }
+  if (manualDrag === ENDPOINT_SENTINEL) {
+    if (!drawEndpointDrag) return;
+    e.preventDefault();
+    manualStrokes[drawEndpointDrag.s][drawEndpointDrag.e] = p;
+    regenerateFromStrokes();
+    return;
+  }
   if (manualDrag === DRAW_SENTINEL) {
     e.preventDefault();
     strokeEnd = p;
@@ -947,6 +981,11 @@ function manualPointerUp(e: PointerEvent) {
     }
     return;
   }
+  if (manualDrag === ENDPOINT_SENTINEL) {
+    manualDrag = null;
+    drawEndpointDrag = null;
+    return;
+  }
   if (manualDrag === DRAW_SENTINEL) {
     manualDrag = null;
     if (strokeStart && strokeEnd && Math.hypot(strokeEnd.x - strokeStart.x, strokeEnd.y - strokeStart.y) >= 12) {
@@ -965,30 +1004,68 @@ function manualPointerUp(e: PointerEvent) {
   manualDragLast = null;
 }
 
-/** Draw the traced reference lines + the in-progress stroke (draw mode). */
+/** Radius (image px) for a traced-line endpoint / delete handle hit-test + draw. */
+function manualStrokeHandleRadius(): number {
+  const W = lastResult?.width ?? view.width;
+  const H = lastResult?.height ?? view.height;
+  return Math.max(W, H) * 0.028;
+}
+
+/** Draw the traced reference lines + their endpoint/delete handles + the in-progress
+ * stroke (draw mode). */
 function drawStrokes(ctx: CanvasRenderingContext2D) {
   const lw = Math.max(2, view.width / 300);
+  const r = manualStrokeHandleRadius();
   ctx.save();
   ctx.lineCap = 'round';
-  ctx.strokeStyle = '#22d3ee';
-  ctx.lineWidth = lw;
   const seg = (a: ImgPt, b: ImgPt) => {
     ctx.beginPath();
     ctx.moveTo(a.x, a.y);
     ctx.lineTo(b.x, b.y);
     ctx.stroke();
   };
-  for (const [a, b] of manualStrokes) seg(a, b);
+  // Committed strokes: line + 2 endpoint handles + a delete (×) at the midpoint.
+  ctx.strokeStyle = '#22d3ee';
+  ctx.lineWidth = lw;
+  for (const [a, b] of manualStrokes) {
+    seg(a, b);
+    for (const p of [a, b]) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r * 0.5, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(34, 211, 238, 0.30)';
+      ctx.fill();
+      ctx.lineWidth = Math.max(2, r * 0.12);
+      ctx.strokeStyle = '#22d3ee';
+      ctx.stroke();
+    }
+    // delete badge at the midpoint
+    const mx = (a.x + b.x) / 2;
+    const my = (a.y + b.y) / 2;
+    ctx.beginPath();
+    ctx.arc(mx, my, r * 0.55, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(239, 68, 68, 0.92)';
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = Math.max(2, r * 0.14);
+    const k = r * 0.26;
+    ctx.beginPath();
+    ctx.moveTo(mx - k, my - k);
+    ctx.lineTo(mx + k, my + k);
+    ctx.moveTo(mx + k, my - k);
+    ctx.lineTo(mx - k, my + k);
+    ctx.stroke();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = '#22d3ee';
+  }
+  // In-progress stroke (no handles yet).
   if (strokeStart && strokeEnd) seg(strokeStart, strokeEnd);
   ctx.restore();
 }
 
-/** Magnifier loupe over the corner being dragged, so the finger doesn't hide where
- * the vertex is landing. Samples the already-drawn photo+grid from the canvas and
- * shows it zoomed with a crosshair at the exact corner. */
-function drawCornerLoupe(ctx: CanvasRenderingContext2D) {
-  if (manualDrag === null || manualDrag < 0 || manualDrag > 3 || !manualQuad) return;
-  const c = manualQuad[manualDrag]; // image = canvas coords (view backing store)
+/** Magnifier loupe over the point being dragged (a grid corner or a traced-line
+ * endpoint), so the finger doesn't hide where it lands. Samples the already-drawn
+ * photo+grid from the canvas and shows it zoomed with a crosshair at the point. */
+function drawLoupeAt(ctx: CanvasRenderingContext2D, c: ImgPt) {
   const zoom = 2.5;
   const R = Math.max(48, view.width * 0.14); // loupe radius (canvas px)
   const srcR = R / zoom;
@@ -1119,9 +1196,15 @@ function draw() {
 
   if (manualActive) {
     if (manualDrawPending) {
+      if (manualDrag === ENDPOINT_SENTINEL && drawEndpointDrag) {
+        drawLoupeAt(ctx, manualStrokes[drawEndpointDrag.s][drawEndpointDrag.e]);
+      }
       drawStrokes(ctx);
     } else {
-      drawCornerLoupe(ctx); // magnifier (samples clean photo+grid) while dragging a corner
+      // Magnifier (samples clean photo+grid) while dragging a corner.
+      if (manualDrag !== null && manualDrag >= 0 && manualDrag <= 3 && manualQuad) {
+        drawLoupeAt(ctx, manualQuad[manualDrag]);
+      }
       drawManualHandles(ctx);
     }
     return; // no tactical layer while editing the grid

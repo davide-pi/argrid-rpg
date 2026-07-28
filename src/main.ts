@@ -411,13 +411,11 @@ const nextFrame = () =>
 
 let detecting = false;
 
-// Below this confidence a shown grid gets a soft "you can edit it" toast (it's not a
-// hard gate any more — see runDetection). Matches the old weak-grid threshold.
-const MIN_GRID_CONFIDENCE = 0.35;
-// Max ratio between the two families' cell pitches before the fit is treated as
-// garbage (one family collapsed → micro cells one way, macro the other). Real grids —
-// even under strong perspective — keep the two median pitches within a few ×.
-const MAX_CELL_ASPECT = 6;
+// Minimum detection confidence to DRAW the auto grid (else → manual fallback). 0.5 =
+// at least 4 detected lines per family. Calibrated against the user's labels on the
+// 16-photo corpus: the correct grids scored ≥ 0.75, the wrong ones ≤ 0.25 (bar one
+// confident-but-wrong outlier no metric catches).
+const MIN_GRID_CONFIDENCE = 0.5;
 
 async function runDetection() {
   // One detection at a time — the pipeline is heavy and holds OpenCV Mats.
@@ -439,23 +437,13 @@ async function runDetection() {
     setProcessing('Quasi pronto…', 1);
     lastResult = step.value;
 
-    // Draw the auto grid unless it's actually garbage. "Garbage" = a DEGENERATE
-    // sub-pitch collapse (micro cells), a family that wasn't really found (< 2
-    // detected lines), or an EXTREME cell-aspect asymmetry (one family collapsed →
-    // micro cells one way, macro the other). Everything else — including small or
-    // borderline grids — is shown (with a soft "you can edit it" toast when
-    // confidence is low), so legitimate detections aren't hidden; only clearly-broken
-    // fits go to the fallback. Gating on confidence alone was too strict (it needed
-    // ~4 lines per family) and sent decent grids to the fallback.
-    gridReliable = false;
-    if (lastResult) {
-      const i = lastResult.info;
-      const aspect =
-        i.spacingA > 0 && i.spacingB > 0
-          ? Math.max(i.spacingA / i.spacingB, i.spacingB / i.spacingA)
-          : Infinity;
-      gridReliable = i.detectedA >= 2 && i.detectedB >= 2 && !i.degenerate && aspect <= MAX_CELL_ASPECT;
-    }
+    // Show the auto grid only when the detection is CONFIDENT. On a labelled 16-photo
+    // corpus, confidence separated correct from wrong almost perfectly: the correct
+    // grids scored ≥ 0.75, and every wrong one scored ≤ 0.25 — except a single
+    // confident-but-wrong outlier that no available metric distinguishes from a good
+    // grid. So a confidence gate is right ~15/16; everything below goes to the manual
+    // fallback. (A looser "not-degenerate" gate showed several wrong grids — worse.)
+    gridReliable = !!lastResult && lastResult.info.confidence >= MIN_GRID_CONFIDENCE;
 
     // Grid↔image mapping for tactical overlays — only for a reliable grid.
     gridMap = null;
@@ -1148,12 +1136,6 @@ function reportStatus(dt: number) {
   if (total === 0) {
     setStatus(`${i.rawCount} linee grezze ma nessuna griglia — inquadra più da vicino`);
     return;
-  }
-  // Weak-but-shown grid: few REAL (detected) lines, so it may be imperfect. Since we
-  // now DRAW it (only degenerate fits go to the fallback), nudge the user that they
-  // can fix it by hand rather than implying it failed.
-  if (gridReliable && i.confidence < MIN_GRID_CONFIDENCE) {
-    showToast('Griglia poco sicura — se non è precisa, toccala con l’icona griglia in alto per sistemarla.');
   }
   const base = `Griglia ${i.detectedA}×${i.detectedB} · conf ${(i.confidence * 100).toFixed(0)}% · ${i.angleADeg.toFixed(0)}°/${i.angleBDeg.toFixed(0)}° · ${dt}ms`;
   // On success the top-right shows the action buttons instead of a status line;

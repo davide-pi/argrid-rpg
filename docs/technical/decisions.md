@@ -81,8 +81,9 @@ low confidence (warned) rather than a clean grid; a full fix (per-row TLS / node
 a larger task tracked for the corner-node fallback.
 
 ### Unreliable auto grid → fallback panel + manual grid, never a wrong grid
-**Decision:** when the detection `confidence` is below `MIN_GRID_CONFIDENCE` (0.35,
-`src/main.ts`) the app does **not** draw the auto grid or build tactics on it. Instead it shows
+**Decision:** when the detection `confidence` is below `MIN_GRID_CONFIDENCE` (0.5 — at least 4
+detected lines per family, `src/main.ts`) the app does **not** draw the auto grid or build tactics
+on it. Instead it shows
 the photo alone under a fallback card (`#gridFail`) offering **retake**, **grid to adapt**, or
 **draw by hand**. A top-bar **edit-grid** button makes the manual editor available on *any* result
 too (so a well-detected grid can also be tweaked). The manual editor (`src/main.ts`, "Manual grid
@@ -106,7 +107,16 @@ being edited.
 detection fails in *any* variant of the pipeline — and drawing the resulting degenerate
 micro/macro grid over the photo is what reads as a "drastic loss of precision". Showing the clean
 photo + an honest choice (retake / place it yourself) is far better than a confident-looking wrong
-grid. The confidence score already collapses to ~0 on degenerate fits, so it is the natural gate.
+grid.
+**Calibration (user-labelled 16-photo corpus).** The user labelled which auto-detections are
+actually correct — **only 3/16** were (auto-detection accuracy is genuinely low on hard photos).
+Confidence tracks correctness well: the 3 correct grids scored **≥ 0.75**, and every wrong one
+scored **≤ 0.25 except one confident-but-wrong outlier** (a full lattice at the wrong orientation)
+that no available metric separates from a good grid. So `confidence ≥ 0.5` is the gate — it agrees
+with the labels **15/16** (only the outlier is shown-but-wrong). An earlier attempt to gate on
+"not degenerate + cell-aspect" instead of confidence was **worse** (it showed 5 wrong grids), and
+was reverted. Do NOT re-tune this gate against my own guesses — establish ground truth from the
+user first (see the memory note). The remaining gap is detection *accuracy*, not the gate.
 
 ### Map-boundary quad auto-rescue was attempted and dropped (unreliable segmentation)
 **Decision:** an auto "map boundary" step (restrict the edges to the detected map quad before

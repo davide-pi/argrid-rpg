@@ -200,9 +200,11 @@ export function* detectGridSteps(
 }
 
 /**
- * Grid detection on an already-loaded working Mat (RGBA or gray). Split out so
- * it can run headless (Node) without a canvas/DOM. The caller owns `work` and
- * must delete it.
+ * Grid detection on an already-loaded working Mat (RGBA or gray). Split out so it
+ * can be called without a <canvas>/DOM element (e.g. a Mat built from an ImageBitmap
+ * in a Worker, or a synthetic test Mat) — note OpenCV.js itself cannot run in Node
+ * (its Emscripten runtime wedges), so verification still goes through a headless
+ * browser. The caller owns `work` and must delete it.
  */
 export function detectGridFromMat(
   cv: any,
@@ -236,103 +238,125 @@ export function* detectGridFromMatSteps(
   params: DetectorParams = DEFAULT_PARAMS,
   wantEdges = false,
 ): Generator<DetectProgress, GridResult, void> {
-  yield { frac: 0.05, label: "Preparazione dell'immagine…" };
-  const gray = new cv.Mat();
-  if (work.channels && work.channels() === 1) {
-    work.copyTo(gray);
-  } else {
-    cv.cvtColor(work, gray, cv.COLOR_RGBA2GRAY);
-  }
-
-  // --- Standard edge path: CLAHE local contrast -> blur -> auto-Canny (Otsu) ---
-  const eq = new cv.Mat();
-  const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
-  clahe.apply(gray, eq);
-  clahe.delete();
-
-  const blurred = new cv.Mat();
-  cv.GaussianBlur(eq, blurred, new cv.Size(3, 3), 0);
-
-  // Auto-Canny: derive thresholds from Otsu's global threshold.
-  const otsuTmp = new cv.Mat();
-  const otsu = cv.threshold(blurred, otsuTmp, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
-  otsuTmp.delete();
-  const cannyHigh = Math.max(1, Math.round(otsu));
-  const cannyLow = Math.max(1, Math.round(0.5 * otsu));
-
-  yield { frac: 0.2, label: 'Rilevamento dei bordi…' };
-  const cannyEdges = new cv.Mat();
-  cv.Canny(blurred, cannyEdges, cannyLow, cannyHigh);
-
-  // Chromatic edges: a grid that differs from its background in HUE but not in
-  // brightness (e.g. a coloured map on a similarly-light surface) leaves no
-  // luminance edge, so grayscale Canny misses it. Add the colour-only edges from
-  // the Lab a/b channels. Only when the source has colour (RGBA) and the channel
-  // actually carries chroma (near-neutral channels contribute nothing).
-  if (params.colorEdges && work.channels && work.channels() === 4) {
-    yield { frac: 0.35, label: 'Analisi cromatica…' };
-    const chroma = chromaEdges(cv, work);
-    cv.bitwise_or(cannyEdges, chroma, cannyEdges);
-    chroma.delete();
-  }
-
-  // Focus gating (off by default): the grid sits in the focal plane, so it is
-  // sharper than an out-of-focus background; suppress edges whose local sharpness
-  // is well below the median among edges. Self-disabling when the frame is
-  // uniformly sharp. See DetectorParams.
-  if (params.focusGating) gateEdgesByFocus(cv, gray, cannyEdges);
-  eq.delete();
-  blurred.delete();
-
-  // Hough + grid fit on the Canny edges.
-  yield { frac: 0.55, label: 'Ricerca delle linee della griglia…' };
-  let edges = cannyEdges;
-  let { result } = houghToGrid(cv, edges, work, scale, W0, H0, params);
-
-  // --- Fallback for noisy / low-contrast photos -------------------------
-  // When Canny drowns in background texture (a grid drawn on dirt/cork), it finds
-  // no grid. Retry with the morphological line extractor and keep it if it does
-  // better. Costs an extra pass only when the plain pipeline already failed.
-  // `gridStrength` counts only DETECTED lines (not interior-filled or extrapolated
-  // ones), so a weak detection can't be masked by fill/extension and skip the fallback.
-  if (params.lineMorph && gridStrength(result) < 3) {
-    yield { frac: 0.75, label: 'Immagine complessa, riprovo…' };
-    const morphEdges = enhanceGridLines(cv, gray);
-    const alt = houghToGrid(cv, morphEdges, work, scale, W0, H0, params);
-    if (gridStrength(alt.result) > gridStrength(result)) {
-      result = alt.result;
-      cannyEdges.delete();
-      edges = morphEdges;
+  // OpenCV Mats are freed in `finally` so a throw mid-pipeline (a cv.* call) can't
+  // leak the WASM heap. Each is nulled right after an explicit early delete; `edges`
+  // is just an alias for whichever of cannyEdges/morphEdges is live, so only those
+  // two need tracking. (gateEdgesByFocus / chromaEdges / enhanceGridLines own their
+  // own temporaries.)
+  let gray: any = null;
+  let clahe: any = null;
+  let eq: any = null;
+  let blurred: any = null;
+  let cannyEdges: any = null;
+  let morphEdges: any = null;
+  try {
+    yield { frac: 0.05, label: "Preparazione dell'immagine…" };
+    gray = new cv.Mat();
+    if (work.channels && work.channels() === 1) {
+      work.copyTo(gray);
     } else {
-      morphEdges.delete();
+      cv.cvtColor(work, gray, cv.COLOR_RGBA2GRAY);
     }
-  }
 
-  yield { frac: 0.9, label: 'Ricostruzione della griglia…' };
-  result.info.cannyHigh = cannyHigh;
-  result.info.edgePixels = cv.countNonZero(edges);
+    // --- Standard edge path: CLAHE local contrast -> blur -> auto-Canny (Otsu) ---
+    eq = new cv.Mat();
+    clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+    clahe.apply(gray, eq);
+    clahe.delete();
+    clahe = null;
 
-  if (wantEdges) {
-    // Build an RGBA ImageData from the single-channel edge mask (DOM-free, so it
-    // also works inside a Web Worker).
-    const ew = edges.cols;
-    const eh = edges.rows;
-    const buf = new Uint8ClampedArray(ew * eh * 4);
-    const em = edges.data as Uint8Array;
-    for (let i = 0; i < ew * eh; i++) {
-      const v = em[i];
-      buf[i * 4] = v;
-      buf[i * 4 + 1] = v;
-      buf[i * 4 + 2] = v;
-      buf[i * 4 + 3] = 255;
+    blurred = new cv.Mat();
+    cv.GaussianBlur(eq, blurred, new cv.Size(3, 3), 0);
+
+    // Auto-Canny: derive thresholds from Otsu's global threshold.
+    const otsuTmp = new cv.Mat();
+    const otsu = cv.threshold(blurred, otsuTmp, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+    otsuTmp.delete();
+    const cannyHigh = Math.max(1, Math.round(otsu));
+    const cannyLow = Math.max(1, Math.round(0.5 * otsu));
+
+    yield { frac: 0.2, label: 'Rilevamento dei bordi…' };
+    cannyEdges = new cv.Mat();
+    cv.Canny(blurred, cannyEdges, cannyLow, cannyHigh);
+
+    // Chromatic edges: a grid that differs from its background in HUE but not in
+    // brightness (e.g. a coloured map on a similarly-light surface) leaves no
+    // luminance edge, so grayscale Canny misses it. Add the colour-only edges from
+    // the Lab a/b channels. Only when the source has colour (RGBA) and the channel
+    // actually carries chroma (near-neutral channels contribute nothing).
+    if (params.colorEdges && work.channels && work.channels() === 4) {
+      yield { frac: 0.35, label: 'Analisi cromatica…' };
+      const chroma = chromaEdges(cv, work);
+      cv.bitwise_or(cannyEdges, chroma, cannyEdges);
+      chroma.delete();
     }
-    result.edges = new ImageData(buf, ew, eh);
+
+    // Focus gating (off by default): the grid sits in the focal plane, so it is
+    // sharper than an out-of-focus background; suppress edges whose local sharpness
+    // is well below the median among edges. Self-disabling when the frame is
+    // uniformly sharp. See DetectorParams.
+    if (params.focusGating) gateEdgesByFocus(cv, gray, cannyEdges);
+    eq.delete();
+    eq = null;
+    blurred.delete();
+    blurred = null;
+
+    // Hough + grid fit on the Canny edges.
+    yield { frac: 0.55, label: 'Ricerca delle linee della griglia…' };
+    let result = houghToGrid(cv, cannyEdges, work, scale, W0, H0, params);
+
+    // --- Fallback for noisy / low-contrast photos -----------------------
+    // When Canny drowns in background texture (a grid drawn on dirt/cork), it finds
+    // no grid. Retry with the morphological line extractor and keep it if it does
+    // better. Costs an extra pass only when the plain pipeline already failed.
+    // `gridStrength` counts only DETECTED lines (not interior-filled or extrapolated
+    // ones), so a weak detection can't be masked by fill/extension and skip the fallback.
+    if (params.lineMorph && gridStrength(result) < 3) {
+      yield { frac: 0.75, label: 'Immagine complessa, riprovo…' };
+      morphEdges = enhanceGridLines(cv, gray);
+      const alt = houghToGrid(cv, morphEdges, work, scale, W0, H0, params);
+      if (gridStrength(alt) > gridStrength(result)) {
+        result = alt;
+        cannyEdges.delete();
+        cannyEdges = null; // morphEdges is now the live mask
+      } else {
+        morphEdges.delete();
+        morphEdges = null;
+      }
+    }
+
+    const edges = morphEdges ?? cannyEdges; // whichever mask survived
+
+    yield { frac: 0.9, label: 'Ricostruzione della griglia…' };
+    result.info.cannyHigh = cannyHigh;
+    result.info.edgePixels = cv.countNonZero(edges);
+
+    if (wantEdges) {
+      // Build an RGBA ImageData from the single-channel edge mask (DOM-free, so it
+      // also works inside a Web Worker).
+      const ew = edges.cols;
+      const eh = edges.rows;
+      const buf = new Uint8ClampedArray(ew * eh * 4);
+      const em = edges.data as Uint8Array;
+      for (let i = 0; i < ew * eh; i++) {
+        const v = em[i];
+        buf[i * 4] = v;
+        buf[i * 4 + 1] = v;
+        buf[i * 4 + 2] = v;
+        buf[i * 4 + 3] = 255;
+      }
+      result.edges = new ImageData(buf, ew, eh);
+    }
+
+    return result;
+  } finally {
+    if (clahe) clahe.delete();
+    if (gray) gray.delete();
+    if (eq) eq.delete();
+    if (blurred) blurred.delete();
+    if (cannyEdges) cannyEdges.delete();
+    if (morphEdges) morphEdges.delete();
   }
-
-  gray.delete();
-  edges.delete();
-
-  return result;
 }
 
 /** Adaptive Hough on an edge mask + grid fit. The accumulator threshold is a
@@ -346,38 +370,41 @@ function houghToGrid(
   W0: number,
   H0: number,
   params: DetectorParams,
-): { result: GridResult; usedHough: number } {
+): GridResult {
   const minDim = Math.min(work.cols, work.rows);
   const linesMat = new cv.Mat();
   let usedHough = Math.max(30, Math.round(minDim * 0.3));
-  for (let attempt = 0; attempt < 8; attempt++) {
-    cv.HoughLines(edges, linesMat, 1, Math.PI / 360, usedHough); // 0.5° angular resolution
-    const n = linesMat.rows;
-    if (n < 8 && usedHough > 25) {
-      usedHough = Math.max(20, Math.round(usedHough * 0.6));
-      continue;
+  try {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      cv.HoughLines(edges, linesMat, 1, Math.PI / 360, usedHough); // 0.5° angular resolution
+      const n = linesMat.rows;
+      if (n < 8 && usedHough > 25) {
+        usedHough = Math.max(20, Math.round(usedHough * 0.6));
+        continue;
+      }
+      if (n > 600) {
+        usedHough = Math.round(usedHough * 1.5);
+        continue;
+      }
+      break;
     }
-    if (n > 600) {
-      usedHough = Math.round(usedHough * 1.5);
-      continue;
+    const raw: RawLine[] = [];
+    for (let i = 0; i < linesMat.rows; i++) {
+      const rho = linesMat.data32F[i * 2];
+      const theta = linesMat.data32F[i * 2 + 1];
+      // OpenCV's convention: theta in [0,pi) and rho SIGNED. Keep rho signed — the
+      // offset projection (rho*cos(theta-mean)) is already sign-correct, and forcing
+      // rho positive would collapse two distinct parallel lines onto one.
+      let thetaDeg = theta * DEG;
+      thetaDeg = ((thetaDeg % 180) + 180) % 180;
+      raw.push({ rho, thetaDeg });
     }
-    break;
+    const result = buildGrid(raw, scale, W0, H0, params);
+    result.info.usedHough = usedHough;
+    return result;
+  } finally {
+    linesMat.delete();
   }
-  const raw: RawLine[] = [];
-  for (let i = 0; i < linesMat.rows; i++) {
-    const rho = linesMat.data32F[i * 2];
-    const theta = linesMat.data32F[i * 2 + 1];
-    // OpenCV's convention: theta in [0,pi) and rho SIGNED. Keep rho signed — the
-    // offset projection (rho*cos(theta-mean)) is already sign-correct, and forcing
-    // rho positive would collapse two distinct parallel lines onto one.
-    let thetaDeg = theta * DEG;
-    thetaDeg = ((thetaDeg % 180) + 180) % 180;
-    raw.push({ rho, thetaDeg });
-  }
-  linesMat.delete();
-  const result = buildGrid(raw, scale, W0, H0, params);
-  result.info.usedHough = usedHough;
-  return { result, usedHough };
 }
 
 /** Morphological line extractor for noisy / low-contrast photos (e.g. a grid drawn

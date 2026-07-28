@@ -43,6 +43,10 @@ export interface DetectorParams {
    * luminance, so grayscale Canny misses them): OR the Lab a/b edge map into the
    * luminance Canny before Hough. A near-neutral channel contributes nothing. */
   colorEdges: boolean;
+  /** Use an FFT periodicity prior to fix the family-orientation split when the angle
+   * histogram locks onto a wrong orientation (e.g. a 45° diagonal off a tiled floor).
+   * Only overrides when the prior confidently disagrees; a matching prior is a no-op. */
+  fftPrior: boolean;
 }
 
 export const DEFAULT_PARAMS: DetectorParams = {
@@ -54,6 +58,7 @@ export const DEFAULT_PARAMS: DetectorParams = {
   lineMorph: true,
   extend: 'frame',
   colorEdges: true,
+  fftPrior: true,
 };
 
 /** A line as normal form: nx*x + ny*y = d, with (nx,ny) a unit vector. */
@@ -305,9 +310,20 @@ export function* detectGridFromMatSteps(
     blurred.delete();
     blurred = null;
 
+    // Global FFT periodicity prior (orientation only) — used to fix the family split
+    // when Hough's angle histogram locks onto a wrong orientation. Best-effort.
+    let orient: { a: number; b: number } | null = null;
+    if (params.fftPrior) {
+      try {
+        orient = fftOrientations(cv, gray);
+      } catch (err) {
+        console.warn('fft orientation prior skipped:', err);
+      }
+    }
+
     // Hough + grid fit on the Canny edges.
     yield { frac: 0.55, label: 'Ricerca delle linee della griglia…' };
-    let result = houghToGrid(cv, cannyEdges, work, scale, W0, H0, params);
+    let result = houghToGrid(cv, cannyEdges, work, scale, W0, H0, params, orient);
 
     // --- Fallback for noisy / low-contrast photos -----------------------
     // When Canny drowns in background texture (a grid drawn on dirt/cork), it finds
@@ -318,7 +334,7 @@ export function* detectGridFromMatSteps(
     if (params.lineMorph && gridStrength(result) < 3) {
       yield { frac: 0.75, label: 'Immagine complessa, riprovo…' };
       morphEdges = enhanceGridLines(cv, gray);
-      const alt = houghToGrid(cv, morphEdges, work, scale, W0, H0, params);
+      const alt = houghToGrid(cv, morphEdges, work, scale, W0, H0, params, orient);
       if (gridStrength(alt) > gridStrength(result)) {
         result = alt;
         cannyEdges.delete();
@@ -374,6 +390,7 @@ function houghToGrid(
   W0: number,
   H0: number,
   params: DetectorParams,
+  orientPrior: { a: number; b: number } | null = null,
 ): GridResult {
   const minDim = Math.min(work.cols, work.rows);
   const linesMat = new cv.Mat();
@@ -403,7 +420,7 @@ function houghToGrid(
       thetaDeg = ((thetaDeg % 180) + 180) % 180;
       raw.push({ rho, thetaDeg });
     }
-    const result = buildGrid(raw, scale, W0, H0, params);
+    const result = buildGrid(raw, scale, W0, H0, params, orientPrior);
     result.info.usedHough = usedHough;
     return result;
   } finally {
@@ -698,12 +715,146 @@ const angleOfDeg = (nx: number, ny: number): number => {
  *  4. Fit a regular lattice per family there, rebuild every row/column (filling
  *     occluded ones), then map the complete grid back into the image.
  */
+/** 2-D Hann window as a CV_32F Mat (cached by size). */
+let hannCache: { n: number; mat: any } | null = null;
+function hannWindow(cv: any, N: number): any {
+  if (hannCache && hannCache.n === N) return hannCache.mat;
+  if (hannCache) hannCache.mat.delete();
+  const w = new Float32Array(N);
+  for (let i = 0; i < N; i++) w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (N - 1)));
+  const data = new Float32Array(N * N);
+  for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) data[y * N + x] = w[y] * w[x];
+  const mat = cv.matFromArray(N, N, cv.CV_32F, data);
+  hannCache = { n: N, mat };
+  return mat;
+}
+
+/** In-place quadrant swap (fftshift) of an N×N Mat. */
+function fftshift(cv: any, m: any, N: number): void {
+  const c = N / 2;
+  const q0 = m.roi(new cv.Rect(0, 0, c, c));
+  const q1 = m.roi(new cv.Rect(c, 0, c, c));
+  const q2 = m.roi(new cv.Rect(0, c, c, c));
+  const q3 = m.roi(new cv.Rect(c, c, c, c));
+  const t = new cv.Mat();
+  q0.copyTo(t); q3.copyTo(q0); t.copyTo(q3);
+  q1.copyTo(t); q2.copyTo(q1); t.copyTo(q2);
+  t.delete(); q0.delete(); q1.delete(); q2.delete(); q3.delete();
+}
+
+/**
+ * Global periodicity prior via FFT: the two dominant ORIENTATIONS of the grid (as
+ * line-NORMAL angles in [0,180), same space as a RawLine's thetaDeg). A regular grid
+ * is periodic, so its spectrum has sharp peaks whose direction is the grid's frequency
+ * direction (= line normal). Robust to noise/faint contrast/distractors where Hough
+ * latches onto local texture. Returns the two ~orthogonal family angles (a = strongest
+ * peak, b = strongest peak 60–120° away at a similar radius) or null if there's no
+ * clear second family. `gray` is the working grayscale Mat. (Pitch is NOT returned —
+ * FFT can lock onto a harmonic; here we only use the reliable orientation.)
+ */
+function fftOrientations(cv: any, gray: any): { a: number; b: number } | null {
+  const N = 512;
+  const W = gray.cols;
+  const H = gray.rows;
+  const maxD = Math.max(W, H);
+  const sc = N / maxD;
+  const nw = Math.max(1, Math.round(W * sc));
+  const nh = Math.max(1, Math.round(H * sc));
+  let rs: any = null, gx: any = null, gy: any = null, gm: any = null, pad: any = null;
+  let complex: any = null, planes: any = null, mag: any = null, bg: any = null;
+  try {
+    rs = new cv.Mat();
+    cv.resize(gray, rs, new cv.Size(nw, nh), 0, 0, cv.INTER_AREA);
+    gx = new cv.Mat();
+    gy = new cv.Mat();
+    cv.Sobel(rs, gx, cv.CV_32F, 1, 0, 3);
+    cv.Sobel(rs, gy, cv.CV_32F, 0, 1, 3);
+    gm = new cv.Mat();
+    cv.magnitude(gx, gy, gm);
+    const top = Math.floor((N - nh) / 2);
+    const left = Math.floor((N - nw) / 2);
+    pad = new cv.Mat();
+    cv.copyMakeBorder(gm, pad, top, N - nh - top, left, N - nw - left, cv.BORDER_CONSTANT, new cv.Scalar(0));
+    cv.multiply(pad, hannWindow(cv, N), pad);
+    const zeros = cv.Mat.zeros(N, N, cv.CV_32F);
+    planes = new cv.MatVector();
+    planes.push_back(pad);
+    planes.push_back(zeros);
+    complex = new cv.Mat();
+    cv.merge(planes, complex);
+    zeros.delete();
+    cv.dft(complex, complex);
+    const sp = new cv.MatVector();
+    cv.split(complex, sp);
+    mag = new cv.Mat();
+    cv.magnitude(sp.get(0), sp.get(1), mag);
+    sp.delete();
+    const one = cv.Mat.ones(N, N, cv.CV_32F);
+    cv.add(mag, one, mag);
+    one.delete();
+    cv.log(mag, mag);
+    fftshift(cv, mag, N);
+    bg = new cv.Mat();
+    cv.GaussianBlur(mag, bg, new cv.Size(0, 0), 9);
+    cv.subtract(mag, bg, mag); // spectral high-pass (kill the low-freq background)
+
+    const d = mag.data32F as Float32Array;
+    const cx = N / 2;
+    const cy = N / 2;
+    const R0 = 12;
+    const Rmax = N / 2 - 4;
+    const CROSS = 3;
+    let mx = 0;
+    for (let y = 0; y < N; y++) {
+      for (let x = 0; x < N; x++) {
+        const dx = x - cx;
+        const dy = y - cy;
+        const r = Math.hypot(dx, dy);
+        if (r < R0 || r > Rmax || Math.abs(dx) < CROSS || Math.abs(dy) < CROSS) continue;
+        const v = d[y * N + x];
+        if (v > mx) mx = v;
+      }
+    }
+    if (mx <= 0) return null;
+    const thr = mx * 0.5;
+    const cand: { v: number; r: number; ang: number }[] = [];
+    for (let y = 1; y < N - 1; y++) {
+      for (let x = 1; x < N - 1; x++) {
+        const dx = x - cx;
+        const dy = y - cy;
+        const r = Math.hypot(dx, dy);
+        if (r < R0 || r > Rmax || Math.abs(dx) < CROSS || Math.abs(dy) < CROSS) continue;
+        const v = d[y * N + x];
+        if (v < thr) continue;
+        cand.push({ v, r, ang: (((Math.atan2(dy, dx) * DEG) % 180) + 180) % 180 });
+      }
+    }
+    if (!cand.length) return null;
+    cand.sort((p, q) => q.v - p.v);
+    const p1 = cand[0];
+    let p2b: { v: number; r: number; ang: number } | null = null;
+    for (const c of cand) {
+      const ad = angDist180(c.ang, p1.ang);
+      if (ad >= 60 && ad <= 120 && Math.abs(c.r - p1.r) / p1.r < 0.4) {
+        p2b = c;
+        break;
+      }
+    }
+    if (!p2b) return null; // no clear orthogonal second family → not a confident grid prior
+    return { a: p1.ang, b: p2b.ang };
+  } finally {
+    for (const m of [rs, gx, gy, gm, pad, complex, mag, bg]) if (m) m.delete();
+    if (planes) planes.delete();
+  }
+}
+
 export function buildGrid(
   raw: RawLine[],
   scale: number,
   W0: number,
   H0: number,
   params: DetectorParams,
+  orientPrior: { a: number; b: number } | null = null,
 ): GridResult {
   const rawLines: Line2[] = raw.map((l) => toLine2(l.rho, l.thetaDeg, scale));
 
@@ -756,8 +907,18 @@ export function buildGrid(
   for (const l of raw) bins[Math.min(89, Math.floor(l.thetaDeg / 2))]++;
   let peak = 0;
   for (let i = 1; i < bins.length; i++) if (bins[i] > bins[peak]) peak = i;
-  const axisA = peak * 2 + 1;
-  const axisB = (axisA + 90) % 180;
+  let axisA = peak * 2 + 1;
+  let axisB = (axisA + 90) % 180;
+  // FFT orientation prior: if the histogram peak matches NEITHER prior family, it
+  // locked onto a wrong orientation (e.g. a 45° diagonal off a tiled floor) — trust
+  // the periodicity prior instead. A matching prior leaves the split unchanged.
+  if (orientPrior) {
+    const off = Math.min(angDist180(axisA, orientPrior.a), angDist180(axisA, orientPrior.b));
+    if (off > 15) {
+      axisA = orientPrior.a;
+      axisB = orientPrior.b;
+    }
+  }
 
   const famA: Line2[] = [];
   const famB: Line2[] = [];

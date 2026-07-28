@@ -203,7 +203,17 @@ function setStatus(msg: string) {
 // manual editing, or a photo with no grid); otherwise it stays where the user left it.
 let infoOpen = false;
 
-/** The guidance for the current app state (null → nothing to show, button hidden). */
+// The exact top-bar button icons (Lucide), inlined so the (i) guidance points at the
+// real controls with their real glyphs — kept in sync with index.html (#btnEditGrid /
+// #btnRetake). Rendered as HTML (see updateInfo), so info strings are treated as HTML;
+// all guidance text is static, so there's no injection surface.
+const ICON_GRID =
+  '<span class="info-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="1"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg></span>';
+const ICON_CAM =
+  '<span class="info-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg></span>';
+
+/** The guidance for the current app state (null → nothing to show, button hidden). May
+ * contain inline HTML (the real UI icons); updateInfo renders it as HTML. */
 function currentInfo(): string | null {
   if (!showingResult) return null; // camera mode — the central on-screen hint suffices
   if (manualActive) {
@@ -225,10 +235,10 @@ function currentInfo(): string | null {
       : base;
   }
   if (!gridReliable)
-    return 'Nessuna griglia rilevata.\nDisegnala a mano con il tasto griglia (in alto a destra), o rifai la foto con il tasto fotocamera.';
-  // Idle over a good grid: the always-available "what can I do". Refer to the top-bar
-  // buttons by what their icons ARE (grid / camera), not by a mismatched glyph.
-  return 'Tocca ＋ per aggiungere pedine o aree.\nUsa il tasto griglia (in alto a destra) per modificare la griglia, o il tasto fotocamera per rifare la foto.';
+    return `Nessuna griglia rilevata.\nDisegnala a mano con ${ICON_GRID} o rifai la foto con ${ICON_CAM}.`;
+  // Idle over a good grid: the always-available "what can I do". Point at the real
+  // top-bar buttons with their real icons (grid / camera).
+  return `Tocca ＋ per aggiungere pedine o aree.\nUsa ${ICON_GRID} per modificare la griglia, o ${ICON_CAM} per rifare la foto.`;
 }
 
 /** Sync the (i) button + popover with the current state. */
@@ -242,7 +252,7 @@ function updateInfo() {
     return;
   }
   infoWrap.hidden = false;
-  infoPop.textContent = text;
+  infoPop.innerHTML = text; // static guidance, may embed the real UI icons (see ICON_*)
   infoPop.hidden = !infoOpen;
   infoWrap.classList.toggle('open', infoOpen);
 }

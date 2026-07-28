@@ -22,11 +22,12 @@ Entry points (all funnel into the generator `detectGridFromMatSteps`):
 | --- | --- | --- | --- |
 | 1 | Downscale to `maxDim` | `detectGrid` / `…FromMat` | `INTER_AREA`; `scale` is carried so lines map back to original coords (`grid-detector.ts:109`). |
 | 2 | Grayscale → **CLAHE** (local contrast) | `grid-detector.ts:190` | `cv.CLAHE(2.0, 8×8)` so faint / unevenly-lit grids still yield edges. |
-| 3 | Gaussian blur 3×3 | `grid-detector.ts:195` | |
+| 3 | Gaussian blur 5×5 | `grid-detector.ts` | A touch more denoising than 3×3 before Otsu/Canny (CLAHE just before amplifies noise); the Otsu-derived Canny thresholds are computed on this blurred image. |
 | 4 | **Auto-Canny** from Otsu | `grid-detector.ts:199` | `high = round(otsu)`, `low = round(0.5·otsu)`, then `cv.Canny`. |
 | 5 | **Chromatic edges** (optional) | `chromaEdges` | On (`colorEdges`) and when the source is RGBA: auto-Canny the Lab **a/b** channels and OR into the luminance edges, so a grid that differs from its background only in **hue** (no luminance edge) is still found. A near-neutral channel (std < `CHROMA_MIN_STD` = 3) is skipped. |
 | 6 | Focus gating (optional) | `gateEdgesByFocus` | **Off by default**; suppresses blurry, out-of-plane edges by local `|Laplacian|` vs the median. |
 | 7 | **Adaptive Hough** | `houghToGrid` | `cv.HoughLines`, 0.5° resolution; threshold starts at `max(30, minDim·0.3)` and self-tunes over ≤8 tries (too few → relax, >600 → tighten). |
+| — | **Oriented re-extraction** (optional, VP-aware) | `orientEdgesVP` | On (`orientGate`) and only when the first fit is WEAK (`gridStrength < ORIENT_SKIP_STRENGTH` = 6): keep only edge pixels whose gradient matches the LOCAL expected grid normal of either family (direction to that family's vanishing point ± `ORIENT_TOL_DEG` = 15° — so it follows the perspective fan), re-run Hough, and keep the re-fit **only if strictly stronger** (so it can only help; a good fit is left untouched). |
 | — | **Noisy fallback** (optional) | `enhanceGridLines` | If the standard path detects `< 3` lines per family and `lineMorph` is on, retry Hough on a morphological line mask (directional openings that suppress isotropic texture) and keep it if it detects more. |
 | 8 | Parse raw lines, **rho kept SIGNED** | `grid-detector.ts:244` | θ→`[0,180)`; rho stays signed so the 0/180° wrap doesn't collapse two parallel lines. See the wrap note below. |
 | 9 | Build the 2-D lattice | `buildGrid` | The rest of this section (incl. the `extend` extrapolation, step 7 there). |
@@ -97,6 +98,8 @@ exact synthetic θ do **not** catch it — only real Hough output does.
 | `lineMorph` | `true` | Noisy/low-contrast fallback (grid on dirt/cork): if the plain Canny path detects `< 3` lines per family, retry on a morphological line mask (`enhanceGridLines`) and keep it if it detects more. Strength is counted from **detected** lines only, so fill/extension can't mask a weak detection. |
 | `extend` | `'frame'` | Extrapolate the fitted lattice past the detected lines (step 7): `'off'` none, `'border'` a couple of cells to recover a missed outer edge, `'frame'` tile the whole frame (virtual grid). |
 | `colorEdges` | `true` | Also detect **chromatic** edges (Lab a/b) and OR them into the luminance Canny, so a grid distinguished from its background by hue (not brightness) is found (`chromaEdges`, stage 5). |
+| `fftPrior` | `true` | FFT periodicity prior: fix the family-orientation split when the angle histogram locks onto a wrong orientation (`fftOrientations`). Overrides only when it confidently disagrees. |
+| `orientGate` | `true` | VP-aware oriented re-extraction on a weak first fit (`orientEdgesVP`); contained (kept only if strictly stronger), so it can only help. |
 
 ## `GridResult.info` (diagnostics, `grid-detector.ts:52`)
 
@@ -124,7 +127,8 @@ detection so the diagnostics appear/disappear.
 
 When `wantEdges`, the generator also captures a downscaled RGBA snapshot of each stage
 into `result.debugSteps` (`DebugStep[]`: Grigio → CLAHE → Sfocatura → Canny → +cromatica
-→ morfologico) via `matToPreview`. `main.ts` renders a top **step-chip bar** (`#debugBar`,
+→ orientati → morfologico — the last two only appear when those optional stages run) via
+`matToPreview`. `main.ts` renders a top **step-chip bar** (`#debugBar`,
 `rebuildDebugBar`) — the default chip is the live line overlay, the others blit that
 stage's image onto the view canvas (`drawDebugStep`), so you can inspect where the
 pipeline diverges from the photo.

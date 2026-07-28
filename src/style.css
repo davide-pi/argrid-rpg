@@ -655,6 +655,24 @@ body {
 .info-pop[hidden] {
   display: none;
 }
+/* Inline copies of the real top-bar icons, shown as little control chips inside the
+   guidance so it points at the actual buttons. */
+.info-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: -0.32em;
+  width: 24px;
+  height: 24px;
+  margin: 0 1px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--fg);
+}
+.info-ico svg {
+  display: block;
+}
 
 /* --- Grid fallback panel (unreliable auto-detection) ---------------- */
 /* Shown over the captured photo when the auto grid is too unreliable to draw.

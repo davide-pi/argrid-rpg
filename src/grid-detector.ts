@@ -47,6 +47,12 @@ export interface DetectorParams {
    * histogram locks onto a wrong orientation (e.g. a 45° diagonal off a tiled floor).
    * Only overrides when the prior confidently disagrees; a matching prior is a no-op. */
   fftPrior: boolean;
+  /** Oriented edge re-extraction: before Hough, keep only edge pixels whose gradient
+   * (line-normal) orientation matches one of the two dominant grid directions from the
+   * FFT prior (± ORIENT_TOL_DEG), dropping clutter at other angles (furniture, text,
+   * diagonals). Needs the FFT prior; self-disables when it would remove too much or the
+   * prior is absent. A generous tolerance keeps perspective fan — see ORIENT_TOL_DEG. */
+  orientGate: boolean;
 }
 
 export const DEFAULT_PARAMS: DetectorParams = {
@@ -59,6 +65,7 @@ export const DEFAULT_PARAMS: DetectorParams = {
   extend: 'frame',
   colorEdges: true,
   fftPrior: true,
+  orientGate: true,
 };
 
 /** A line as normal form: nx*x + ny*y = d, with (nx,ny) a unit vector. */
@@ -323,7 +330,10 @@ export function* detectGridFromMatSteps(
     snap('Contrasto (CLAHE)', eq);
 
     blurred = new cv.Mat();
-    cv.GaussianBlur(eq, blurred, new cv.Size(3, 3), 0);
+    // 5×5 (was 3×3): a touch more denoising before Otsu/Canny on real photos. CLAHE
+    // just before amplifies noise, so this tames it; the trade-off is that very faint
+    // or very thin lines blur more, so keep it modest.
+    cv.GaussianBlur(eq, blurred, new cv.Size(5, 5), 0);
     snap('Sfocatura', blurred);
 
     // Auto-Canny: derive thresholds from Otsu's global threshold.
@@ -375,6 +385,32 @@ export function* detectGridFromMatSteps(
     // Hough + grid fit on the Canny edges.
     yield { frac: 0.55, label: 'Ricerca delle linee della griglia…' };
     let result = houghToGrid(cv, cannyEdges, work, scale, W0, H0, params, orient);
+
+    // VP-aware oriented re-extraction: on a WEAK first fit, gate the edges by the fit's
+    // own perspective-consistent orientation (drops clutter — furniture, text, diagonals
+    // — that doesn't run with either family) and re-fit. Kept only if strictly stronger,
+    // so it can only help. The gate follows the vanishing-point fan (not a fixed angle),
+    // so it doesn't erase a steeply-converging family.
+    if (params.orientGate && gridStrength(result) < ORIENT_SKIP_STRENGTH) {
+      try {
+        const gated = orientEdgesVP(cv, gray, cannyEdges, scale, result.familyA, result.familyB, ORIENT_TOL_DEG);
+        if (gated && gated.keptFrac >= ORIENT_MIN_KEEP) {
+          snap('Bordi orientati', gated.mask);
+          const alt = houghToGrid(cv, gated.mask, work, scale, W0, H0, params, orient);
+          if (gridStrength(alt) > gridStrength(result)) {
+            result = alt;
+            cannyEdges.delete();
+            cannyEdges = gated.mask; // adopted mask becomes the live edge mask
+          } else {
+            gated.mask.delete();
+          }
+        } else if (gated) {
+          gated.mask.delete();
+        }
+      } catch (err) {
+        console.warn('oriented re-extraction skipped:', err);
+      }
+    }
 
     // --- Fallback for noisy / low-contrast photos -----------------------
     // When Canny drowns in background texture (a grid drawn on dirt/cork), it finds
@@ -898,6 +934,89 @@ function fftOrientations(cv: any, gray: any): { a: number; b: number } | null {
   } finally {
     for (const m of [rs, gx, gy, gm, pad, complex, mag, bg]) if (m) m.delete();
     if (planes) planes.delete();
+  }
+}
+
+/** Angular half-width (deg) an edge pixel's gradient may deviate from the LOCAL
+ * expected grid normal and still be kept. The gate is vanishing-point-aware (the
+ * expected normal follows the perspective fan), so this can stay tight. */
+const ORIENT_TOL_DEG = 15;
+/** Self-disable guard: if the gate would keep less than this fraction of the edge
+ * pixels, the families probably don't describe the real grid — skip it. */
+const ORIENT_MIN_KEEP = 0.15;
+/** Skip the oriented re-extraction when the first fit is already this strong (detected
+ * lines per family): a confident grid needs no cleanup, and re-fitting risks nothing. */
+const ORIENT_SKIP_STRENGTH = 6;
+
+/**
+ * Vanishing-point-aware oriented edge re-extraction. Using the FIRST fit's two families
+ * (their vanishing points, or mean orientation when parallel), keep only edge pixels
+ * whose gradient (= line-normal) matches the **locally** expected grid normal of either
+ * family within `tolDeg`. Because the expected normal is computed from the pixel's
+ * direction to each vanishing point, it FOLLOWS the perspective fan — a fixed global
+ * angle would erase the strongly-converging family. Returns a NEW mask (caller owns it)
+ * + kept fraction, or null if the fit has no usable family orientation. Does not mutate
+ * `edges`. Coordinates: family lines are in original image space, `edges` is at working
+ * resolution, so vanishing points are scaled by `scale`.
+ */
+function orientEdgesVP(
+  cv: any,
+  gray: any,
+  edges: any,
+  scale: number,
+  familyA: Line2[],
+  familyB: Line2[],
+  tolDeg: number,
+): { mask: any; keptFrac: number } | null {
+  const meanNorm = (fam: Line2[]): number | null =>
+    fam.length ? meanAngle180(fam.map((l) => angleOfDeg(l.nx, l.ny))) : null;
+  const mnA = meanNorm(familyA);
+  const mnB = meanNorm(familyB);
+  if (mnA == null && mnB == null) return null;
+  const vpA = familyA.length >= 2 ? vanishingPoint(familyA) : null; // original coords
+  const vpB = familyB.length >= 2 ? vanishingPoint(familyB) : null;
+  const axw = vpA ? vpA.x * scale : 0;
+  const ayw = vpA ? vpA.y * scale : 0;
+  const bxw = vpB ? vpB.x * scale : 0;
+  const byw = vpB ? vpB.y * scale : 0;
+
+  const gx = new cv.Mat();
+  const gy = new cv.Mat();
+  try {
+    cv.Sobel(gray, gx, cv.CV_32F, 1, 0, 3);
+    cv.Sobel(gray, gy, cv.CV_32F, 0, 1, 3);
+    const out = edges.clone();
+    const em = out.data as Uint8Array;
+    const gxD = gx.data32F as Float32Array;
+    const gyD = gy.data32F as Float32Array;
+    const W = out.cols;
+    const fold = (deg: number): number => (((deg % 180) + 180) % 180);
+    let kept = 0;
+    let total = 0;
+    for (let i = 0; i < em.length; i++) {
+      if (!em[i]) continue;
+      total++;
+      const px = i % W;
+      const py = (i / W) | 0;
+      const gnorm = fold(Math.atan2(gyD[i], gxD[i]) * DEG); // gradient = line normal
+      // Expected normal of family A at this pixel: line points to VP_A (finite) or has
+      // the constant parallel orientation; its normal is that direction + 90°.
+      let ok = false;
+      if (mnA != null) {
+        const nA = vpA ? fold(Math.atan2(ayw - py, axw - px) * DEG + 90) : mnA;
+        ok = angDist180(gnorm, nA) <= tolDeg;
+      }
+      if (!ok && mnB != null) {
+        const nB = vpB ? fold(Math.atan2(byw - py, bxw - px) * DEG + 90) : mnB;
+        ok = angDist180(gnorm, nB) <= tolDeg;
+      }
+      if (ok) kept++;
+      else em[i] = 0;
+    }
+    return { mask: out, keptFrac: total ? kept / total : 0 };
+  } finally {
+    gx.delete();
+    gy.delete();
   }
 }
 

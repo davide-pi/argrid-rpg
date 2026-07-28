@@ -49,12 +49,14 @@ does not touch OpenCV. This is what keeps the UI responsive on a phone.
 **Reliability gate + manual grid.** After detection, `runDetection` sets
 `gridReliable` from `info.confidence` (≥ `MIN_GRID_CONFIDENCE`). When it's false the
 grid and the tactical layer are **not** drawn — instead the fallback panel
-(`#gridFail`) offers *retake* or *manual grid*. The manual editor overlays a
-draggable **quad** tiled into N×M cells and, via the quad→unit-square homography,
-synthesises the same `familyA`/`familyB` `Line2[]` the detector emits, so `draw()`,
-`makeGridMap` and every tactical tool are agnostic to whether the grid came from CV or
-from the user's hand. See [decisions.md](decisions.md) ("Unreliable auto grid → fallback
-panel + manual grid").
+(`#gridFail`) offers *retake*, *grid to adapt*, or *draw by hand* (and a top-bar
+button opens the editor on any result). Both manual modes synthesise the same
+`familyA`/`familyB` `Line2[]` the detector emits — *adapt* tiles a draggable quad via
+the quad→unit-square homography; *draw* traces reference lines fed to `buildGrid` —
+and on commit the lattice is extended to fill the frame. So `draw()`, `makeGridMap`
+and every tactical tool are agnostic to whether the grid came from CV or the user's
+hand. See [decisions.md](decisions.md) ("Unreliable auto grid → fallback panel + manual
+grid").
 
 ## Boot path (why a classic script)
 

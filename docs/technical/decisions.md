@@ -83,22 +83,41 @@ a larger task tracked for the corner-node fallback.
 ### Unreliable auto grid → fallback panel + manual grid, never a wrong grid
 **Decision:** when the detection `confidence` is below `MIN_GRID_CONFIDENCE` (0.35,
 `src/main.ts`) the app does **not** draw the auto grid or build tactics on it. Instead it shows
-the photo alone under a fallback card (`#gridFail`) with two choices: **retake**, or **manual
-grid**. The manual editor (`src/main.ts`, "Manual grid editor") overlays a **quad** (4 draggable
-corner handles) tiled into N×M cells; the quad→unit-square homography (`solveHomography`/`applyH`
-from `overlays.ts`) yields projective, perspective-correct nodes, from which it builds the same
-`familyA`/`familyB` `Line2[]` the detector would — so drawing (`drawFamily`) and every tactical
-tool (`makeGridMap`, tokens, areas, movement) work unchanged. Grid drawing + the tactical layer
-are gated on `gridReliable` (or the editor being active); the FAB/HUD are hidden while a grid is
-unreliable or being edited.
+the photo alone under a fallback card (`#gridFail`) offering **retake**, **grid to adapt**, or
+**draw by hand**. A top-bar **edit-grid** button makes the manual editor available on *any* result
+too (so a well-detected grid can also be tweaked). The manual editor (`src/main.ts`, "Manual grid
+editor") has two modes, both producing the same `familyA`/`familyB` `Line2[]` the detector would —
+so drawing (`drawFamily`) and every tactical tool (`makeGridMap`, tokens, areas, movement) work
+unchanged:
+- **Adapt** — a **quad** (4 draggable corners) tiled into N×M cells; the quad→unit-square
+  homography (`solveHomography`/`applyH` from `overlays.ts`) gives projective, perspective-correct
+  nodes. Seeded from the current grid when there is one, else a default inset. Cell counts via ±
+  steppers or direct numeric entry; **two-finger pinch** resizes it (image zoom is handed to the
+  editor via `manualActive`); a **magnifier loupe** shows the vertex under the finger.
+- **Draw by hand** — the user TRACES reference lines along columns/rows; each stroke → a `RawLine`
+  fed to `buildGrid` (family split + VP fit + `extend:'frame'`), so a few lines generate the whole
+  lattice. Strokes have draggable endpoints and a × delete badge; the grid regenerates live.
+On **commit** ("Fatto") the grid is EXTENDED past the drawn quad to fill the frame
+(`commitManualGrid`, mirroring `extend:'frame'`). The controls bar sits at the top and is
+collapsible so it never hides a corner handle. Grid drawing + the tactical layer are gated on
+`gridReliable` (or the editor being active); the FAB/HUD are hidden while a grid is unreliable or
+being edited.
 **Why:** on genuinely hard shots (strong perspective, noise, or distractors like a tiled floor)
 detection fails in *any* variant of the pipeline — and drawing the resulting degenerate
 micro/macro grid over the photo is what reads as a "drastic loss of precision". Showing the clean
 photo + an honest choice (retake / place it yourself) is far better than a confident-looking wrong
 grid. The confidence score already collapses to ~0 on degenerate fits, so it is the natural gate.
-**Deferred:** a second manual sub-mode — *freehand draw → the system recalculates/expands the
-lattice* — and improving auto recall on the hard cases (distractor rejection, stronger sub-pitch
-guard, corner-node / map-boundary-quad fallbacks).
+
+### Map-boundary quad auto-rescue was attempted and dropped (unreliable segmentation)
+**Decision:** an auto "map boundary" step (restrict the edges to the detected map quad before
+Hough, to shake off distractors like a tiled floor) was prototyped twice — Canny→contours→
+`approxPolyDP`, then Otsu→`minAreaRect` with both polarities — as a non-regressive *rescue*
+(runs only on a weak fit, kept only if strictly better). On the real corpus it found **no usable
+map quad** (cluttered scenes: mat + floor + objects don't segment into a clean rectangle; results
+were near-frame or nothing, and the target grids in the distractor cases are too faint to detect
+even when isolated). It improved nothing, so it was reverted rather than shipped as inert code.
+The reliable path for these hard cases is the **manual grid** above. A corner/intersection-node
+fallback remains a possible future direction.
 
 ### Grid extrapolated to the whole frame by default (`extend: 'frame'`)
 **Decision:** after fitting the regular lattice, continue it `a + b·k` outward past the

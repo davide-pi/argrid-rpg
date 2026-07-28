@@ -75,7 +75,8 @@ const topActions = $<HTMLDivElement>('topActions');
 // Fallback panel (shown over the photo when the auto grid is unreliable).
 const gridFail = $<HTMLDivElement>('gridFail');
 const failRetake = $<HTMLButtonElement>('failRetake');
-const failManual = $<HTMLButtonElement>('failManual');
+const failAdapt = $<HTMLButtonElement>('failAdapt');
+const failDraw = $<HTMLButtonElement>('failDraw');
 
 // Result-mode "edit the grid by hand" button (top bar); always available so any
 // grid — even a well-detected one — can be adjusted.
@@ -91,6 +92,7 @@ const rowsInput = $<HTMLInputElement>('rowsInput');
 const manualDone = $<HTMLButtonElement>('manualDone');
 const manualCancel = $<HTMLButtonElement>('manualCancel');
 const manualCollapse = $<HTMLButtonElement>('manualCollapse');
+const manualHint = $<HTMLParagraphElement>('manualHint');
 
 // Debug has no on-screen switch — it's a hidden state toggled by triple-tapping
 // the logo. When on, detection draws its edge/line diagnostics and a verbose status.
@@ -504,6 +506,12 @@ let manualNa = 10; // cells along the top/bottom edge (columns)
 let manualNb = 10; // cells along the left/right edge (rows)
 let manualDragLast: ImgPt | null = null;
 let manualCollapsed = false; // the editor bar can collapse to free the corners under it
+// "Draw a cell" mode: before the quad exists, the user drags one cell and the grid
+// is tiled/expanded from it across the frame.
+let manualDrawPending = false;
+let drawCellStart: ImgPt | null = null;
+let drawCellEnd: ImgPt | null = null;
+const DRAW_SENTINEL = 5; // manualDrag value while drawing the seed cell
 
 /** Client → image-pixel coordinates (accounts for CSS sizing + the zoom transform,
  * since the canvas backing store is in image pixels). */
@@ -627,7 +635,13 @@ function manualDefaultQuad() {
   manualNb = Math.max(2, Math.round((H - 2 * my) / cell));
 }
 
-function enterManualMode() {
+function setManualHint() {
+  manualHint.textContent = manualDrawPending
+    ? 'Disegna una cella trascinando sulla mappa: la griglia si espande da lì.'
+    : 'Trascina gli angoli per adattare la griglia · trascina il centro per spostarla.';
+}
+
+function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
   if (!lastCapture || !lastResult) return;
   manualActive = true;
   gridFail.hidden = true;
@@ -635,21 +649,74 @@ function enterManualMode() {
   hud.hidden = true;
   btnEditGrid.hidden = true;
   hideToast();
-  // Start from the current grid when it's a usable one, else a default quad — so a
-  // well-detected grid is only tweaked, but a bad/absent one starts from scratch.
-  if (!gridReliable || !seedQuadFromCurrentGrid()) manualDefaultQuad();
   manualCollapsed = false;
+  manualDrawPending = mode === 'draw';
+  drawCellStart = null;
+  drawCellEnd = null;
+  setManualHint();
   updateManualBar();
   showManualBar(true);
+  if (manualDrawPending) {
+    // No grid yet — wait for the user to drag one cell. Show the photo alone.
+    manualQuad = null;
+    gridReliable = false;
+    gridMap = null;
+    draw();
+  } else {
+    // Start from the current grid when it's usable, else a default quad — so a
+    // well-detected grid is only tweaked, but a bad/absent one starts from scratch.
+    if (!gridReliable || !seedQuadFromCurrentGrid()) manualDefaultQuad();
+    applyManual();
+  }
+}
+
+/** Turn the single dragged cell into a grid that tiles the whole frame. */
+function finalizeDrawnCell() {
+  if (!drawCellStart || !drawCellEnd || !lastResult) return;
+  const x0 = Math.min(drawCellStart.x, drawCellEnd.x);
+  const x1 = Math.max(drawCellStart.x, drawCellEnd.x);
+  const y0 = Math.min(drawCellStart.y, drawCellEnd.y);
+  const y1 = Math.max(drawCellStart.y, drawCellEnd.y);
+  const cw = x1 - x0;
+  const ch = y1 - y0;
+  if (cw < 8 || ch < 8) return; // too small to be a real cell — ignore the drag
+  const W = lastResult.width;
+  const H = lastResult.height;
+  // Tile the drawn cell outward to cover the frame (axis-aligned); the user then
+  // rotates / skews via the corner handles if the map isn't square-on.
+  const nLeft = Math.min(MANUAL_MAX_CELLS, Math.ceil(x0 / cw));
+  const nRight = Math.min(MANUAL_MAX_CELLS, Math.ceil((W - x1) / cw));
+  const nUp = Math.min(MANUAL_MAX_CELLS, Math.ceil(y0 / ch));
+  const nDown = Math.min(MANUAL_MAX_CELLS, Math.ceil((H - y1) / ch));
+  const na = Math.min(MANUAL_MAX_CELLS, nLeft + 1 + nRight);
+  const nb = Math.min(MANUAL_MAX_CELLS, nUp + 1 + nDown);
+  const ox = x0 - nLeft * cw;
+  const oy = y0 - nUp * ch;
+  manualQuad = [
+    { x: ox, y: oy },
+    { x: ox + na * cw, y: oy },
+    { x: ox + na * cw, y: oy + nb * ch },
+    { x: ox, y: oy + nb * ch },
+  ];
+  manualNa = na;
+  manualNb = nb;
+  manualDrawPending = false;
+  setManualHint();
+  updateManualBar();
   applyManual();
 }
 
 /** Leave manual editing. keep=true commits the grid; false discards it (back to the
  * fallback panel). */
 function exitManualMode(keep: boolean) {
+  // Nothing to commit if the user hit "Fatto" before drawing a cell.
+  if (keep && (!manualQuad || !gridMap)) keep = false;
   manualActive = false;
   manualDrag = null;
   manualDragLast = null;
+  manualDrawPending = false;
+  drawCellStart = null;
+  drawCellEnd = null;
   showManualBar(false);
   if (keep) {
     // gridReliable / gridMap already set by applyManual — just show the tools.
@@ -672,6 +739,20 @@ function updateEditGridButton() {
 
 // Pointer gestures while editing a manual grid (routed from the map handlers).
 function manualPointerDown(e: PointerEvent) {
+  if (manualDrawPending) {
+    activePointers.add(e.pointerId);
+    if (activePointers.size !== 1) {
+      manualDrag = null;
+      return;
+    }
+    const p = pointerToImage(e.clientX, e.clientY);
+    if (!p) return;
+    drawCellStart = p;
+    drawCellEnd = p;
+    manualDrag = DRAW_SENTINEL;
+    capturePointer(e.pointerId);
+    return;
+  }
   if (!manualQuad) return;
   activePointers.add(e.pointerId);
   if (activePointers.size !== 1) {
@@ -695,6 +776,14 @@ function manualPointerDown(e: PointerEvent) {
   capturePointer(e.pointerId);
 }
 function manualPointerMove(e: PointerEvent) {
+  if (manualDrag === DRAW_SENTINEL) {
+    const p = pointerToImage(e.clientX, e.clientY);
+    if (!p) return;
+    e.preventDefault();
+    drawCellEnd = p;
+    draw();
+    return;
+  }
   if (manualDrag === null || !manualQuad || !manualDragLast) return;
   const p = pointerToImage(e.clientX, e.clientY);
   if (!p) return;
@@ -714,8 +803,29 @@ function manualPointerMove(e: PointerEvent) {
 }
 function manualPointerUp(e: PointerEvent) {
   activePointers.delete(e.pointerId);
+  if (manualDrag === DRAW_SENTINEL) {
+    manualDrag = null;
+    finalizeDrawnCell();
+    return;
+  }
   manualDrag = null;
   manualDragLast = null;
+}
+
+/** Preview rectangle while the user drags the seed cell in "draw" mode. */
+function drawDrawPreview(ctx: CanvasRenderingContext2D) {
+  if (!drawCellStart || !drawCellEnd) return;
+  const x = Math.min(drawCellStart.x, drawCellEnd.x);
+  const y = Math.min(drawCellStart.y, drawCellEnd.y);
+  const w = Math.abs(drawCellEnd.x - drawCellStart.x);
+  const h = Math.abs(drawCellEnd.y - drawCellStart.y);
+  ctx.save();
+  ctx.lineWidth = Math.max(2, view.width / 320);
+  ctx.strokeStyle = '#22d3ee';
+  ctx.fillStyle = 'rgba(34, 211, 238, 0.14)';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeRect(x, y, w, h);
+  ctx.restore();
 }
 
 /** Draw the 4 corner handles over the manual grid. */
@@ -799,16 +909,18 @@ function draw() {
   // other family), so lines don't protrude past the outer rows/columns. Both
   // directions share one colour — a soft white — since we don't distinguish them.
   const gridColor = '#eaf1fb';
-  // Draw the grid when it's trustworthy, or while the user is placing one by hand.
-  // An unreliable auto fit shows the photo alone under the fallback panel, not a
-  // wrong grid.
-  if (gridReliable || manualActive) {
+  // Draw the grid when it's trustworthy, or while the user is adjusting a manual
+  // quad. An unreliable auto fit (or the "draw a cell" step before a cell exists)
+  // shows the photo alone, not a wrong grid.
+  const showManualGrid = manualActive && !manualDrawPending && !!manualQuad;
+  if (gridReliable || showManualGrid) {
     drawFamily(ctx, r.familyA, r.familyB, r.width, r.height, gridColor, lw);
     drawFamily(ctx, r.familyB, r.familyA, r.width, r.height, gridColor, lw);
   }
 
   if (manualActive) {
-    drawManualHandles(ctx);
+    if (manualDrawPending) drawDrawPreview(ctx);
+    else drawManualHandles(ctx);
     return; // no tactical layer while editing the grid
   }
 
@@ -2134,10 +2246,15 @@ failRetake.addEventListener('click', () => {
   if (showingResult) history.back();
   else retake();
 });
-// Fallback panel: "Griglia manuale" drops into the manual-grid editor.
-failManual.addEventListener('click', () => {
+// Fallback panel: two ways into the manual editor — adapt a (default/current) grid,
+// or draw one cell and expand from it.
+failAdapt.addEventListener('click', () => {
   gridFail.hidden = true;
-  enterManualMode();
+  enterManualMode('adapt');
+});
+failDraw.addEventListener('click', () => {
+  gridFail.hidden = true;
+  enterManualMode('draw');
 });
 
 // Manual-grid bar controls.

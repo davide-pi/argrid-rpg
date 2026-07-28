@@ -174,7 +174,8 @@
             <p class="grid-fail-sub">La foto potrebbe essere poco nitida, storta o senza una griglia chiara. Riprova, oppure posiziona la griglia a mano.</p>
             <div class="grid-fail-actions">
               <button id="failRetake" class="btn btn-primary" type="button">Scatta un'altra foto</button>
-              <button id="failManual" class="btn btn-ghost" type="button">Griglia manuale</button>
+              <button id="failAdapt" class="btn btn-ghost" type="button">Griglia da adattare</button>
+              <button id="failDraw" class="btn btn-ghost" type="button">Disegna a mano</button>
             </div>
           </div>
         </div>
@@ -197,7 +198,7 @@
             </div>
           </div>
           <div class="manual-bar-body">
-            <p class="manual-bar-hint">Trascina gli angoli per adattare la griglia · trascina il centro per spostarla.</p>
+            <p class="manual-bar-hint" id="manualHint">Trascina gli angoli per adattare la griglia · trascina il centro per spostarla.</p>
             <div class="manual-bar-row">
               <div class="stepper" aria-label="Numero di colonne">
                 <span class="stepper-lbl">Colonne</span>

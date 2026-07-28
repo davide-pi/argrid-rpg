@@ -86,6 +86,10 @@ export interface GridResult {
     detectedA: number; // real DETECTED (non-filled) lines per family …
     detectedB: number;
     confidence: number; // …feeding a 0..1 heuristic detection-quality score
+    // true when the fit collapsed to an implausible SUB-PITCH (micro-cells) — a
+    // degenerate/garbage grid. This (not a confidence threshold) is what the UI gates
+    // on to decide whether to draw the auto grid or offer the manual fallback.
+    degenerate: boolean;
   };
 }
 
@@ -723,6 +727,7 @@ export function buildGrid(
       detectedA: 0,
       detectedB: 0,
       confidence: 0,
+      degenerate: true, // no grid at all → treat as degenerate (offer the fallback)
     },
   };
 
@@ -813,6 +818,7 @@ export function buildGrid(
       detectedA: detectedCount(familyA),
       detectedB: detectedCount(familyB),
       confidence: degenerate ? 0 : gridConfidence(familyA, familyB),
+      degenerate,
     },
   };
 }

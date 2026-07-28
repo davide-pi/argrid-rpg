@@ -46,17 +46,20 @@ rotating the angle ring, editing an area — only mutates module state and calls
 `draw()` (`main.ts:403`). `draw()` repaints the photo plus the vector overlays; it
 does not touch OpenCV. This is what keeps the UI responsive on a phone.
 
-**Reliability gate + manual grid.** After detection, `runDetection` sets
-`gridReliable` from `info.confidence` (≥ `MIN_GRID_CONFIDENCE`). When it's false the
-grid and the tactical layer are **not** drawn — instead the fallback panel
-(`#gridFail`) offers *retake*, *grid to adapt*, or *draw by hand* (and a top-bar
-button opens the editor on any result). Both manual modes synthesise the same
+**Reliability gate + manual grid.** After detection, `applyDetectedGrid` sets
+`gridReliable` **structurally** (`detectedA,detectedB ≥ 2`, drawn cells per side
+`≥ MIN_GRID_CELLS`, `!degenerate`, cell-aspect `≤ MAX_CELL_ASPECT`) — not from a
+`confidence` threshold. When it's false, the grid + tactical layer are simply **not**
+drawn (the photo shows alone); there is **no** automatic panel. Guidance lives in the
+single info **(i)** button (bottom-left), and a top-bar **edit-grid** button opens an
+on-demand chooser (`#editChooser`: *grid to adapt* / *draw by hand*) on any result;
+**cancel restores the detected grid**. Both manual modes synthesise the same
 `familyA`/`familyB` `Line2[]` the detector emits — *adapt* tiles a draggable quad via
 the quad→unit-square homography; *draw* traces reference lines fed to `buildGrid` —
 and on commit the lattice is extended to fill the frame. So `draw()`, `makeGridMap`
 and every tactical tool are agnostic to whether the grid came from CV or the user's
-hand. See [decisions.md](decisions.md) ("Unreliable auto grid → fallback panel + manual
-grid").
+hand. See [decisions.md](decisions.md) ("Unreliable auto grid → photo alone + (i)
+guidance + on-demand manual editor").
 
 ## Boot path (why a classic script)
 

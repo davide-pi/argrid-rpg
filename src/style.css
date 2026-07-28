@@ -445,17 +445,9 @@ body {
   align-items: center;
   gap: 8px 12px;
 }
-.hud-hint {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.35;
-  color: var(--muted);
-}
-.hud-hint[hidden] {
-  display: none;
-}
-/* Hints are hidden by default (toggled by the HUD (i) button) to save space. */
-.hud.hints-off .hud-hint {
+/* Movement (and other control-less contexts) have no body — drop the empty padded
+   area and, in JS, the collapse chevron too. */
+.hud.bodyless .hud-body {
   display: none;
 }
 
@@ -541,37 +533,127 @@ body {
   color: #93b4fd;
 }
 
-/* --- Transient toast (placement hints) ------------------------------ */
-.toast {
+/* --- Debug step viewer (numbered stage chips, top; debug mode only) --- */
+.debug-bar {
   position: absolute;
-  left: 14px;
-  bottom: calc(14px + env(safe-area-inset-bottom));
-  z-index: 15;
-  max-width: min(340px, calc(100% - 90px)); /* clear the FAB on the right */
-  padding: 9px 14px;
+  left: 8px;
+  right: 8px;
+  top: calc(8px + env(safe-area-inset-top));
+  z-index: 30; /* above the HUD while inspecting the pipeline */
+  display: flex;
+  gap: 6px;
+  padding: 6px;
   border-radius: 12px;
-  background: rgba(17, 24, 33, 0.94);
+  background: rgba(10, 14, 19, 0.82);
   border: 1px solid var(--line);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
-  color: var(--fg);
-  font-size: 13px;
-  line-height: 1.3;
-  /* Never taller than 2 lines. */
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  opacity: 0;
-  transform: translateY(6px);
-  transition: opacity 0.2s ease, transform 0.2s ease;
-  pointer-events: none;
+  backdrop-filter: blur(8px);
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
 }
-.toast[hidden] {
+.debug-bar[hidden] {
   display: none;
 }
-.toast.show {
-  opacity: 1;
-  transform: none;
+.debug-chip {
+  appearance: none;
+  flex: none;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.debug-chip .n {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: var(--fg);
+  opacity: 0.6;
+}
+.debug-chip:hover {
+  background: #1f2b3b;
+}
+.debug-chip.on {
+  color: var(--accent-ink);
+  background: linear-gradient(135deg, var(--accent), #16b8d4);
+  border-color: var(--accent);
+}
+.debug-chip.on .n {
+  color: var(--accent-ink);
+  opacity: 0.85;
+}
+
+/* --- Contextual help: a single (i) button + popover (bottom-left) --- */
+/* Sits just above the version badge; shown only when there's guidance for the
+   current state. Replaces the scattered hints and transient toasts. */
+.info-wrap {
+  position: absolute;
+  left: 10px;
+  bottom: calc(30px + env(safe-area-inset-bottom));
+  z-index: 17; /* above the HUD */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+.info-wrap[hidden] {
+  display: none;
+}
+.info-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--line);
+  background: rgba(17, 24, 33, 0.9);
+  color: var(--muted);
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(8px);
+  transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.06s;
+}
+.info-btn:hover {
+  color: var(--fg);
+  background: #1e2a3a;
+}
+.info-btn:active {
+  transform: scale(0.94);
+}
+.info-wrap.open .info-btn {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.info-btn svg {
+  display: block;
+}
+.info-pop {
+  max-width: min(320px, calc(100vw - 32px));
+  padding: 10px 13px;
+  border-radius: 12px;
+  background: rgba(17, 24, 33, 0.96);
+  border: 1px solid var(--line);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(10px);
+  color: var(--fg);
+  font-size: 12.5px;
+  line-height: 1.45;
+  white-space: pre-line; /* honour \n between the hint lines */
+}
+.info-pop[hidden] {
+  display: none;
 }
 
 /* --- Grid fallback panel (unreliable auto-detection) ---------------- */
@@ -697,23 +779,17 @@ body {
   align-items: center;
   gap: 8px;
 }
-.manual-bar-title {
-  flex: 1;
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--fg);
-}
-.manual-bar-head-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+/* Fatto (primary) is pushed to the right, so the head reads: Annulla … Fatto [⌄]. */
+#manualDone {
+  margin-left: auto;
 }
 /* When collapsed, only the head row (with Fatto/Annulla) stays. */
 .manual-bar.collapsed .manual-bar-body {
   display: none;
 }
-/* In "draw" mode the grid comes from traced lines, so the cell steppers don't apply. */
-.manual-bar.draw-mode .manual-bar-row {
+/* In "draw" mode the grid comes from traced lines: no steppers, so the whole body
+   goes away and the bar is just a slim head. */
+.manual-bar.draw-mode .manual-bar-body {
   display: none;
 }
 .manual-bar.collapsed .manual-bar-head .chev {
@@ -723,13 +799,6 @@ body {
   display: flex;
   flex-direction: column;
   gap: 10px;
-}
-.manual-bar-hint {
-  margin: 0;
-  font-size: 12.5px;
-  line-height: 1.4;
-  color: var(--muted);
-  text-align: center;
 }
 .manual-bar-row {
   display: flex;
@@ -816,7 +885,6 @@ body {
   position: absolute;
   left: 10px;
   bottom: calc(7px + env(safe-area-inset-bottom));
-  /* Below the transient toast (z 15) — it may briefly cover the badge. */
   z-index: 14;
   padding: 2px 6px;
   border-radius: 6px;

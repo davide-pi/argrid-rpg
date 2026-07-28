@@ -90,10 +90,15 @@
         <canvas id="view" hidden></canvas>
         <div id="hint" class="hint">Inquadra una griglia di quadrati e scatta.</div>
 
+        <!-- Debug step viewer: a scrollable row of numbered stage chips, shown only in
+             debug mode. Chips are injected by main.ts; the last (default) shows the
+             live line overlay, the others show that pipeline stage's image. -->
+        <div id="debugBar" class="debug-bar" hidden></div>
+
         <!-- Contextual heads-up panel, overlaid on the TOP of the map. Shows the
              controls for whatever is active (a selected piece, an area, or a
              movement). Collapsible; it does NOT reopen itself when you move things. -->
-        <div class="hud hints-off" id="hud" hidden>
+        <div class="hud" id="hud" hidden>
           <div class="hud-head" id="hudHead">
             <span class="hud-badge" id="hudBadge" aria-hidden="true"></span>
             <span class="hud-title" id="hudTitle">—</span>
@@ -104,12 +109,6 @@
                   <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
                   <line x1="10" x2="10" y1="11" y2="17" />
                   <line x1="14" x2="14" y1="11" y2="17" />
-                </svg>
-              </button>
-              <button class="hud-icon" id="hudInfo" type="button" aria-label="Mostra i suggerimenti">
-                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <circle cx="12" cy="12" r="10" />
-                  <path d="M12 16v-4M12 8h.01" />
                 </svg>
               </button>
               <button class="hud-icon" id="hudCollapse" type="button" aria-label="Riduci o espandi">
@@ -139,7 +138,6 @@
                 <select id="areaSizeSel" class="sel" aria-label="Dimensione dell'area" title="Dimensione"></select>
                 <select id="areaCreature" class="sel" aria-label="Taglia della creatura" title="Taglia creatura" hidden></select>
               </div>
-              <p class="hud-hint" id="areaRotHint" hidden>Ruota trascinando la punta sulla mappa.</p>
             </div>
 
             <!-- Piece editor -->
@@ -148,13 +146,10 @@
                 <label class="fld">Taglia <select id="pieceSize" class="sel"></select></label>
                 <label class="fld">Movimento <select id="pieceMove" class="sel"></select></label>
               </div>
-              <p class="hud-hint">Tocca la pedina per il movimento · trascinala per spostarla.</p>
             </div>
 
-            <!-- Movement -->
-            <div class="hud-section" id="hudMove" hidden>
-              <p class="hud-hint">Tocca una cella per vedere i percorsi · tocca un'altra pedina per spostarti su di essa.</p>
-            </div>
+            <!-- Movement (controls live on the map; guidance is behind the (i) button) -->
+            <div class="hud-section" id="hudMove" hidden></div>
           </div>
         </div>
 
@@ -192,26 +187,15 @@
              never hides a corner handle the user needs to reach. -->
         <div id="manualBar" class="manual-bar" hidden>
           <div class="manual-bar-head">
-            <span class="manual-bar-title">Griglia manuale</span>
-            <div class="manual-bar-head-actions">
-              <button id="manualReset" class="btn btn-ghost btn-mini" type="button" hidden>Cancella</button>
-              <button id="manualCancel" class="btn btn-ghost btn-mini" type="button">Annulla</button>
-              <button id="manualDone" class="btn btn-primary btn-mini" type="button">Fatto</button>
-              <button id="manualInfo" class="hud-icon" type="button" aria-label="Mostra le istruzioni">
-                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <circle cx="12" cy="12" r="10" />
-                  <path d="M12 16v-4M12 8h.01" />
-                </svg>
-              </button>
-              <button id="manualCollapse" class="hud-icon" type="button" aria-label="Riduci o espandi i controlli">
-                <svg class="chev" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="m6 9 6 6 6-6" />
-                </svg>
-              </button>
-            </div>
+            <button id="manualCancel" class="btn btn-ghost btn-mini" type="button">Annulla</button>
+            <button id="manualDone" class="btn btn-primary btn-mini" type="button">Fatto</button>
+            <button id="manualCollapse" class="hud-icon" type="button" aria-label="Riduci o espandi i controlli">
+              <svg class="chev" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="m6 9 6 6 6-6" />
+              </svg>
+            </button>
           </div>
           <div class="manual-bar-body">
-            <p class="manual-bar-hint" id="manualHint" hidden>Trascina gli angoli per adattare la griglia · trascina il centro per spostarla.</p>
             <div class="manual-bar-row">
               <div class="stepper" aria-label="Numero di colonne">
                 <span class="stepper-lbl">Colonne</span>
@@ -229,9 +213,6 @@
           </div>
         </div>
 
-        <!-- Transient hint (e.g. entering placement mode), bottom-left near the FAB. -->
-        <div class="toast" id="toast" hidden></div>
-
         <!-- Floating "add" speed-dial (pieces / areas), overlaying the map. -->
         <div class="fab-wrap" id="fabWrap" hidden>
           <div class="fab-menu" id="fabMenu">
@@ -244,6 +225,20 @@
 
         <!-- Capture button (camera mode only). -->
         <button id="btnCapture" class="capture-btn" disabled>Scatta</button>
+
+        <!-- Contextual help: a single (i) button (bottom-left, above the version
+             badge), shown only when there's guidance for the current state. Tapping
+             it toggles a small popover with what you can do right now — replaces the
+             scattered hints and transient toasts. -->
+        <div id="infoWrap" class="info-wrap" hidden>
+          <div id="infoPop" class="info-pop" hidden></div>
+          <button id="infoBtn" class="info-btn" type="button" aria-label="Mostra i suggerimenti">
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10" />
+              <path d="M12 16v-4M12 8h.01" />
+            </svg>
+          </button>
+        </div>
 
         <!-- Build version (computed by GitVersion in CI), overlaid bottom-left. -->
         <span id="versionBadge" class="version-badge" aria-hidden="true"></span>

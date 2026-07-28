@@ -61,6 +61,12 @@ perspective (`buildGrid` / `ransacVP` / `fitFamilyGrid`, `src/grid-detector.ts`)
   actually fan (`VP_MIN_FAN_DEG`) **and** the VP lands outside the frame (`VP_FRAME_MARGIN`);
   otherwise it uses the stable at-infinity VP. A near-parallel family's noisy far
   intersection used to corrupt the rectifying horizon and compress the lattice to a sub-pitch.
+  **Strong-evidence override** (added later): a finite VP *inside* the frame is trusted anyway
+  when many inliers concur over a wide fan (`VP_STRONG_MIN_INLIERS` + `VP_STRONG_FAN_DEG`) —
+  a genuine shallow-angle floor/table VP. Without it, a low-angle floor (VP legitimately
+  in-frame) was rejected → no rectification → collapse to a fronto-parallel **2×2**. A
+  fronto-parallel grid fans ~0° so it never triggers the override (no regression there);
+  `MIN_GRID_CELLS` (5, in `main.ts`) is the backstop that hides any residual 2×2 collapse.
 - **Sub-multiple rejection** — `coarsenPitch` prefers the coarsest integer multiple of the
   base cell that still holds (almost) all offsets, so the fit can't lock onto a 1/m harmonic
   (tolerance is absolute, tied to the base cell, so occluded/dropped lines don't over-coarsen).
@@ -80,16 +86,19 @@ compresses toward invisibility) is still only partially recovered — such cases
 low confidence (warned) rather than a clean grid; a full fix (per-row TLS / node-based fit) is
 a larger task tracked for the corner-node fallback.
 
-### Unreliable auto grid → fallback panel + manual grid, never a wrong grid
-**Decision:** when the detection `confidence` is below `MIN_GRID_CONFIDENCE` (0.5 — at least 4
-detected lines per family, `src/main.ts`) the app does **not** draw the auto grid or build tactics
-on it. Instead it shows
-the photo alone under a fallback card (`#gridFail`) offering **retake**, **grid to adapt**, or
-**draw by hand**. A top-bar **edit-grid** button makes the manual editor available on *any* result
-too (so a well-detected grid can also be tweaked). The manual editor (`src/main.ts`, "Manual grid
-editor") has two modes, both producing the same `familyA`/`familyB` `Line2[]` the detector would —
-so drawing (`drawFamily`) and every tactical tool (`makeGridMap`, tokens, areas, movement) work
-unchanged:
+### Unreliable auto grid → photo alone + (i) guidance + on-demand manual editor, never a wrong grid
+**Decision:** the app **always draws the grid it found when it is reliable, or the photo alone
+otherwise** — there is **no** automatic fallback card. Reliability is structural, in
+`applyDetectedGrid` (`src/main.ts`): `detectedA,detectedB ≥ 2`, drawn cells per side
+`≥ MIN_GRID_CELLS` (5), `!degenerate`, and cell-aspect `≤ MAX_CELL_ASPECT` — **not** a
+`confidence` threshold. When no grid is drawn, the single info **(i)** button (bottom-left)
+carries the guidance ("Nessuna griglia rilevata — usa il tasto griglia / fotocamera"). A top-bar
+**edit-grid** button opens an on-demand chooser (`#editChooser`: **grid to adapt** / **draw by
+hand**) on *any* result, so a well-detected grid can also be tweaked. **Cancelling** the editor
+restores the detected grid (`applyDetectedGrid`), never discards it. The manual editor
+(`src/main.ts`, "Manual grid editor") has two modes, both producing the same `familyA`/`familyB`
+`Line2[]` the detector would — so drawing (`drawFamily`) and every tactical tool (`makeGridMap`,
+tokens, areas, movement) work unchanged:
 - **Adapt** — a **quad** (4 draggable corners) tiled into N×M cells; the quad→unit-square
   homography (`solveHomography`/`applyH` from `overlays.ts`) gives projective, perspective-correct
   nodes. Seeded from the current grid when there is one, else a default inset. Cell counts via ±
@@ -100,23 +109,24 @@ unchanged:
   lattice. Strokes have draggable endpoints and a × delete badge; the grid regenerates live.
 On **commit** ("Fatto") the grid is EXTENDED past the drawn quad to fill the frame
 (`commitManualGrid`, mirroring `extend:'frame'`). The controls bar sits at the top and is
-collapsible so it never hides a corner handle. Grid drawing + the tactical layer are gated on
-`gridReliable` (or the editor being active); the FAB/HUD are hidden while a grid is unreliable or
-being edited.
+collapsible so it never hides a corner handle (the collapse chevron is hidden when there's nothing
+to collapse — draw mode). Grid drawing + the tactical layer are gated on `gridReliable` (or the
+editor being active); the FAB is hidden while a grid is unreliable or being edited.
 **Why:** on genuinely hard shots (strong perspective, noise, or distractors like a tiled floor)
 detection fails in *any* variant of the pipeline — and drawing the resulting degenerate
 micro/macro grid over the photo is what reads as a "drastic loss of precision". Showing the clean
-photo + an honest choice (retake / place it yourself) is far better than a confident-looking wrong
+photo + an honest choice (edit it yourself / retake) is far better than a confident-looking wrong
 grid.
 **Calibration (user-labelled 16-photo corpus).** The user labelled which auto-detections are
 actually correct — **only 3/16** were (auto-detection accuracy is genuinely low on hard photos).
-Confidence tracks correctness well: the 3 correct grids scored **≥ 0.75**, and every wrong one
-scored **≤ 0.25 except one confident-but-wrong outlier** (a full lattice at the wrong orientation)
-that no available metric separates from a good grid. So `confidence ≥ 0.5` is the gate — it agrees
-with the labels **15/16** (only the outlier is shown-but-wrong). An earlier attempt to gate on
-"not degenerate + cell-aspect" instead of confidence was **worse** (it showed 5 wrong grids), and
-was reverted. Do NOT re-tune this gate against my own guesses — establish ground truth from the
-user first (see the memory note). The remaining gap is detection *accuracy*, not the gate.
+`confidence` = `clamp((min(detectedA,detectedB)−2)/4,0,1)` tracks correctness reasonably (the 3
+correct scored high; most wrong scored low, save one confident-but-wrong outlier — a full lattice
+at the wrong orientation — that no metric separates). **The product choice, however, is "always
+show the grid you found and let the user judge/edit it", not to hide grids behind a confidence
+gate** — so `confidence` is now diagnostic only, and reliability is the structural test above
+(`!degenerate` + cell-aspect + `MIN_GRID_CELLS`). Do NOT re-tune detection against my own guesses —
+establish ground truth from the user first (see the memory note). The remaining gap is detection
+*accuracy*, not the gate.
 
 ### Map-boundary quad auto-rescue was attempted and dropped (unreliable segmentation)
 **Decision:** an auto "map boundary" step (restrict the edges to the detected map quad before

@@ -46,7 +46,13 @@ Works in **image-centred** coordinates for numerical stability (`:458`), then ma
 3. **Vanishing point per family (RANSAC)** — `ransacVP` (`grid-detector.ts:556`) picks
    the VP where the most lines concur (≤1.5° residual, `vpResidualDeg` `:531`); lines
    that don't converge like the grid (text, drawings, stray marks) are rejected.
-   Refined by least squares (`vanishingPoint` `:650`); parallel → VP at infinity.
+   Refined by least squares (`vanishingPoint` `:650`); parallel → VP at infinity. A
+   finite VP **inside** the frame is normally spurious (`VP_FRAME_MARGIN`) and dropped
+   back to "parallel" — EXCEPT when the evidence is strong (wide inlier fan
+   `VP_STRONG_FAN_DEG` + many concurrent lines `VP_STRONG_MIN_INLIERS`): that is a
+   genuine shallow-angle floor/table VP, so it's trusted. Without this override a
+   low-angle floor collapses to a fronto-parallel 2×2 (the vanishing point rejected →
+   no rectification). A fronto-parallel grid fans ~0° and never triggers the override.
 4. **Rectify with the horizon** — `buildRectify` (`grid-detector.ts:590`) sends the
    horizon `VP_A × VP_B` to infinity; in the rectified plane each family is parallel
    and **evenly spaced**.
@@ -100,15 +106,28 @@ exact synthetic θ do **not** catch it — only real Hough output does.
 Surfaced in the status line when `debug` is on. Note `aCount`/`bCount` are the **total**
 family sizes (detected + filled + extended); the `lineMorph` fallback and `confidence`
 gate on the **detected-only** counts instead, so fill/extension never inflate them.
-`confidence` = `clamp((min(detectedA, detectedB) − 2) / 4, 0, 1)`; the UI warns the user
-with a toast when it is below 0.35 (a mostly-extrapolated, unreliable grid).
+`confidence` = `clamp((min(detectedA, detectedB) − 2) / 4, 0, 1)` (diagnostic only). The
+UI no longer gates on `confidence` or shows a toast: `applyDetectedGrid()` (in `main.ts`)
+sets `gridReliable = detectedA ≥ 2 && detectedB ≥ 2 && cellsA,cellsB ≥ MIN_GRID_CELLS (5)
+&& !degenerate && aspect ≤ MAX_CELL_ASPECT` and draws the grid it found, or the photo
+alone when unreliable. The `MIN_GRID_CELLS` floor (drawn cells per side) rejects the
+tiny 2×2 a bad perspective fit collapses to. Contextual guidance ("Nessuna griglia
+rilevata — usa il tasto griglia / fotocamera", etc.) is carried by the single info
+**(i)** button (bottom-left), not a transient toast.
 
-## Debug output (edges + raw Hough lines)
+## Debug output (edges, raw Hough lines, step viewer)
 
 `detectGrid(…, wantEdges=true)` fills `result.edges` (Canny mask as `ImageData`).
-`draw()` blits it at 0.45 alpha and strokes every `rawLines` entry in translucent red
-(`main.ts:412`). Debug is a module boolean toggled by **triple-tapping the logo**
-(`main.ts:1660`), which re-runs detection so the diagnostics appear/disappear.
+`draw()` blits it at 0.45 alpha and strokes every `rawLines` entry in translucent red.
+Debug is a module boolean toggled by **triple-tapping the logo**, which re-runs
+detection so the diagnostics appear/disappear.
+
+When `wantEdges`, the generator also captures a downscaled RGBA snapshot of each stage
+into `result.debugSteps` (`DebugStep[]`: Grigio → CLAHE → Sfocatura → Canny → +cromatica
+→ morfologico) via `matToPreview`. `main.ts` renders a top **step-chip bar** (`#debugBar`,
+`rebuildDebugBar`) — the default chip is the live line overlay, the others blit that
+stage's image onto the view canvas (`drawDebugStep`), so you can inspect where the
+pipeline diverges from the photo.
 
 ## Verifying the pipeline
 

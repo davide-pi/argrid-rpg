@@ -70,6 +70,13 @@ export interface Line2 {
   extended?: boolean; // true if extrapolated BEYOND the detected extent (see extend)
 }
 
+/** One captured pipeline stage (debug only): a downscaled RGBA snapshot of an
+ * intermediate Mat, for the debug step viewer. */
+export interface DebugStep {
+  label: string;
+  image: ImageData;
+}
+
 export interface GridResult {
   width: number;
   height: number;
@@ -77,6 +84,7 @@ export interface GridResult {
   familyB: Line2[];
   rawLines: Line2[];
   edges?: ImageData; // debug edge map (working resolution); DOM-free
+  debugSteps?: DebugStep[]; // per-stage previews (only when wantEdges/debug)
   info: {
     rawCount: number;
     aCount: number;
@@ -161,6 +169,38 @@ function scaleToWork(cv: any, src: any, work: any, W0: number, H0: number, maxDi
     src.copyTo(work);
   }
   return scale;
+}
+
+/** Downscaled RGBA snapshot of an intermediate Mat, for the debug step viewer.
+ * Handles 1-channel (gray / binary) and 3/4-channel inputs; DOM-free (works in a
+ * worker). `maxW` caps the width so a dozen previews stay cheap in memory. */
+function matToPreview(cv: any, mat: any, maxW = 720): ImageData {
+  const s = Math.min(1, maxW / mat.cols);
+  const w = Math.max(1, Math.round(mat.cols * s));
+  const h = Math.max(1, Math.round(mat.rows * s));
+  const small = new cv.Mat();
+  try {
+    cv.resize(mat, small, new cv.Size(w, h), 0, 0, cv.INTER_AREA);
+    const ch = small.channels();
+    const src = small.data as Uint8Array;
+    const buf = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < w * h; i++) {
+      if (ch === 1) {
+        const v = src[i];
+        buf[i * 4] = v;
+        buf[i * 4 + 1] = v;
+        buf[i * 4 + 2] = v;
+      } else {
+        buf[i * 4] = src[i * ch];
+        buf[i * 4 + 1] = src[i * ch + 1];
+        buf[i * 4 + 2] = src[i * ch + 2];
+      }
+      buf[i * 4 + 3] = 255;
+    }
+    return new ImageData(buf, w, h);
+  } finally {
+    small.delete();
+  }
 }
 
 export function detectGrid(
@@ -258,6 +298,12 @@ export function* detectGridFromMatSteps(
   let blurred: any = null;
   let cannyEdges: any = null;
   let morphEdges: any = null;
+  // Debug-only per-stage previews (populated when wantEdges). Captured as the stage's
+  // Mat is still live, since Mats are freed before we return.
+  const steps: DebugStep[] = [];
+  const snap = (label: string, mat: any) => {
+    if (wantEdges) steps.push({ label, image: matToPreview(cv, mat) });
+  };
   try {
     yield { frac: 0.05, label: "Preparazione dell'immagine…" };
     gray = new cv.Mat();
@@ -266,6 +312,7 @@ export function* detectGridFromMatSteps(
     } else {
       cv.cvtColor(work, gray, cv.COLOR_RGBA2GRAY);
     }
+    snap('Grigio', gray);
 
     // --- Standard edge path: CLAHE local contrast -> blur -> auto-Canny (Otsu) ---
     eq = new cv.Mat();
@@ -273,9 +320,11 @@ export function* detectGridFromMatSteps(
     clahe.apply(gray, eq);
     clahe.delete();
     clahe = null;
+    snap('Contrasto (CLAHE)', eq);
 
     blurred = new cv.Mat();
     cv.GaussianBlur(eq, blurred, new cv.Size(3, 3), 0);
+    snap('Sfocatura', blurred);
 
     // Auto-Canny: derive thresholds from Otsu's global threshold.
     const otsuTmp = new cv.Mat();
@@ -287,6 +336,7 @@ export function* detectGridFromMatSteps(
     yield { frac: 0.2, label: 'Rilevamento dei bordi…' };
     cannyEdges = new cv.Mat();
     cv.Canny(blurred, cannyEdges, cannyLow, cannyHigh);
+    snap('Bordi (Canny)', cannyEdges);
 
     // Chromatic edges: a grid that differs from its background in HUE but not in
     // brightness (e.g. a coloured map on a similarly-light surface) leaves no
@@ -298,6 +348,7 @@ export function* detectGridFromMatSteps(
       const chroma = chromaEdges(cv, work);
       cv.bitwise_or(cannyEdges, chroma, cannyEdges);
       chroma.delete();
+      snap('Bordi + cromatica', cannyEdges);
     }
 
     // Focus gating (off by default): the grid sits in the focal plane, so it is
@@ -334,6 +385,7 @@ export function* detectGridFromMatSteps(
     if (params.lineMorph && gridStrength(result) < 3) {
       yield { frac: 0.75, label: 'Immagine complessa, riprovo…' };
       morphEdges = enhanceGridLines(cv, gray);
+      snap('Estrazione morfologica', morphEdges);
       const alt = houghToGrid(cv, morphEdges, work, scale, W0, H0, params, orient);
       if (gridStrength(alt) > gridStrength(result)) {
         result = alt;
@@ -367,6 +419,7 @@ export function* detectGridFromMatSteps(
       }
       result.edges = new ImageData(buf, ew, eh);
     }
+    if (steps.length) result.debugSteps = steps;
 
     return result;
   } finally {
@@ -1013,9 +1066,18 @@ function vpResidualDeg(l: Line2, vp: V3): number {
 /** Min angular fan (deg) among inliers before a FINITE vanishing point is trusted
  * — near-parallel lines intersect at a wildly unstable far point. */
 const VP_MIN_FAN_DEG = 4;
-/** A real grid family's vanishing point lies OUTSIDE the frame; a finite VP within
- * this multiple of the half-frame is spurious (Hough-noise intersection). */
+/** A real grid family's vanishing point USUALLY lies OUTSIDE the frame; a finite VP
+ * within this multiple of the half-frame is normally spurious (Hough-noise
+ * intersection). But a floor/table shot at a shallow angle has a GENUINE in-frame
+ * vanishing point — see VP_STRONG_* below, which overrides this rejection. */
 const VP_FRAME_MARGIN = 1.3;
+/** Strong-evidence override: an in-frame finite VP is trusted anyway when many
+ * inliers concur (VP_STRONG_MIN_INLIERS) over a wide angular fan (VP_STRONG_FAN_DEG).
+ * A fronto-parallel grid fans ~0° so it never qualifies (stays "parallel"); only a
+ * real perspective pencil of lines does — this is what rescues shallow floor shots
+ * from collapsing to a fronto-parallel 2×2. */
+const VP_STRONG_FAN_DEG = 8;
+const VP_STRONG_MIN_INLIERS = 6;
 
 function ransacVP(
   lines: Line2[],
@@ -1049,8 +1111,12 @@ function ransacVP(
   const meanA = meanAngle180(best.map((k) => angleOfDeg(lines[k].nx, lines[k].ny)));
   const fan = Math.max(...best.map((k) => angDist180(angleOfDeg(lines[k].nx, lines[k].ny), meanA)));
   let refined = fan >= VP_MIN_FAN_DEG ? vanishingPoint(best.map((k) => lines[k])) : null;
+  // A wide fan of many concurrent lines is a GENUINE vanishing point even inside the
+  // frame (shallow floor/table shot) — trust it. Otherwise an in-frame VP is spurious.
+  const strongVP = fan >= VP_STRONG_FAN_DEG && best.length >= VP_STRONG_MIN_INLIERS;
   if (
     refined &&
+    !strongVP &&
     Math.abs(refined.x) < halfW * VP_FRAME_MARGIN &&
     Math.abs(refined.y) < halfH * VP_FRAME_MARGIN
   ) {

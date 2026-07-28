@@ -94,13 +94,15 @@ const rowsInput = $<HTMLInputElement>('rowsInput');
 const manualDone = $<HTMLButtonElement>('manualDone');
 const manualCancel = $<HTMLButtonElement>('manualCancel');
 const manualCollapse = $<HTMLButtonElement>('manualCollapse');
-const manualInfo = $<HTMLButtonElement>('manualInfo');
-const manualHint = $<HTMLParagraphElement>('manualHint');
-const manualReset = $<HTMLButtonElement>('manualReset');
 
 // Debug has no on-screen switch — it's a hidden state toggled by triple-tapping
-// the logo. When on, detection draws its edge/line diagnostics and a verbose status.
+// the logo. When on, detection draws its edge/line diagnostics and a verbose status,
+// and the debug step viewer lets you inspect each pipeline stage.
 let debug = false;
+const debugBar = $<HTMLDivElement>('debugBar');
+// Selected debug stage: an index into lastResult.debugSteps, or === its length for the
+// final live line overlay (the default). Reset to the overlay on each detection.
+let debugStepIdx = 0;
 // Floating "add" speed-dial.
 const fabWrap = $<HTMLDivElement>('fabWrap');
 const fab = $<HTMLButtonElement>('fab');
@@ -118,15 +120,16 @@ const hudArea = $<HTMLDivElement>('hudArea');
 const hudPiece = $<HTMLDivElement>('hudPiece');
 const hudMove = $<HTMLDivElement>('hudMove');
 const hudCollapse = $<HTMLButtonElement>('hudCollapse');
-const hudInfo = $<HTMLButtonElement>('hudInfo');
 const hudClose = $<HTMLButtonElement>('hudClose');
-const toast = $<HTMLDivElement>('toast');
+// Single contextual-help affordance (bottom-left, above the version badge).
+const infoWrap = $<HTMLDivElement>('infoWrap');
+const infoBtn = $<HTMLButtonElement>('infoBtn');
+const infoPop = $<HTMLDivElement>('infoPop');
 // Area controls (live inside the HUD now).
 const areaTypeBox = $<HTMLDivElement>('areaType');
 const areaSizeSel = $<HTMLSelectElement>('areaSizeSel');
 const areaUnit = $<HTMLSelectElement>('areaUnit');
 const areaCreature = $<HTMLSelectElement>('areaCreature');
-const areaRotHint = $<HTMLParagraphElement>('areaRotHint');
 const brand = $<HTMLElement>('brand');
 // Build version (injected by Vite — GitVersion in CI), shown small on the map.
 const versionBadge = $<HTMLSpanElement>('versionBadge');
@@ -192,26 +195,56 @@ function setStatus(msg: string) {
   statusEl.textContent = msg;
 }
 
-// A transient bottom toast (max 2 lines, ~2s) for placement hints — replaces the
-// long "Modalità …" status line in the header.
-let toastTimer: ReturnType<typeof setTimeout> | null = null;
-let toastHide: ReturnType<typeof setTimeout> | null = null;
-function showToast(msg: string) {
-  if (toastTimer) clearTimeout(toastTimer);
-  if (toastHide) clearTimeout(toastHide);
-  toast.textContent = msg;
-  toast.hidden = false;
-  requestAnimationFrame(() => toast.classList.add('show'));
-  toastTimer = setTimeout(() => {
-    toast.classList.remove('show');
-    toastHide = setTimeout(() => (toast.hidden = true), 220); // after the fade-out
-  }, 2000);
+// --- Contextual help (single (i) button, bottom-left) ------------------
+// One affordance carries all the "what can I do now" guidance that used to be
+// scattered across HUD hints and transient toasts. It's shown only when there's
+// something to say for the current state; tapping (i) toggles the popover. It
+// auto-opens on the moments that need immediate guidance (entering placement /
+// manual editing, or a photo with no grid); otherwise it stays where the user left it.
+let infoOpen = false;
+
+/** The guidance for the current app state (null → nothing to show, button hidden). */
+function currentInfo(): string | null {
+  if (!showingResult) return null; // camera mode — the central on-screen hint suffices
+  if (manualActive) {
+    return manualDrawPending
+      ? 'Traccia una linea lungo ogni colonna e ogni riga (almeno 2 per direzione): da queste genero la griglia.\nTrascina gli estremi per correggere una linea · tocca la × per eliminarla.'
+      : 'Trascina gli angoli per adattare la griglia · trascina il centro per spostarla.\nAvvicina o allontana due dita per ridimensionarla.';
+  }
+  if (placeMode === 'area') return 'Tocca una cella per posizionare l’area.';
+  if (placeMode === 'ally') return 'Tocca le celle per aggiungere o togliere alleati.';
+  if (placeMode === 'enemy') return 'Tocca le celle per aggiungere o togliere nemici.';
+  const ctx = hudContext();
+  if (ctx === 'move')
+    return 'Tocca una cella per vedere i percorsi · tocca un’altra pedina per spostarti su di essa.';
+  if (ctx === 'piece') return 'Tocca la pedina per il movimento · trascinala per spostarla.';
+  if (ctx === 'area') {
+    const base = 'Trascina l’area per spostarla · tocca ✕ per rimuoverla.';
+    return currentAreaType === 'linea' || currentAreaType === 'cono'
+      ? 'Ruota l’area trascinando la punta sulla mappa.\n' + base
+      : base;
+  }
+  if (!gridReliable)
+    return 'Nessuna griglia rilevata.\nDisegnala a mano con il tasto griglia (in alto a destra), o rifai la foto con il tasto fotocamera.';
+  // Idle over a good grid: the always-available "what can I do". Refer to the top-bar
+  // buttons by what their icons ARE (grid / camera), not by a mismatched glyph.
+  return 'Tocca ＋ per aggiungere pedine o aree.\nUsa il tasto griglia (in alto a destra) per modificare la griglia, o il tasto fotocamera per rifare la foto.';
 }
-function hideToast() {
-  if (toastTimer) clearTimeout(toastTimer);
-  if (toastHide) clearTimeout(toastHide);
-  toast.classList.remove('show');
-  toast.hidden = true;
+
+/** Sync the (i) button + popover with the current state. */
+function updateInfo() {
+  const text = currentInfo();
+  if (!text) {
+    infoOpen = false;
+    infoWrap.hidden = true;
+    infoPop.hidden = true;
+    infoWrap.classList.remove('open');
+    return;
+  }
+  infoWrap.hidden = false;
+  infoPop.textContent = text;
+  infoPop.hidden = !infoOpen;
+  infoWrap.classList.toggle('open', infoOpen);
 }
 
 // --- Heads-up panel (contextual controls over the map) -----------------
@@ -235,10 +268,15 @@ function refreshHud() {
   const ctx = hudContext();
   if (!ctx) {
     hud.hidden = true;
+    updateInfo();
     return;
   }
   hud.hidden = false;
   hud.classList.toggle('collapsed', hudCollapsed);
+  // Movement has no body controls (its guidance lives behind the (i) button), so
+  // drop the empty body and its collapse chevron.
+  hud.classList.toggle('bodyless', ctx === 'move');
+  hudCollapse.hidden = ctx === 'move';
   hudArea.hidden = ctx !== 'area';
   hudPiece.hidden = ctx !== 'piece';
   hudMove.hidden = ctx !== 'move';
@@ -258,6 +296,7 @@ function refreshHud() {
     hudTitle.textContent = 'Movimento';
     hudBadge.classList.add(moveGroup());
   }
+  updateInfo();
 }
 
 // Expand + rebuild — only for explicit entry points (add area / open editor / start
@@ -333,6 +372,8 @@ function boot() {
           // the ring from a test harness.
           ringHandle: () => ringHandleGrid(),
           effectiveAngle: () => effectiveAngle(),
+          // Current detection state, for test assertions.
+          state: () => ({ gridReliable, gridDims: { ...gridDims }, showingResult }),
         };
       }
       btnCapture.disabled = false;
@@ -362,6 +403,7 @@ async function startCamera() {
     if (placeMode !== 'none') setPlaceMode('none');
     fabWrap.hidden = true; // nothing to add on the live camera
     setStatus(''); // no header status on the live camera (the on-map hint suffices)
+    updateInfo(); // hide the (i) button — nothing to guide on the camera
   } catch (err) {
     console.error(err);
     setStatus('Fotocamera non disponibile — tocca lo schermo per riprovare');
@@ -394,15 +436,17 @@ function processImage(canvas: HTMLCanvasElement) {
   editChooser.hidden = true;
   if (placeMode !== 'none') setPlaceMode('none'); // turn off any active placement
   fabWrap.hidden = false; // the "add" FAB is available once there's a grid
-  runDetection();
-  btnCapture.hidden = true; // no Scatta once we already have a grid
-  topActions.hidden = false; // show the camera (retake) button at the top
-  // Push a history entry so the device/browser "back" returns to the camera
-  // (via popstate) instead of leaving the app.
+  // Enter result mode BEFORE detection so the chrome/(i) updates run by runDetection
+  // (updateResultChrome / updateInfo) see the correct mode — otherwise the FIRST photo
+  // leaves the (i) hidden and the FAB ungated. Push a history entry so the device/
+  // browser "back" returns to the camera (via popstate) instead of leaving the app.
   if (!showingResult) {
     showingResult = true;
     history.pushState({ argrid: 'result' }, '');
   }
+  runDetection();
+  btnCapture.hidden = true; // no Scatta once we already have a grid
+  topActions.hidden = false; // show the camera (retake) button at the top
 }
 
 // Yield to the browser so it paints the overlay (bar + message) and keeps the
@@ -415,6 +459,11 @@ let detecting = false;
 // Max ratio between the two families' cell pitches before a fit is treated as "not a
 // grid" (one family collapsed → micro one way / macro the other).
 const MAX_CELL_ASPECT = 6;
+// A real tactical grid is at least this many cells per side. A smaller fit (e.g. the
+// 2×2 a strong-perspective floor collapses to when the vanishing point is rejected and
+// no rectification happens) is treated as unreliable → we don't draw a confidently
+// wrong grid; the (i) guidance steers the user to ✎ / ↺ instead.
+const MIN_GRID_CELLS = 5;
 
 async function runDetection() {
   // One detection at a time — the pipeline is heavy and holds OpenCV Mats.
@@ -438,25 +487,9 @@ async function runDetection() {
 
     // Draw whatever grid the detector actually FOUND — or nothing if it didn't. The
     // user decides if it's good (they can edit it or retake); we no longer auto-hide
-    // low-confidence grids behind a panel. "Found a grid" = both families really
-    // detected (≥ 2 lines each) and not a broken fit (degenerate sub-pitch, or one
-    // family collapsed → extreme cell-aspect). Otherwise show the photo alone.
-    gridReliable = false;
-    if (lastResult) {
-      const i = lastResult.info;
-      const aspect =
-        i.spacingA > 0 && i.spacingB > 0
-          ? Math.max(i.spacingA / i.spacingB, i.spacingB / i.spacingA)
-          : Infinity;
-      gridReliable = i.detectedA >= 2 && i.detectedB >= 2 && !i.degenerate && aspect <= MAX_CELL_ASPECT;
-    }
-
-    // Grid↔image mapping for tactical overlays — only for a reliable grid.
-    gridMap = null;
-    if (gridReliable && lastResult) {
-      gridMap = makeGridMap(lastResult.familyA, lastResult.familyB);
-      gridDims = { na: lastResult.familyA.length, nb: lastResult.familyB.length };
-    }
+    // low-confidence grids behind a panel.
+    applyDetectedGrid();
+    debugStepIdx = lastResult?.debugSteps?.length ?? 0; // default to the final overlay
     if (selectedCell) {
       const [i, j] = selectedCell;
       if (!gridMap || i >= gridDims.na - 1 || j >= gridDims.nb - 1) deselectCell();
@@ -464,12 +497,9 @@ async function runDetection() {
     const dt = Math.round(performance.now() - t0);
     draw();
     reportStatus(dt);
+    // No grid found → the photo shows alone; updateResultChrome surfaces the (i)
+    // guidance ("tocca ✎ / ↺") so the user isn't left wondering.
     updateResultChrome();
-    // No grid found → the photo shows alone; nudge the user toward the controls
-    // rather than leaving them wondering.
-    if (!gridReliable) {
-      showToast('Nessuna griglia rilevata — tocca ✎ per crearla a mano o ↺ per riscattare.');
-    }
   } catch (err) {
     console.error(err);
     setStatus('Errore analisi: ' + (err as Error).message);
@@ -493,6 +523,39 @@ function hideProcessing() {
   processing.hidden = true;
 }
 
+// Derive gridReliable + the grid↔image map from the current detector output
+// (lastResult). "Found a grid" = both families really detected (≥ 2 lines each), the
+// drawn grid spans at least MIN_GRID_CELLS per side, and it isn't a broken fit
+// (degenerate sub-pitch, or one family collapsed → extreme cell-aspect). Used after
+// detection AND to RESTORE the auto grid when the user cancels a manual edit (cancel
+// must not lose the detected grid).
+function applyDetectedGrid() {
+  gridReliable = false;
+  if (lastResult) {
+    const i = lastResult.info;
+    const aspect =
+      i.spacingA > 0 && i.spacingB > 0
+        ? Math.max(i.spacingA / i.spacingB, i.spacingB / i.spacingA)
+        : Infinity;
+    // Cells drawn per side (lines − 1) — a strong-perspective collapse yields a tiny
+    // 2×2, which this floors out.
+    const naCells = lastResult.familyA.length - 1;
+    const nbCells = lastResult.familyB.length - 1;
+    gridReliable =
+      i.detectedA >= 2 &&
+      i.detectedB >= 2 &&
+      naCells >= MIN_GRID_CELLS &&
+      nbCells >= MIN_GRID_CELLS &&
+      !i.degenerate &&
+      aspect <= MAX_CELL_ASPECT;
+  }
+  gridMap = null;
+  if (gridReliable && lastResult) {
+    gridMap = makeGridMap(lastResult.familyA, lastResult.familyB);
+    gridDims = { na: lastResult.familyA.length, nb: lastResult.familyB.length };
+  }
+}
+
 // Result-mode chrome: there is NO automatic fallback panel. The FAB (place tokens)
 // only makes sense when a grid was found; the edit button + retake are always
 // available so the user can create/replace the grid or reshoot at will.
@@ -500,9 +563,14 @@ function updateResultChrome() {
   editChooser.hidden = true; // only opened explicitly by the edit button
   if (showingResult && !manualActive) {
     fabWrap.hidden = !gridReliable;
-    if (!gridReliable) hud.hidden = true;
+    if (!gridReliable) {
+      hud.hidden = true;
+      infoOpen = true; // auto-reveal "no grid — use ✎ or ↺"
+    }
   }
   updateEditGridButton();
+  updateInfo();
+  rebuildDebugBar();
 }
 
 // --- Manual grid editor -----------------------------------------------
@@ -732,17 +800,11 @@ function manualDefaultQuad() {
   manualNb = 10;
 }
 
-function setManualHint() {
-  manualHint.textContent = manualDrawPending
-    ? 'Traccia linee lungo le colonne e le righe (almeno 2 per verso): la griglia si genera da sole.'
-    : 'Trascina gli angoli per adattare la griglia · trascina il centro per spostarla.';
-}
-
-// Draw-mode bar variant: hide the cell steppers (the grid comes from the traced
-// lines) and show the "clear lines" button instead.
+// Draw-mode bar variant: the grid comes from the traced lines, so there are no cell
+// steppers and nothing to collapse — the bar is just a slim head (Annulla / Fatto).
 function applyManualBarMode() {
   manualBar.classList.toggle('draw-mode', manualDrawPending);
-  manualReset.hidden = !manualDrawPending;
+  manualCollapse.hidden = manualDrawPending;
 }
 
 function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
@@ -752,7 +814,6 @@ function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
   fabWrap.hidden = true;
   hud.hidden = true;
   btnEditGrid.hidden = true;
-  hideToast();
   manualCollapsed = false;
   manualDrawPending = mode === 'draw';
   manualStrokes = [];
@@ -761,9 +822,10 @@ function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
   drawEndpointDrag = null;
   manualPointerPos.clear();
   pinchState = null;
-  setManualHint();
+  infoOpen = true; // reveal the editing instructions right away
   applyManualBarMode();
   showManualBar(true);
+  rebuildDebugBar(); // hide the debug step bar while editing a manual grid
   if (manualDrawPending) {
     // No grid yet — wait for the user to trace lines. Show the photo alone.
     manualQuad = null;
@@ -778,6 +840,7 @@ function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
     updateManualBar(); // sync the counters AFTER na/nb are set (was showing stale values)
     applyManual();
   }
+  updateInfo();
 }
 
 /** A traced stroke → a RawLine (rho, thetaDeg) in image coords for buildGrid. */
@@ -848,9 +911,10 @@ function exitManualMode(keep: boolean) {
     if (!wasDraw) commitManualGrid(); // adjust mode: extend the drawn quad to frame
     fabWrap.hidden = false;
   } else {
+    // Cancel → restore the auto-detected grid (don't throw it away just because the
+    // user opened the editor and changed their mind).
     manualQuad = null;
-    gridReliable = false;
-    gridMap = null;
+    applyDetectedGrid();
     deselectCell();
   }
   draw();
@@ -1181,10 +1245,76 @@ function reportStatus(dt: number) {
 
 // --- Drawing (photo + overlay on one canvas => perfect alignment) ------
 let edgeCanvas: HTMLCanvasElement | null = null;
+let debugStepCanvas: HTMLCanvasElement | null = null;
+
+/** True when a pipeline-stage preview (not the final overlay) is selected. Never while
+ * editing a manual grid (that view needs the photo + quad). */
+function debugStepActive(): boolean {
+  const steps = lastResult?.debugSteps;
+  return debug && !manualActive && !!steps && debugStepIdx < steps.length;
+}
+
+/** Blit the selected pipeline-stage preview onto the view canvas (scaled up from the
+ * downscaled snapshot), with the stage name labelled top-left. */
+function drawDebugStep() {
+  const r = lastResult!;
+  const step = r.debugSteps![debugStepIdx];
+  view.width = r.width;
+  view.height = r.height;
+  const ctx = view.getContext('2d')!;
+  if (!debugStepCanvas) debugStepCanvas = document.createElement('canvas');
+  debugStepCanvas.width = step.image.width;
+  debugStepCanvas.height = step.image.height;
+  debugStepCanvas.getContext('2d')!.putImageData(step.image, 0, 0);
+  ctx.imageSmoothingEnabled = false; // show the pipeline pixels, not a blurred upscale
+  ctx.drawImage(debugStepCanvas, 0, 0, r.width, r.height);
+  ctx.imageSmoothingEnabled = true;
+  const fs = Math.max(16, Math.round(r.width / 40));
+  ctx.font = `700 ${fs}px system-ui, sans-serif`;
+  const label = `${debugStepIdx + 1}. ${step.label}`;
+  const pad = fs * 0.5;
+  ctx.fillStyle = 'rgba(10,14,19,0.72)';
+  ctx.fillRect(pad, pad, ctx.measureText(label).width + pad * 2, fs + pad);
+  ctx.fillStyle = '#eaf1fb';
+  ctx.textBaseline = 'top';
+  ctx.fillText(label, pad * 2, pad * 1.5);
+}
+
+/** Build the debug step chips from lastResult.debugSteps (+ a final "Overlay" chip).
+ * Hidden unless debug is on, a result is shown, and we're not editing a manual grid. */
+function rebuildDebugBar() {
+  const steps = lastResult?.debugSteps ?? [];
+  const show = debug && showingResult && !manualActive && steps.length > 0;
+  debugBar.hidden = !show;
+  if (!show) return;
+  const overlayIdx = steps.length; // the final live line overlay
+  if (debugStepIdx > overlayIdx) debugStepIdx = overlayIdx;
+  debugBar.textContent = '';
+  const mk = (idx: number, name: string) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'debug-chip' + (idx === debugStepIdx ? ' on' : '');
+    b.innerHTML = `<span class="n">${String(idx + 1).padStart(2, '0')}</span>${name}`;
+    b.addEventListener('click', () => {
+      debugStepIdx = idx;
+      for (const c of Array.from(debugBar.children)) c.classList.remove('on');
+      b.classList.add('on');
+      draw();
+    });
+    return b;
+  };
+  steps.forEach((s, i) => debugBar.appendChild(mk(i, s.label)));
+  debugBar.appendChild(mk(overlayIdx, 'Overlay')); // the live line overlay (default)
+}
 
 function draw() {
   if (!lastResult || !lastCapture) return;
   const r = lastResult;
+  // Debug: a pipeline-stage preview replaces the photo+overlay entirely.
+  if (debugStepActive()) {
+    drawDebugStep();
+    return;
+  }
   view.width = r.width;
   view.height = r.height;
   const ctx = view.getContext('2d')!;
@@ -2056,16 +2186,12 @@ function setPlaceMode(m: 'ally' | 'enemy' | 'area' | 'none') {
   fabWrap.classList.remove('open'); // a choice closes the speed-dial
   if (placeMode !== 'none') {
     deselectCell();
-    const msg =
-      placeMode === 'area'
-        ? 'Tocca una cella per posizionare l’area'
-        : `Tocca le celle per aggiungere o togliere ${placeMode === 'ally' ? 'alleati' : 'nemici'}`;
-    showToast(msg); // transient bottom popup, not the header status
+    infoOpen = true; // auto-reveal what to tap for this placement mode
   } else {
-    hideToast();
     setStatus('');
   }
   updateFabIcon();
+  updateInfo();
 }
 /** The FAB shows ✕ (and its type colour) while a placement mode is active OR while
  * an area is on the map — so the same ✕ that adds an area also REMOVES it — and a
@@ -2184,10 +2310,11 @@ function highlightAreaType() {
   for (const el of areaTypeBox.querySelectorAll('.chip')) {
     el.classList.toggle('on', (el as HTMLElement).dataset.t === currentAreaType);
   }
-  // Line/cone rotate via the on-map ring (tip handle) — no angle readout; just a hint.
-  areaRotHint.hidden = !(currentAreaType === 'linea' || currentAreaType === 'cono');
+  // Line/cone rotate via the on-map ring (tip handle) — the rotation hint lives
+  // behind the (i) button and depends on the type, so refresh it.
   areaCreature.hidden = currentAreaType !== 'emanazione'; // creature size only for emanations
   refreshSizeUI();
+  updateInfo();
 }
 
 // Rebuild the active overlay from the current form values and redraw.
@@ -2461,8 +2588,11 @@ hudCollapse.addEventListener('click', () => {
   hudCollapsed = !hudCollapsed;
   refreshHud();
 });
-// (i) toggles the contextual hints (hidden by default to save space).
-hudInfo.addEventListener('click', () => hud.classList.toggle('hints-off'));
+// The single (i) button toggles the contextual-help popover.
+infoBtn.addEventListener('click', () => {
+  infoOpen = !infoOpen;
+  updateInfo();
+});
 hudClose.addEventListener('click', () => {
   if (activeOverlay?.kind === 'area') removeActiveArea();
   else {
@@ -2533,6 +2663,7 @@ function retake() {
   fabWrap.hidden = true;
   btnEditGrid.hidden = true;
   topActions.hidden = true; // leaving result mode → hide Pulisci / Rifai
+  debugBar.hidden = true; // no pipeline to inspect on the live camera
   startCamera().catch(() => {
     setStatus('Fotocamera non disponibile — tocca lo schermo per riprovare');
     hint.hidden = false;
@@ -2602,22 +2733,8 @@ manualCollapse.addEventListener('click', () => {
   manualCollapsed = !manualCollapsed;
   manualBar.classList.toggle('collapsed', manualCollapsed);
 });
-// (i) toggles the instructions (hidden by default to save space).
-manualInfo.addEventListener('click', () => {
-  manualHint.hidden = !manualHint.hidden;
-  if (manualCollapsed && !manualHint.hidden) {
-    manualCollapsed = false;
-    manualBar.classList.remove('collapsed');
-  }
-});
 manualDone.addEventListener('click', () => exitManualMode(true));
 manualCancel.addEventListener('click', () => exitManualMode(false));
-manualReset.addEventListener('click', () => {
-  manualStrokes = [];
-  strokeStart = null;
-  strokeEnd = null;
-  regenerateFromStrokes();
-});
 // Top-bar "edit grid" — open the chooser (adapt a grid / draw one by hand).
 btnEditGrid.addEventListener('click', () => {
   if (!showingResult) return;

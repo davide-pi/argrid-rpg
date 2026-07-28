@@ -566,6 +566,84 @@ function applyManual() {
   draw();
 }
 
+/**
+ * Commit the manual grid, EXTENDING the lattice past the drawn quad to fill the
+ * whole frame (like the detector's extend:'frame'): continue the same projective
+ * lattice outward from each edge while the line still crosses the image, capped and
+ * with a crowding guard. Cells beyond the drawn quad are flagged extended (drawn
+ * faint). Returns false if there's no valid quad to commit.
+ */
+function commitManualGrid(): boolean {
+  if (!manualQuad || !lastResult) return false;
+  const [TL, TR, BR, BL] = manualQuad;
+  const H = solveHomography(
+    [[0, 0], [1, 0], [1, 1], [0, 1]],
+    [[TL.x, TL.y], [TR.x, TR.y], [BR.x, BR.y], [BL.x, BL.y]],
+  );
+  if (!H) return false;
+  const W = lastResult.width;
+  const Ht = lastResult.height;
+  const node = (i: number, j: number): ImgPt => {
+    const [x, y] = applyH(H, i / manualNa, j / manualNb);
+    return { x, y };
+  };
+  const CAP = 200; // hard cap on extended lines per side
+  const MIN_GAP = 2; // stop once adjacent lines crowd below this (px) — near a VP
+  const colLine = (i: number) => lineThrough(node(i, 0), node(i, manualNb));
+  const rowLine = (j: number) => lineThrough(node(0, j), node(manualNa, j));
+  const midJ = manualNb / 2;
+  const midI = manualNa / 2;
+  const colGap = (i: number) => Math.hypot(node(i, midJ).x - node(i - 1, midJ).x, node(i, midJ).y - node(i - 1, midJ).y);
+  const rowGap = (j: number) => Math.hypot(node(midI, j).x - node(midI, j - 1).x, node(midI, j).y - node(midI, j - 1).y);
+  const crosses = (l: Line2) => !!clipLineToRect(l, W, Ht);
+
+  let iMin = 0;
+  let iMax = manualNa;
+  let jMin = 0;
+  let jMax = manualNb;
+  for (let i = -1; i > -CAP; i--) {
+    if (!crosses(colLine(i)) || colGap(i + 1) < MIN_GAP) break;
+    iMin = i;
+  }
+  for (let i = manualNa + 1; i < manualNa + CAP; i++) {
+    if (!crosses(colLine(i)) || colGap(i) < MIN_GAP) break;
+    iMax = i;
+  }
+  for (let j = -1; j > -CAP; j--) {
+    if (!crosses(rowLine(j)) || rowGap(j + 1) < MIN_GAP) break;
+    jMin = j;
+  }
+  for (let j = manualNb + 1; j < manualNb + CAP; j++) {
+    if (!crosses(rowLine(j)) || rowGap(j) < MIN_GAP) break;
+    jMax = j;
+  }
+
+  const A: Line2[] = [];
+  for (let i = iMin; i <= iMax; i++) {
+    const l = colLine(i);
+    if (i < 0 || i > manualNa) {
+      l.extended = true;
+      l.filled = true;
+    }
+    A.push(l);
+  }
+  const B: Line2[] = [];
+  for (let j = jMin; j <= jMax; j++) {
+    const l = rowLine(j);
+    if (j < 0 || j > manualNb) {
+      l.extended = true;
+      l.filled = true;
+    }
+    B.push(l);
+  }
+  lastResult.familyA = A;
+  lastResult.familyB = B;
+  gridMap = makeGridMap(A, B);
+  gridDims = { na: A.length, nb: B.length };
+  gridReliable = true;
+  return true;
+}
+
 /** Radius (image px) within which a tap grabs a corner handle. */
 function manualHandleRadius(): number {
   const W = lastResult?.width ?? view.width;
@@ -719,7 +797,7 @@ function exitManualMode(keep: boolean) {
   drawCellEnd = null;
   showManualBar(false);
   if (keep) {
-    // gridReliable / gridMap already set by applyManual — just show the tools.
+    commitManualGrid(); // extend the drawn quad to fill the whole frame
     fabWrap.hidden = false;
   } else {
     manualQuad = null;

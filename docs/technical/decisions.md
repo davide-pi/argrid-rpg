@@ -49,19 +49,34 @@ live: an **iso-luminance** grid (magenta lines on a gray of identical Y) is `0×
 `colorEdges:false` and the full grid with it on; clean gray grids and the dirt photo are
 unchanged (near-neutral chroma adds nothing).
 
-### Degenerate sub-pitch lattices are rejected (no fill/extend)
-**Decision:** in `fitFamilyGrid`, map the fitted pitch back to the image; if a cell is
-smaller than `image / MAX_CELLS_ACROSS` (50), the fit is degenerate — skip fill and
-extension for that family and keep only the detected lines. A family whose final spacing
-is below that floor also drops `confidence` to 0 (`src/grid-detector.ts`).
-**Why:** on real photos under **strong perspective** the vanishing-point / rectification
-fit can lock onto a spurious sub-pitch (e.g. 7–8 px on a 720 px frame). The regular-lattice
-reconstruction then fills/extends it into **hundreds** of bogus lines (measured 113×65 and
-202×73 on two perspective test photos), which floods the tactical homography and the draw.
-The guard caps that (→ 6× and 12× for the sub-pitch family) and the low confidence warns
-the user. **Accepted limitation:** it does not *fix* the perspective mis-fit (the other
-family can still be over-dense); a proper fix (better family split / VP under perspective)
-is a larger, separate task.
+### Perspective robustness: stable VP, independent split, sub-multiple rejection
+**Decision:** three cheap, pure-geometry fixes make the lattice fit survive strong
+perspective (`buildGrid` / `ransacVP` / `fitFamilyGrid`, `src/grid-detector.ts`):
+- **Independent second axis** — `axisB` is a separate histogram mode ≥30° from `axisA`
+  (not a forced `axisA+90`); the two grid families are not orthogonal in the image under
+  perspective. Falls back to orthogonal when there is no distinct second peak.
+- **Guarded vanishing point** — `ransacVP` trusts a *finite* VP only when the inliers
+  actually fan (`VP_MIN_FAN_DEG`) **and** the VP lands outside the frame (`VP_FRAME_MARGIN`);
+  otherwise it uses the stable at-infinity VP. A near-parallel family's noisy far
+  intersection used to corrupt the rectifying horizon and compress the lattice to a sub-pitch.
+- **Sub-multiple rejection** — `coarsenPitch` prefers the coarsest integer multiple of the
+  base cell that still holds (almost) all offsets, so the fit can't lock onto a 1/m harmonic
+  (tolerance is absolute, tied to the base cell, so occluded/dropped lines don't over-coarsen).
+**Why:** on real angled photos these compounded into a spurious ~7–8 px pitch → **hundreds**
+of bogus lines (measured 113×65, 202×73). Combined effect on the test corpus: a tiles-in-
+perspective shot went from a 202-line explosion (spacing 7/19) to a sane 12×19 (spacing 117/76);
+no photo explodes any more.
+
+### Degenerate lattices are still guarded (no fill/extend) as a backstop
+**Decision:** after the perspective fixes, `fitFamilyGrid` still rejects a residual degenerate
+fit: the **median** image-space cell across the detected extent (sampled, robust to genuine
+far-cell foreshortening) must be ≥ `image / MAX_CELLS_ACROSS` (50), else fill/extension are
+skipped for that family; extension also stops once cells crowd below `0.5·minCell`. A family
+whose spacing is below the floor drops `confidence` to 0 so the UI warns.
+**Accepted limitation:** extreme perspective on a *fine* grid (the far edge genuinely
+compresses toward invisibility) is still only partially recovered — such cases come back with
+low confidence (warned) rather than a clean grid; a full fix (per-row TLS / node-based fit) is
+a larger task tracked for the corner-node fallback.
 
 ### Grid extrapolated to the whole frame by default (`extend: 'frame'`)
 **Decision:** after fitting the regular lattice, continue it `a + b·k` outward past the

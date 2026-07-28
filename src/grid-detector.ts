@@ -763,7 +763,15 @@ export function buildGrid(
   let peak = 0;
   for (let i = 1; i < bins.length; i++) if (bins[i] > bins[peak]) peak = i;
   const axisA = peak * 2 + 1;
-  const axisB = (axisA + 90) % 180;
+  // Under perspective the two grid families are NOT orthogonal in the image, so
+  // axisB is an INDEPENDENT second histogram mode at least 30° from axisA rather
+  // than a forced axisA+90. Fall back to orthogonal when there is no distinct
+  // second peak (a clean fronto-parallel grid).
+  let peakB = -1;
+  for (let i = 0; i < bins.length; i++) {
+    if (angDist180(i * 2 + 1, axisA) >= 30 && (peakB < 0 || bins[i] > bins[peakB])) peakB = i;
+  }
+  const axisB = peakB >= 0 && bins[peakB] > 0 ? peakB * 2 + 1 : (axisA + 90) % 180;
 
   const famA: Line2[] = [];
   const famB: Line2[] = [];
@@ -781,8 +789,9 @@ export function buildGrid(
   const mB = mergeDuplicateLines(famB, mergeDist);
 
   // --- Vanishing point per family (RANSAC) — keeps only concurrent lines --
-  const vA = ransacVP(mA.map((m) => m.line));
-  const vB = ransacVP(mB.map((m) => m.line));
+  // Lines are in centred coords, so the frame half-extents are W0/2, H0/2.
+  const vA = ransacVP(mA.map((m) => m.line), W0 / 2, H0 / 2);
+  const vB = ransacVP(mB.map((m) => m.line), W0 / 2, H0 / 2);
   const inA = vA.inliers.map((k) => mA[k]);
   const inB = vB.inliers.map((k) => mB[k]);
 
@@ -853,7 +862,18 @@ function vpResidualDeg(l: Line2, vp: V3): number {
  * Grid lines converge to a common point (finite under perspective, at infinity
  * when parallel); noise lines don't, so this rejects them.
  */
-function ransacVP(lines: Line2[]): { vp: V3; inliers: number[] } {
+/** Min angular fan (deg) among inliers before a FINITE vanishing point is trusted
+ * — near-parallel lines intersect at a wildly unstable far point. */
+const VP_MIN_FAN_DEG = 4;
+/** A real grid family's vanishing point lies OUTSIDE the frame; a finite VP within
+ * this multiple of the half-frame is spurious (Hough-noise intersection). */
+const VP_FRAME_MARGIN = 1.3;
+
+function ransacVP(
+  lines: Line2[],
+  halfW = Infinity,
+  halfH = Infinity,
+): { vp: V3; inliers: number[] } {
   const N = lines.length;
   if (N < 3) return { vp: [0, 0, 1], inliers: lines.map((_, i) => i) };
 
@@ -873,14 +893,26 @@ function ransacVP(lines: Line2[]): { vp: V3; inliers: number[] } {
   }
   if (best.length < 3) return { vp: [0, 0, 1], inliers: lines.map((_, i) => i) };
 
-  // Refine the VP from all inliers (least squares); parallel -> VP at infinity.
-  const refined = vanishingPoint(best.map((k) => lines[k]));
+  // Refine the VP, but only TRUST a finite VP when the inliers actually fan (else
+  // the far intersection is noise) AND it lands outside the image frame (a real
+  // family's VP must be off-frame). Otherwise treat the family as parallel — the
+  // stable "VP at infinity from the mean direction", which avoids feeding a
+  // garbage horizon into buildRectify and compressing the lattice to a sub-pitch.
+  const meanA = meanAngle180(best.map((k) => angleOfDeg(lines[k].nx, lines[k].ny)));
+  const fan = Math.max(...best.map((k) => angDist180(angleOfDeg(lines[k].nx, lines[k].ny), meanA)));
+  let refined = fan >= VP_MIN_FAN_DEG ? vanishingPoint(best.map((k) => lines[k])) : null;
+  if (
+    refined &&
+    Math.abs(refined.x) < halfW * VP_FRAME_MARGIN &&
+    Math.abs(refined.y) < halfH * VP_FRAME_MARGIN
+  ) {
+    refined = null; // finite VP inside the frame → spurious
+  }
   let vp: V3;
   if (refined) {
     vp = [refined.x, refined.y, 1];
   } else {
-    const ang = meanAngle180(best.map((k) => angleOfDeg(lines[k].nx, lines[k].ny)));
-    const dir = (ang + 90) / DEG; // line direction
+    const dir = (meanA + 90) / DEG; // line direction
     vp = [Math.cos(dir), Math.sin(dir), 0];
   }
   return { vp, inliers: best };
@@ -975,6 +1007,35 @@ const robustCell = (xs: number[]): number => {
   return single.length ? median(single) : gm;
 };
 
+/**
+ * Reject a sub-multiple (harmonic) pitch: prefer the COARSEST integer multiple of
+ * the base cell that still lands (almost) every offset on the lattice. A true 1/m
+ * harmonic keeps all inliers when coarsened by m (only phantom empty slots vanish);
+ * a genuine fundamental loses its real intermediate lines off the coarse lattice, so
+ * the fine pitch is kept. Backstops the perspective sub-pitch collapse. `offs` sorted.
+ */
+function coarsenPitch(offs: number[], cell: number): number {
+  if (offs.length < 3 || cell <= 0) return cell;
+  const span = offs[offs.length - 1] - offs[0];
+  const tol = 0.2 * cell; // ABSOLUTE (base-cell) tolerance — must NOT grow with the
+  // coarse pitch, or a large multiple's wide tolerance falsely "captures" off-lattice
+  // offsets (e.g. occluded/dropped lines) and over-coarsens.
+  const onLattice = (pitch: number): number => {
+    let n = 0;
+    for (const o of offs) {
+      const k = Math.round((o - offs[0]) / pitch);
+      if (Math.abs(o - offs[0] - k * pitch) <= tol) n++;
+    }
+    return n;
+  };
+  const base = onLattice(cell);
+  let best = cell;
+  for (let m = 2; m <= 8 && cell * m <= span; m++) {
+    if (onLattice(cell * m) >= base - 1) best = cell * m;
+  }
+  return best;
+}
+
 /** Conservative extension: how many cells past the detected extent 'border' may
  * add (recovers an undetected outer border; bounded by the image frame). */
 const EXTEND_BORDER_CELLS = 2;
@@ -1040,6 +1101,7 @@ function fitFamilyGrid(
   if (cell <= 0) {
     return finalize(pts.map((p) => backToImage(p.off, meanNx, meanNy, false)));
   }
+  cell = coarsenPitch(pts.map((p) => p.off), cell);
 
   // Drop cell-splitting duplicates: a line within half a cell of a neighbour —
   // keep the better-supported one (these are never distinct grid lines).
@@ -1054,6 +1116,7 @@ function fitFamilyGrid(
   }
   pts = dedup;
   cell = robustCell(pts.map((p) => p.off)) || cell;
+  cell = coarsenPitch(pts.map((p) => p.off), cell);
 
   const offs = pts.map((p) => p.off);
   if (offs.length < 2 || !params.reconstruct) {
@@ -1117,18 +1180,23 @@ function fitFamilyGrid(
     return finalize(offs.map((o) => backToImage(o, meanNx, meanNy, false)));
   }
 
-  // Degeneracy guard: map the fitted pitch back to the image. If a cell is
-  // implausibly small (< image/MAX_CELLS_ACROSS) the fit is spurious — usually the
-  // VP/rectify locking onto a sub-pitch under strong perspective — so DON'T fill or
-  // extend it (that is what balloons into hundreds of bogus lines); keep only the
-  // detected lines. The low resulting spacing also drives confidence to ~0.
-  const imgCell = Math.abs(
-    backToImage(a + b, meanNx, meanNy, false).d - backToImage(a, meanNx, meanNy, false).d,
-  );
-  const degenerate = imgCell > 0 && imgCell < minCell;
-
   const kmin = Math.min(...detectedIdx);
   const kmax = Math.max(...detectedIdx);
+
+  // Degeneracy guard: the MEDIAN image-space cell across the detected extent (not
+  // just at the anchor — under perspective the far cells legitimately compress, so
+  // sample across the range and take the median). If it is implausibly small
+  // (< image/MAX_CELLS_ACROSS) the fit is a spurious sub-pitch — DON'T fill or
+  // extend it (that is what balloons into hundreds of bogus lines); keep only the
+  // detected lines. The low resulting spacing also drives confidence to ~0.
+  const imgCellAt = (k: number): number =>
+    Math.abs(backToImage(a + b * (k + 1), meanNx, meanNy, false).d - backToImage(a + b * k, meanNx, meanNy, false).d);
+  const step = Math.max(1, Math.floor((kmax - kmin) / 12));
+  const cellSamples: number[] = [];
+  for (let k = kmin; k < kmax; k += step) cellSamples.push(imgCellAt(k));
+  const imgCell = cellSamples.length ? median(cellSamples) : imgCellAt(kmin);
+  const degenerate = imgCell > 0 && imgCell < minCell;
+
   const canFill = !degenerate && params.fillGrid && kmax - kmin <= 200;
   const core: Line2[] = [];
   for (let k = kmin; k <= kmax; k++) {
@@ -1151,6 +1219,10 @@ function fitFamilyGrid(
         : 0;
   const lo: Line2[] = [];
   const hi: Line2[] = [];
+  // Stop extending once cells compress below a plausible size: raw crowding guard,
+  // but also don't tile a heavily foreshortened region near a vanishing point with
+  // dozens of sub-`minCell` lines (that is what over-densified perspective grids).
+  const minExtendGap = Math.max(EXTEND_MIN_GAP_PX, 0.5 * minCell);
   if (!degenerate && cap > 0 && core.length >= 2) {
     const extendFrom = (startK: number, step: number, out: Line2[]): void => {
       // (nx,ny) is constant across offsets for this family, so |Δd| at the image
@@ -1160,7 +1232,7 @@ function fitFamilyGrid(
         const line = backToImage(a + b * (startK + step * n), meanNx, meanNy, true);
         line.extended = true;
         if (!crossesImage(line)) break;
-        if (Math.abs(line.d - prev.d) < EXTEND_MIN_GAP_PX) break;
+        if (Math.abs(line.d - prev.d) < minExtendGap) break;
         out.push(line);
         prev = line;
       }

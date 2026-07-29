@@ -2808,8 +2808,11 @@ hudClose.addEventListener('click', () => {
   }
 });
 
-// Debug has no on-screen switch: triple-tap the logo (within 600ms) toggles it on/off
-// and re-runs detection on the current capture so the diagnostics appear/disappear.
+// Debug has no on-screen switch: triple-tap the logo (within 600ms) toggles it on/off.
+// The debug diagnostics (stage previews) are only produced when detection runs with them
+// on, so we recompute ONLY the first time debug is enabled on a photo analysed without
+// them — otherwise (turning off, or re-enabling) the cached result already has everything,
+// so we just redraw. That keeps toggling instant instead of re-running the pipeline.
 let brandTaps: number[] = [];
 brand.addEventListener('click', () => {
   const now = Date.now();
@@ -2820,7 +2823,12 @@ brand.addEventListener('click', () => {
     debug = !debug;
     btnLoadImage.hidden = !debug; // the gallery-load button is a debug affordance
     setStatus(debug ? 'Debug attivo' : 'Debug disattivato');
-    if (lastCapture) runDetection();
+    if (debug && lastCapture && !lastResult?.debugSteps) {
+      runDetection(); // first enable on a result computed without diagnostics — build them
+    } else {
+      draw(); // cached (or turning off) — just repaint and show/hide the debug bar
+      rebuildDebugBar();
+    }
   }
 });
 

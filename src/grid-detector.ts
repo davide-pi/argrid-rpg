@@ -449,9 +449,17 @@ export function* detectGridFromMatSteps(
     if (params.focusGating) gateEdgesByFocus(cv, gray, cannyEdges);
     snap('edges', cannyEdges); // merged edge map (Canny [+ chroma]) before cleaning
 
+    // How texture-saturated is the edge map? A clean grid leaves thin, sparse edges; a
+    // dirt/cork/fabric texture floods it. This gates BOTH the cleanup below and (later)
+    // whether we distrust a disagreeing luminance fit in favour of the morphology.
+    const edgeDensity = cv.countNonZero(cannyEdges) / (cannyEdges.rows * cannyEdges.cols);
+    const noisy = edgeDensity > NOISE_EDGE_FRAC;
+
     // Texture cleaning: drop the short components (sand/dirt speckle) so Hough sees the
-    // long grid lines instead of a web of tiny fragments.
-    if (params.edgeClean) {
+    // long grid lines instead of a web of tiny fragments. ONLY on a noisy frame — on a
+    // clean/faint grid the "short components" are the grid's own broken lines, so cleaning
+    // there would erase them (that regressed recall when it ran unconditionally).
+    if (params.edgeClean && noisy) {
       dropShortComponents(cv, cannyEdges, shortLen(cannyEdges));
       snap('clean', cannyEdges);
       cleanApplied = true;
@@ -508,25 +516,22 @@ export function* detectGridFromMatSteps(
 
     const mainFit = result; // luminance path result (incl. oriented recovery), for the panel
     let morphFit: GridResult | null = null;
+    let agreement: number | null = null; // main↔morph agreement, computed once below
 
     // --- Morphological pass -------------------------------------------------
     // A second, INDEPENDENT line extractor (morphology instead of Canny) — strong where
     // Canny drowns in background texture (a grid on dirt/cork). Runs ALWAYS (not only on
-    // failure) so it's a genuine second opinion: its own fit shows in the confidence
-    // panel, and it's adopted as the final grid only if strictly stronger than the
-    // luminance fit (containment — it can't make things worse).
+    // failure) so it's a genuine second opinion.
     if (params.lineMorph) {
       yield { frac: 0.75, label: 'Analisi morfologica…' };
       // The morphology is AXIS-ALIGNED, so a tilted grid must be straightened first. We
       // don't trust a single prior angle (a wrong one leaves the lines crooked): instead
       // we SWEEP deskew angles, and for each one rotate → morphology → fit, keeping the
-      // angle whose fit has the most "virtual" lattice lines (gridStrength — the grid
-      // lines the fit hypothesises from the segments, not the raw segments). The winning
-      // mask is already rotated back to the original frame inside enhanceGridLines.
-      //
-      // Start from a best guess (0 if the prior says near-axis, else the prior's tilt),
-      // and only pay for the full sweep when that first guess is weak — a square grid's
-      // 90° symmetry means every tilt lives in [-45,45].
+      // angle whose fit has the most "virtual" lattice lines (gridStrength — grid lines
+      // hypothesised from the segments, not raw segments). The winning mask is already
+      // rotated back to the original frame inside enhanceGridLines. A square grid's 90°
+      // symmetry means every tilt lives in [-45,45]. Start from a best guess (0 if the
+      // prior says near-axis, else the prior's tilt) and only sweep when it's weak.
       const off = residualTilt(orient ? orient.a : result.info.angleADeg); // [-45,45]
       const primary = Math.abs(off) > 12 ? -off : 0;
       let bestDeskew = primary;
@@ -556,7 +561,17 @@ export function* detectGridFromMatSteps(
       }
       snap('morph', morphEdges);
       morphFit = alt;
-      if (gridStrength(alt) > gridStrength(result)) {
+      agreement = fitsAgree(mainFit, morphFit);
+      // Adopt the morphology when it's strictly stronger — OR, on a NOISY frame, when the
+      // luminance fit DISAGREES with a solid morph fit: the luminance lines are then likely
+      // texture, and the morphology suppresses isotropic texture, so trust it instead.
+      const distrustMain =
+        noisy &&
+        agreement != null &&
+        agreement < NOISE_AGREE_MAX &&
+        gridStrength(alt) >= NOISE_MORPH_MIN &&
+        !alt.info.degenerate;
+      if (gridStrength(alt) > gridStrength(result) || distrustMain) {
         result = alt;
         morphChosen = true;
         cannyEdges.delete();
@@ -569,10 +584,8 @@ export function* detectGridFromMatSteps(
 
     const edges = morphEdges ?? cannyEdges; // whichever mask survived
 
-    // Option B: how much do the two independent fits agree? (null when not comparable.)
-    // Computed here while both fit objects still hold their RAW per-fit confidence — it's
-    // folded into the FINAL confidence below, AFTER the panel captured the raw values.
-    const agreement = fitsAgree(mainFit, morphFit);
+    // `agreement` (main↔morph, option B) was computed in the morph pass above and is folded
+    // into the FINAL confidence below, AFTER the panel captures each fit's RAW value.
 
     yield { frac: 0.9, label: 'Ricostruzione della griglia…' };
     result.info.cannyHigh = cannyHigh;
@@ -676,7 +689,7 @@ export function* detectGridFromMatSteps(
         degenerate: r.info.degenerate,
         chosen,
       });
-      result.debugPipelines = [statOf('main', 'Principale', mainFit, !morphChosen)];
+      result.debugPipelines = [statOf('main', 'Luminanza', mainFit, !morphChosen)];
       if (morphFit) result.debugPipelines.push(statOf('morph', 'Morfologica', morphFit, morphChosen));
       result.debugAgreement = agreement;
     }
@@ -850,6 +863,14 @@ const MORPH_STRONG = 6;
  * some candidate lands within the axis-aligned openings' few-degrees tolerance; larger
  * = fewer (but coarser) morphology passes. */
 const MORPH_SWEEP_STEP = 7.5;
+/** Fraction of edge pixels above which the frame is treated as texture-DOMINATED (noise):
+ * the short-component cleanup is applied, and a disagreeing main fit is distrusted. Kept
+ * high enough that a clean grid (thin, sparse edges) stays below it. */
+const NOISE_EDGE_FRAC = 0.08;
+/** On a noisy frame, distrust the luminance fit and prefer the (noise-robust) morphology
+ * when the two DISAGREE below this and the morph fit is at least this solid. */
+const NOISE_AGREE_MAX = 0.4;
+const NOISE_MORPH_MIN = 4;
 /** Signed tilt (deg, [-45,45]) of an angle from the nearest image axis. Normal vs line
  * angle folds away (they differ by 90°), so the caller's convention doesn't matter. */
 const residualTilt = (deg: number): number => {
@@ -892,8 +913,8 @@ function enhanceGridLines(cv: any, gray: any, snap?: (id: string, mat: any) => v
   // become a hard frame edge that looks like a grid line). `src` is the caller's gray
   // when there's no deskew, or a NEW rotated Mat we own and free at the end.
   const src = deskewDeg ? rotateMat(cv, gray, deskewDeg, cv.INTER_LINEAR, cv.BORDER_REPLICATE) : gray;
-  const MW = 1000; // work around ~1000px on the longer side (the SE sizes and the
-  // mean+K·σ threshold below are tuned for this scale — changing it needs retuning)
+  const MW = 1000; // work around ~1000px on the longer side (the SE sizes / threshold are
+  // tuned for this scale — changing it needs retuning)
   const down = Math.min(1, MW / Math.max(src.cols, src.rows));
   let g = src;
   let tempG: any = null;
@@ -904,9 +925,12 @@ function enhanceGridLines(cv: any, gray: any, snap?: (id: string, mat: any) => v
   }
   const minDim = Math.min(g.cols, g.rows);
   const L = Math.max(9, Math.round(minDim / 23)); // line-probe length
-  const L2 = Math.max(12, Math.round(minDim / 14)); // min line run to keep
+  // min line run to keep: a bit shorter than a full grid line so a perspective-broken
+  // line survives as pieces (Hough re-aggregates the collinear ones), but not SO short
+  // that isolated texture blobs pass — that flooded the ridge with noise.
+  const L2 = Math.max(10, Math.round(minDim / 20));
   const LC = Math.max(24, Math.round(minDim / 7)); // bridge collinear fragments
-  const K = 2.0; // threshold = mean + K·σ of the line response
+  const K = 2.0; // threshold = mean + K·σ of the line response (higher → less noise)
 
   const blur = new cv.Mat();
   cv.GaussianBlur(g, blur, new cv.Size(3, 3), 0);

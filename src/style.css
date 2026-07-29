@@ -565,6 +565,11 @@ body {
   text-transform: uppercase;
   color: var(--muted);
 }
+.debug-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
 .debug-collapse {
   appearance: none;
   display: inline-flex;
@@ -579,11 +584,49 @@ body {
   border-radius: 7px;
   cursor: pointer;
 }
+.debug-collapse.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
 .debug-collapse .chev {
   transition: transform 0.2s ease;
 }
 .debug-bar.collapsed .debug-collapse .chev {
   transform: rotate(-90deg);
+}
+/* Timing log (scroll-text button) — where the pipeline spent its time. */
+.debug-log {
+  margin-top: 7px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  font-variant-numeric: tabular-nums;
+}
+.debug-log-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 11px;
+  line-height: 1.7;
+  white-space: pre;
+}
+.debug-log-k {
+  color: var(--muted);
+}
+.debug-log-v {
+  color: var(--fg);
+  font-weight: 700;
+}
+.debug-log-row:last-child {
+  margin-top: 3px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+.debug-log-row:last-child .debug-log-k,
+.debug-log-row:last-child .debug-log-v {
+  color: var(--accent);
 }
 .debug-scroll {
   margin-top: 6px;

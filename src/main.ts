@@ -106,6 +106,7 @@ const debugBar = $<HTMLDivElement>('debugBar');
 // Selected debug pipeline node id ('overlay' = the live line overlay, the default).
 let debugStepId = 'overlay';
 let debugCollapsed = false;
+let debugLogOpen = false; // the timing log panel (scroll-text button) is showing
 // Floating "add" speed-dial.
 const fabWrap = $<HTMLDivElement>('fabWrap');
 const fab = $<HTMLButtonElement>('fab');
@@ -1391,10 +1392,26 @@ function rebuildDebugBar() {
   debugBar.classList.toggle('collapsed', debugCollapsed);
   debugBar.textContent = '';
 
-  // Header: title + collapse toggle.
+  // Header: title + (timing-log toggle) + collapse toggle.
   const head = document.createElement('div');
   head.className = 'debug-head';
   head.innerHTML = '<span class="debug-title">Pipeline</span>';
+  const actions = document.createElement('div');
+  actions.className = 'debug-head-actions';
+  // Timing log (scroll-text): shown only when the result carries timings.
+  if (lastResult?.debugTimings) {
+    const logBtn = document.createElement('button');
+    logBtn.type = 'button';
+    logBtn.className = 'debug-collapse' + (debugLogOpen ? ' on' : '');
+    logBtn.setAttribute('aria-label', 'Mostra i tempi di elaborazione');
+    logBtn.innerHTML =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 12h-5"/><path d="M15 8h-5"/><path d="M19 17V5a2 2 0 0 0-2-2H4"/><path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3"/></svg>';
+    logBtn.addEventListener('click', () => {
+      debugLogOpen = !debugLogOpen;
+      rebuildDebugBar();
+    });
+    actions.appendChild(logBtn);
+  }
   const collapse = document.createElement('button');
   collapse.type = 'button';
   collapse.className = 'debug-collapse';
@@ -1405,7 +1422,8 @@ function rebuildDebugBar() {
     debugCollapsed = !debugCollapsed;
     debugBar.classList.toggle('collapsed', debugCollapsed);
   });
-  head.appendChild(collapse);
+  actions.appendChild(collapse);
+  head.appendChild(actions);
   debugBar.appendChild(head);
 
   // Confidence strip: each independent fit's quality + the final decision. Sits under
@@ -1512,6 +1530,48 @@ function rebuildDebugBar() {
 
   scroll.appendChild(graph);
   debugBar.appendChild(scroll);
+
+  // Timing log (toggled by the scroll-text button): every stage's compute time + total.
+  const timings = lastResult?.debugTimings;
+  if (debugLogOpen && timings && !debugCollapsed) {
+    const ms = (v: number) => `${Math.round(v)} ms`;
+    // Ordered so it reads top-to-bottom like the pipeline.
+    const order: [string, string][] = [
+      ['gray', 'Grigio'],
+      ['clahe', 'Contrasto'],
+      ['blur', 'Sfocatura'],
+      ['canny', 'Canny'],
+      ['chroma', 'Cromatica'],
+      ['clean', 'Pulizia texture'],
+      ['fft', 'Prior FFT'],
+      ['houghMain', 'Hough luminanza'],
+      ['oriented', 'Orientati'],
+      ['morphEnhance', 'Morfologia · estrazione'],
+      ['morphHough', 'Morfologia · Hough'],
+    ];
+    const rows: [string, string][] = [];
+    let total = 0;
+    for (const [key, label] of order) {
+      const v = timings[key];
+      if (v == null) continue;
+      total += v;
+      rows.push([label, ms(v)]);
+    }
+    if (timings.morphAngles != null) {
+      const n = timings.morphAngles;
+      rows.push(['Morfologia · angoli', `${n} ${n === 1 ? 'angolo' : 'angoli'}`]);
+    }
+    rows.push(['Totale misurato', ms(total)]);
+    const log = document.createElement('div');
+    log.className = 'debug-log';
+    log.innerHTML = rows
+      .map(
+        ([k, v]) =>
+          `<div class="debug-log-row"><span class="debug-log-k">${k}</span><span class="debug-log-v">${v}</span></div>`,
+      )
+      .join('');
+    debugBar.appendChild(log);
+  }
 }
 
 function draw() {

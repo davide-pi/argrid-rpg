@@ -120,6 +120,7 @@ export interface GridResult {
   debugSteps?: DebugStep[]; // per-stage previews (only when wantEdges/debug)
   debugPipelines?: PipelineStat[]; // per-candidate confidence (only when wantEdges/debug)
   debugAgreement?: number | null; // 0..1 main↔morph agreement, or null (debug only)
+  debugTimings?: Record<string, number>; // ms per phase + counts, for the debug log (debug only)
   info: {
     rawCount: number;
     aCount: number;
@@ -382,6 +383,16 @@ export function* detectGridFromMatSteps(
   const snap = (id: string, mat: any) => {
     if (wantEdges) previews[id] = matToPreview(cv, mat);
   };
+  // Debug-only timing: accumulate the ms spent in each heavy (synchronous) phase so the
+  // debug log can show where the pipeline spends its time. `timed` wraps a synchronous
+  // call only — never a span that contains a `yield`, or the frame wait would be counted.
+  const timings: Record<string, number> = {};
+  const timed = <T>(key: string, fn: () => T): T => {
+    const t0 = performance.now();
+    const r = fn();
+    timings[key] = (timings[key] ?? 0) + (performance.now() - t0);
+    return r;
+  };
   let chromaExecuted = false; // the chromatic branch ran (colour source, RGBA)
   let chromaContributed = false; // …and it actually added edges (non-empty)
   let cleanApplied = false;
@@ -392,18 +403,20 @@ export function* detectGridFromMatSteps(
   try {
     yield { frac: 0.05, label: "Preparazione dell'immagine…" };
     gray = new cv.Mat();
-    if (work.channels && work.channels() === 1) {
-      work.copyTo(gray);
-    } else {
-      cv.cvtColor(work, gray, cv.COLOR_RGBA2GRAY);
-    }
+    timed('gray', () => {
+      if (work.channels && work.channels() === 1) {
+        work.copyTo(gray);
+      } else {
+        cv.cvtColor(work, gray, cv.COLOR_RGBA2GRAY);
+      }
+    });
     snap('foto', work); // the original colour image — the single root of the graph
     snap('gray', gray);
 
     // --- Standard edge path: CLAHE local contrast -> blur -> auto-Canny (Otsu) ---
     eq = new cv.Mat();
     clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
-    clahe.apply(gray, eq);
+    timed('clahe', () => clahe.apply(gray, eq));
     clahe.delete();
     clahe = null;
     snap('clahe', eq);
@@ -412,7 +425,7 @@ export function* detectGridFromMatSteps(
     // 5×5: light denoising before Otsu/Canny. A larger kernel (7×7) was tried but it
     // blurred faint / thin grid lines below Canny's threshold and killed recall on real
     // photos, so keep it modest.
-    cv.GaussianBlur(eq, blurred, new cv.Size(5, 5), 0);
+    timed('blur', () => cv.GaussianBlur(eq, blurred, new cv.Size(5, 5), 0));
     snap('blur', blurred);
 
     // Auto-Canny: derive thresholds from Otsu's global threshold.
@@ -424,7 +437,7 @@ export function* detectGridFromMatSteps(
 
     yield { frac: 0.2, label: 'Rilevamento dei bordi…' };
     cannyEdges = new cv.Mat();
-    cv.Canny(blurred, cannyEdges, cannyLow, cannyHigh);
+    timed('canny', () => cv.Canny(blurred, cannyEdges, cannyLow, cannyHigh));
     snap('canny', cannyEdges);
 
     // Chromatic edges: a grid that differs from its background in HUE but not in
@@ -434,7 +447,7 @@ export function* detectGridFromMatSteps(
     // actually carries chroma (near-neutral channels contribute nothing).
     if (params.colorEdges && work.channels && work.channels() === 4) {
       yield { frac: 0.35, label: 'Analisi cromatica…' };
-      const chroma = chromaEdges(cv, work);
+      const chroma = timed('chroma', () => chromaEdges(cv, work));
       snap('chroma', chroma); // the colour-only edges (what chroma actually found)
       chromaExecuted = true;
       chromaContributed = cv.countNonZero(chroma) > 0; // empty on a tonal (non-hue) grid
@@ -460,7 +473,7 @@ export function* detectGridFromMatSteps(
     // clean/faint grid the "short components" are the grid's own broken lines, so cleaning
     // there would erase them (that regressed recall when it ran unconditionally).
     if (params.edgeClean && noisy) {
-      dropShortComponents(cv, cannyEdges, shortLen(cannyEdges));
+      timed('clean', () => dropShortComponents(cv, cannyEdges, shortLen(cannyEdges)));
       snap('clean', cannyEdges);
       cleanApplied = true;
     }
@@ -474,7 +487,7 @@ export function* detectGridFromMatSteps(
     let orient: { a: number; b: number } | null = null;
     if (params.fftPrior) {
       try {
-        orient = fftOrientations(cv, gray);
+        orient = timed('fft', () => fftOrientations(cv, gray));
       } catch (err) {
         console.warn('fft orientation prior skipped:', err);
       }
@@ -482,7 +495,7 @@ export function* detectGridFromMatSteps(
 
     // Hough + grid fit on the Canny edges.
     yield { frac: 0.55, label: 'Ricerca delle linee della griglia…' };
-    let result = houghToGrid(cv, cannyEdges, work, scale, W0, H0, params, orient);
+    let result = timed('houghMain', () => houghToGrid(cv, cannyEdges, work, scale, W0, H0, params, orient));
 
     // VP-aware oriented re-extraction: on a WEAK first fit, gate the edges by the fit's
     // own perspective-consistent orientation (drops clutter — furniture, text, diagonals
@@ -491,12 +504,14 @@ export function* detectGridFromMatSteps(
     // so it doesn't erase a steeply-converging family.
     if (params.orientGate && gridStrength(result) < ORIENT_SKIP_STRENGTH) {
       try {
-        const gated = orientEdgesVP(cv, gray, cannyEdges, scale, result.familyA, result.familyB, ORIENT_TOL_DEG);
+        const gated = timed('oriented', () =>
+          orientEdgesVP(cv, gray, cannyEdges, scale, result.familyA, result.familyB, ORIENT_TOL_DEG),
+        );
         if (gated) {
           snap('oriented', gated.mask);
           orientedRan = true;
           if (gated.keptFrac >= ORIENT_MIN_KEEP) {
-            const alt = houghToGrid(cv, gated.mask, work, scale, W0, H0, params, orient);
+            const alt = timed('oriented', () => houghToGrid(cv, gated.mask, work, scale, W0, H0, params, orient));
             if (gridStrength(alt) > gridStrength(result)) {
               result = alt;
               orientedAdopted = true;
@@ -535,14 +550,16 @@ export function* detectGridFromMatSteps(
       const off = residualTilt(orient ? orient.a : result.info.angleADeg); // [-45,45]
       const primary = Math.abs(off) > 12 ? -off : 0;
       let bestDeskew = primary;
-      morphEdges = enhanceGridLines(cv, gray, snap, primary);
+      let morphAngles = 1;
+      morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, primary));
       morphRan = true;
-      let alt = houghToGrid(cv, morphEdges, work, scale, W0, H0, params, orient);
+      let alt = timed('morphHough', () => houghToGrid(cv, morphEdges, work, scale, W0, H0, params, orient));
       if (gridStrength(alt) < MORPH_STRONG) {
         for (let a = -45; a <= 45; a += MORPH_SWEEP_STEP) {
           if (Math.abs(a - primary) < MORPH_SWEEP_STEP / 2) continue; // ~already tried
-          const m = enhanceGridLines(cv, gray, undefined, a);
-          const f = houghToGrid(cv, m, work, scale, W0, H0, params, orient);
+          morphAngles++;
+          const m = timed('morphEnhance', () => enhanceGridLines(cv, gray, undefined, a));
+          const f = timed('morphHough', () => houghToGrid(cv, m, work, scale, W0, H0, params, orient));
           if (gridStrength(f) > gridStrength(alt)) {
             morphEdges.delete();
             morphEdges = m;
@@ -556,9 +573,10 @@ export function* detectGridFromMatSteps(
         // Re-run the winning angle WITH snap so the graph shows its (deskewed) stages.
         if (bestDeskew !== primary) {
           morphEdges.delete();
-          morphEdges = enhanceGridLines(cv, gray, snap, bestDeskew);
+          morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, bestDeskew));
         }
       }
+      timings.morphAngles = morphAngles;
       snap('morph', morphEdges);
       morphFit = alt;
       agreement = fitsAgree(mainFit, morphFit);
@@ -692,6 +710,7 @@ export function* detectGridFromMatSteps(
       result.debugPipelines = [statOf('main', 'Luminanza', mainFit, !morphChosen)];
       if (morphFit) result.debugPipelines.push(statOf('morph', 'Morfologica', morphFit, morphChosen));
       result.debugAgreement = agreement;
+      result.debugTimings = timings;
     }
 
     // Fold the two-method agreement into the FINAL confidence (after the panel above read

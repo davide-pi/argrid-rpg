@@ -47,12 +47,15 @@ export interface DetectorParams {
    * histogram locks onto a wrong orientation (e.g. a 45° diagonal off a tiled floor).
    * Only overrides when the prior confidently disagrees; a matching prior is a no-op. */
   fftPrior: boolean;
-  /** Oriented edge re-extraction: before Hough, keep only edge pixels whose gradient
-   * (line-normal) orientation matches one of the two dominant grid directions from the
-   * FFT prior (± ORIENT_TOL_DEG), dropping clutter at other angles (furniture, text,
-   * diagonals). Needs the FFT prior; self-disables when it would remove too much or the
-   * prior is absent. A generous tolerance keeps perspective fan — see ORIENT_TOL_DEG. */
+  /** Oriented edge re-extraction (weak-fit recovery): when the first fit is weak, keep
+   * only edge pixels whose gradient matches the fit's own perspective-consistent grid
+   * normal (vanishing-point-aware, so it follows the fan) and re-fit. Adopted only if
+   * strictly stronger — pure containment. See orientEdgesVP / ORIENT_SKIP_STRENGTH. */
   orientGate: boolean;
+  /** Texture cleaning: before Hough, drop the SHORT connected components of the edge
+   * map (a high-frequency sand/dirt texture leaves many tiny fragments; grid lines are
+   * long). Orientation-agnostic length filter — see dropShortComponents. */
+  edgeClean: boolean;
 }
 
 export const DEFAULT_PARAMS: DetectorParams = {
@@ -66,6 +69,7 @@ export const DEFAULT_PARAMS: DetectorParams = {
   colorEdges: true,
   fftPrior: true,
   orientGate: true,
+  edgeClean: true,
 };
 
 /** A line as normal form: nx*x + ny*y = d, with (nx,ny) a unit vector. */
@@ -77,11 +81,33 @@ export interface Line2 {
   extended?: boolean; // true if extrapolated BEYOND the detected extent (see extend)
 }
 
-/** One captured pipeline stage (debug only): a downscaled RGBA snapshot of an
- * intermediate Mat, for the debug step viewer. */
+/** One node of the pipeline graph (debug only). `image` is a downscaled RGBA snapshot
+ * of that stage's Mat (absent for the final overlay node, or for a stage that never
+ * ran). `inputs` are the ids of the stages that STRUCTURALLY feed this one — the full
+ * fixed topology, so every stage (even a skipped one) is drawn with its in/out arrows.
+ * `executed` = the stage actually ran (false → drawn deactivated, not clickable).
+ * `used` = the stage is on the path that actually produced the final grid. So a node
+ * can be: used (highlighted), executed-but-not-used (normal), or not executed. */
 export interface DebugStep {
+  id: string;
   label: string;
-  image: ImageData;
+  image?: ImageData;
+  inputs: string[];
+  executed: boolean;
+  used: boolean;
+}
+
+/** Per-candidate detection quality, for the debug confidence panel. Each independent
+ * fit (the main luminance path, the morphological fallback) reports its own numbers;
+ * `chosen` marks the one that became the final result. */
+export interface PipelineStat {
+  id: string; // 'main' | 'morph'
+  label: string;
+  strength: number; // detected (non-filled) lines in the weaker family
+  confidence: number; // 0..1 heuristic
+  cells: [number, number]; // a × b cells
+  degenerate: boolean;
+  chosen: boolean; // became the final result
 }
 
 export interface GridResult {
@@ -92,6 +118,8 @@ export interface GridResult {
   rawLines: Line2[];
   edges?: ImageData; // debug edge map (working resolution); DOM-free
   debugSteps?: DebugStep[]; // per-stage previews (only when wantEdges/debug)
+  debugPipelines?: PipelineStat[]; // per-candidate confidence (only when wantEdges/debug)
+  debugAgreement?: number | null; // 0..1 main↔morph agreement, or null (debug only)
   info: {
     rawCount: number;
     aCount: number;
@@ -149,14 +177,56 @@ const detectedCount = (fam: Line2[]): number => fam.reduce((n, l) => n + (l.fill
 const gridStrength = (r: GridResult): number =>
   Math.min(detectedCount(r.familyA), detectedCount(r.familyB));
 
-/** 0..1 heuristic detection quality from the detected line counts. A grid needs
- * ≥2 detected lines per family to exist at all; ~6+ per family is an unambiguous
- * detection. Extrapolated/filled lines don't count, so a mostly-extended result
- * (few real lines) scores low. */
+/** 0..1 continuous detection-quality heuristic for ONE fit. Blends three
+ * perspective-safe signals (a grid still scores well when foreshortened):
+ *   • recall   — detected lines in the WEAKER family (2→0, 8→1);
+ *   • realness — fraction of lines actually detected vs interpolated/extended;
+ *   • balance  — the two families are similarly populated (a grid has both).
+ * Deliberately NO spacing-uniformity term: perspective makes the image-space cell
+ * pitch vary smoothly, which is not a defect, so penalising it would be wrong. The
+ * strong cross-check (do the two independent pipelines agree?) is applied separately
+ * — see fitsAgree / the confidence panel. */
 function gridConfidence(familyA: Line2[], familyB: Line2[]): number {
-  const m = Math.min(detectedCount(familyA), detectedCount(familyB));
+  const dA = detectedCount(familyA);
+  const dB = detectedCount(familyB);
+  const m = Math.min(dA, dB);
   if (m < 2) return 0;
-  return Math.max(0, Math.min(1, (m - 2) / 4)); // 2→0, 6→1
+  const sCount = Math.min(1, (m - 2) / 6); // 2→0, 8→1 (smooth ramp)
+  const sReal = Math.min(familyA.length ? dA / familyA.length : 0, familyB.length ? dB / familyB.length : 0);
+  const sBalance = Math.max(dA, dB) ? Math.min(dA, dB) / Math.max(dA, dB) : 0;
+  return Math.max(0, Math.min(1, 0.5 * sCount + 0.3 * sReal + 0.2 * sBalance));
+}
+
+/** Do two independent fits describe the SAME grid? Returns 0..1 (1 = same angle & cell
+ * pitch on both families), or null when they're not comparable (a fit is missing,
+ * degenerate, or too weak). Families are matched by nearest angle; pitch is compared as
+ * a ratio so it's scale-tolerant. This is the OPTION-B second opinion: two independent
+ * methods agreeing is strong evidence, even when each alone found only a few lines. */
+function fitsAgree(a: GridResult | null, b: GridResult | null): number | null {
+  if (!a || !b || a.info.degenerate || b.info.degenerate) return null;
+  if (Math.min(a.info.detectedA, a.info.detectedB) < 2) return null;
+  if (Math.min(b.info.detectedA, b.info.detectedB) < 2) return null;
+  const aAng = [a.info.angleADeg, a.info.angleBDeg];
+  const aPit = [a.info.spacingA, a.info.spacingB];
+  const bAng = [b.info.angleADeg, b.info.angleBDeg];
+  const bPit = [b.info.spacingA, b.info.spacingB];
+  const bi = angDist180(aAng[0], bAng[1]) < angDist180(aAng[0], bAng[0]) ? [1, 0] : [0, 1];
+  let sum = 0;
+  for (let k = 0; k < 2; k++) {
+    const sAng = 1 - Math.min(1, angDist180(aAng[k], bAng[bi[k]]) / 15); // within 15°
+    const pa = aPit[k];
+    const pb = bPit[bi[k]];
+    const ratio = pa > 0 && pb > 0 ? Math.max(pa, pb) / Math.min(pa, pb) : 99;
+    const sPit = 1 - Math.min(1, Math.log(ratio) / Math.log(1.5)); // within 1.5×
+    sum += sAng + sPit;
+  }
+  return Math.max(0, Math.min(1, sum / 4));
+}
+
+/** Fold the two-method agreement into a single fit's confidence: agreement (>0.5) lifts
+ * it, disagreement (<0.5) cuts it, 0.5 is neutral. Bounded to [0,1]. */
+function withAgreement(base: number, agree: number): number {
+  return Math.max(0, Math.min(1, base * (0.5 + 0.5 * agree) + agree * (1 - base) * 0.5));
 }
 
 /** A coarse progress tick emitted between the heavy detection stages, so the UI
@@ -305,12 +375,20 @@ export function* detectGridFromMatSteps(
   let blurred: any = null;
   let cannyEdges: any = null;
   let morphEdges: any = null;
-  // Debug-only per-stage previews (populated when wantEdges). Captured as the stage's
-  // Mat is still live, since Mats are freed before we return.
-  const steps: DebugStep[] = [];
-  const snap = (label: string, mat: any) => {
-    if (wantEdges) steps.push({ label, image: matToPreview(cv, mat) });
+  // Debug-only pipeline-graph previews (populated when wantEdges). Each stage's Mat is
+  // snapped while still live (they're freed before we return); the graph is assembled
+  // at the end from these previews + the applied/discarded flags below.
+  const previews: Record<string, ImageData> = {};
+  const snap = (id: string, mat: any) => {
+    if (wantEdges) previews[id] = matToPreview(cv, mat);
   };
+  let chromaExecuted = false; // the chromatic branch ran (colour source, RGBA)
+  let chromaContributed = false; // …and it actually added edges (non-empty)
+  let cleanApplied = false;
+  let orientedRan = false; // the oriented re-extraction computed a mask
+  let orientedAdopted = false; // …and it was stronger, so its re-fit won
+  let morphRan = false; // the morphological pass ran
+  let morphChosen = false; // …and it beat the luminance fit
   try {
     yield { frac: 0.05, label: "Preparazione dell'immagine…" };
     gray = new cv.Mat();
@@ -319,7 +397,8 @@ export function* detectGridFromMatSteps(
     } else {
       cv.cvtColor(work, gray, cv.COLOR_RGBA2GRAY);
     }
-    snap('Grigio', gray);
+    snap('foto', work); // the original colour image — the single root of the graph
+    snap('gray', gray);
 
     // --- Standard edge path: CLAHE local contrast -> blur -> auto-Canny (Otsu) ---
     eq = new cv.Mat();
@@ -327,14 +406,14 @@ export function* detectGridFromMatSteps(
     clahe.apply(gray, eq);
     clahe.delete();
     clahe = null;
-    snap('Contrasto (CLAHE)', eq);
+    snap('clahe', eq);
 
     blurred = new cv.Mat();
-    // 5×5 (was 3×3): a touch more denoising before Otsu/Canny on real photos. CLAHE
-    // just before amplifies noise, so this tames it; the trade-off is that very faint
-    // or very thin lines blur more, so keep it modest.
+    // 5×5: light denoising before Otsu/Canny. A larger kernel (7×7) was tried but it
+    // blurred faint / thin grid lines below Canny's threshold and killed recall on real
+    // photos, so keep it modest.
     cv.GaussianBlur(eq, blurred, new cv.Size(5, 5), 0);
-    snap('Sfocatura', blurred);
+    snap('blur', blurred);
 
     // Auto-Canny: derive thresholds from Otsu's global threshold.
     const otsuTmp = new cv.Mat();
@@ -346,7 +425,7 @@ export function* detectGridFromMatSteps(
     yield { frac: 0.2, label: 'Rilevamento dei bordi…' };
     cannyEdges = new cv.Mat();
     cv.Canny(blurred, cannyEdges, cannyLow, cannyHigh);
-    snap('Bordi (Canny)', cannyEdges);
+    snap('canny', cannyEdges);
 
     // Chromatic edges: a grid that differs from its background in HUE but not in
     // brightness (e.g. a coloured map on a similarly-light surface) leaves no
@@ -356,9 +435,11 @@ export function* detectGridFromMatSteps(
     if (params.colorEdges && work.channels && work.channels() === 4) {
       yield { frac: 0.35, label: 'Analisi cromatica…' };
       const chroma = chromaEdges(cv, work);
+      snap('chroma', chroma); // the colour-only edges (what chroma actually found)
+      chromaExecuted = true;
+      chromaContributed = cv.countNonZero(chroma) > 0; // empty on a tonal (non-hue) grid
       cv.bitwise_or(cannyEdges, chroma, cannyEdges);
       chroma.delete();
-      snap('Bordi + cromatica', cannyEdges);
     }
 
     // Focus gating (off by default): the grid sits in the focal plane, so it is
@@ -366,6 +447,15 @@ export function* detectGridFromMatSteps(
     // is well below the median among edges. Self-disabling when the frame is
     // uniformly sharp. See DetectorParams.
     if (params.focusGating) gateEdgesByFocus(cv, gray, cannyEdges);
+    snap('edges', cannyEdges); // merged edge map (Canny [+ chroma]) before cleaning
+
+    // Texture cleaning: drop the short components (sand/dirt speckle) so Hough sees the
+    // long grid lines instead of a web of tiny fragments.
+    if (params.edgeClean) {
+      dropShortComponents(cv, cannyEdges, shortLen(cannyEdges));
+      snap('clean', cannyEdges);
+      cleanApplied = true;
+    }
     eq.delete();
     eq = null;
     blurred.delete();
@@ -394,37 +484,81 @@ export function* detectGridFromMatSteps(
     if (params.orientGate && gridStrength(result) < ORIENT_SKIP_STRENGTH) {
       try {
         const gated = orientEdgesVP(cv, gray, cannyEdges, scale, result.familyA, result.familyB, ORIENT_TOL_DEG);
-        if (gated && gated.keptFrac >= ORIENT_MIN_KEEP) {
-          snap('Bordi orientati', gated.mask);
-          const alt = houghToGrid(cv, gated.mask, work, scale, W0, H0, params, orient);
-          if (gridStrength(alt) > gridStrength(result)) {
-            result = alt;
-            cannyEdges.delete();
-            cannyEdges = gated.mask; // adopted mask becomes the live edge mask
+        if (gated) {
+          snap('oriented', gated.mask);
+          orientedRan = true;
+          if (gated.keptFrac >= ORIENT_MIN_KEEP) {
+            const alt = houghToGrid(cv, gated.mask, work, scale, W0, H0, params, orient);
+            if (gridStrength(alt) > gridStrength(result)) {
+              result = alt;
+              orientedAdopted = true;
+              cannyEdges.delete();
+              cannyEdges = gated.mask; // adopted mask becomes the live edge mask
+            } else {
+              gated.mask.delete();
+            }
           } else {
             gated.mask.delete();
           }
-        } else if (gated) {
-          gated.mask.delete();
         }
       } catch (err) {
         console.warn('oriented re-extraction skipped:', err);
       }
     }
 
-    // --- Fallback for noisy / low-contrast photos -----------------------
-    // When Canny drowns in background texture (a grid drawn on dirt/cork), it finds
-    // no grid. Retry with the morphological line extractor and keep it if it does
-    // better. Costs an extra pass only when the plain pipeline already failed.
-    // `gridStrength` counts only DETECTED lines (not interior-filled or extrapolated
-    // ones), so a weak detection can't be masked by fill/extension and skip the fallback.
-    if (params.lineMorph && gridStrength(result) < 3) {
-      yield { frac: 0.75, label: 'Immagine complessa, riprovo…' };
-      morphEdges = enhanceGridLines(cv, gray);
-      snap('Estrazione morfologica', morphEdges);
-      const alt = houghToGrid(cv, morphEdges, work, scale, W0, H0, params, orient);
+    const mainFit = result; // luminance path result (incl. oriented recovery), for the panel
+    let morphFit: GridResult | null = null;
+
+    // --- Morphological pass -------------------------------------------------
+    // A second, INDEPENDENT line extractor (morphology instead of Canny) — strong where
+    // Canny drowns in background texture (a grid on dirt/cork). Runs ALWAYS (not only on
+    // failure) so it's a genuine second opinion: its own fit shows in the confidence
+    // panel, and it's adopted as the final grid only if strictly stronger than the
+    // luminance fit (containment — it can't make things worse).
+    if (params.lineMorph) {
+      yield { frac: 0.75, label: 'Analisi morfologica…' };
+      // The morphology is AXIS-ALIGNED, so a tilted grid must be straightened first. We
+      // don't trust a single prior angle (a wrong one leaves the lines crooked): instead
+      // we SWEEP deskew angles, and for each one rotate → morphology → fit, keeping the
+      // angle whose fit has the most "virtual" lattice lines (gridStrength — the grid
+      // lines the fit hypothesises from the segments, not the raw segments). The winning
+      // mask is already rotated back to the original frame inside enhanceGridLines.
+      //
+      // Start from a best guess (0 if the prior says near-axis, else the prior's tilt),
+      // and only pay for the full sweep when that first guess is weak — a square grid's
+      // 90° symmetry means every tilt lives in [-45,45].
+      const off = residualTilt(orient ? orient.a : result.info.angleADeg); // [-45,45]
+      const primary = Math.abs(off) > 12 ? -off : 0;
+      let bestDeskew = primary;
+      morphEdges = enhanceGridLines(cv, gray, snap, primary);
+      morphRan = true;
+      let alt = houghToGrid(cv, morphEdges, work, scale, W0, H0, params, orient);
+      if (gridStrength(alt) < MORPH_STRONG) {
+        for (let a = -45; a <= 45; a += MORPH_SWEEP_STEP) {
+          if (Math.abs(a - primary) < MORPH_SWEEP_STEP / 2) continue; // ~already tried
+          const m = enhanceGridLines(cv, gray, undefined, a);
+          const f = houghToGrid(cv, m, work, scale, W0, H0, params, orient);
+          if (gridStrength(f) > gridStrength(alt)) {
+            morphEdges.delete();
+            morphEdges = m;
+            alt = f;
+            bestDeskew = a;
+            if (gridStrength(f) >= MORPH_STRONG) break; // clearly a grid — stop searching
+          } else {
+            m.delete();
+          }
+        }
+        // Re-run the winning angle WITH snap so the graph shows its (deskewed) stages.
+        if (bestDeskew !== primary) {
+          morphEdges.delete();
+          morphEdges = enhanceGridLines(cv, gray, snap, bestDeskew);
+        }
+      }
+      snap('morph', morphEdges);
+      morphFit = alt;
       if (gridStrength(alt) > gridStrength(result)) {
         result = alt;
+        morphChosen = true;
         cannyEdges.delete();
         cannyEdges = null; // morphEdges is now the live mask
       } else {
@@ -434,6 +568,11 @@ export function* detectGridFromMatSteps(
     }
 
     const edges = morphEdges ?? cannyEdges; // whichever mask survived
+
+    // Option B: how much do the two independent fits agree? (null when not comparable.)
+    // Computed here while both fit objects still hold their RAW per-fit confidence — it's
+    // folded into the FINAL confidence below, AFTER the panel captured the raw values.
+    const agreement = fitsAgree(mainFit, morphFit);
 
     yield { frac: 0.9, label: 'Ricostruzione della griglia…' };
     result.info.cannyHigh = cannyHigh;
@@ -455,7 +594,97 @@ export function* detectGridFromMatSteps(
       }
       result.edges = new ImageData(buf, ew, eh);
     }
-    if (steps.length) result.debugSteps = steps;
+
+    if (wantEdges) {
+      // FIXED structural topology — every stage is drawn (even skipped ones) with its
+      // in/out arrows.
+      const topo: Record<string, string[]> = {
+        foto: [],
+        gray: ['foto'],
+        clahe: ['gray'],
+        blur: ['clahe'],
+        canny: ['blur'],
+        chroma: ['foto'],
+        edges: ['canny', 'chroma'],
+        clean: ['edges'],
+        oriented: ['clean'],
+        // Morphological pass, exploded: it runs from GRAY (its own denoise/invert
+        // is folded into the ridge nodes), forks into a horizontal and a vertical line
+        // extractor, then the two rejoin into the final mask.
+        mridgeh: ['gray'],
+        mridgev: ['gray'],
+        mbinh: ['mridgeh'],
+        mbinv: ['mridgev'],
+        morph: ['mbinh', 'mbinv'],
+        overlay: ['oriented', 'morph'],
+      };
+      const label: Record<string, string> = {
+        foto: 'Foto', gray: 'Grigio', clahe: 'Contrasto', blur: 'Sfocatura', canny: 'Canny',
+        chroma: 'Cromatica', edges: 'Bordi uniti', clean: 'Pulizia texture', oriented: 'Orientati',
+        mridgeh: 'Cresta H', mridgev: 'Cresta V', mbinh: 'Linee H', mbinv: 'Linee V',
+        morph: 'Morfologica', overlay: 'Griglia',
+      };
+      const executed: Record<string, boolean> = {
+        foto: true, gray: true, clahe: true, blur: true, canny: true,
+        chroma: chromaExecuted, edges: true, clean: cleanApplied, oriented: orientedRan,
+        mridgeh: morphRan, mridgev: morphRan, mbinh: morphRan, mbinv: morphRan,
+        morph: morphRan, overlay: true,
+      };
+      // The ACTUAL data path to the final grid (walk back through the input each stage
+      // really used — bypassing skipped stages / non-contributing branches).
+      const realInput: Record<string, string[]> = {
+        overlay: [morphChosen ? 'morph' : orientedAdopted ? 'oriented' : cleanApplied ? 'clean' : 'edges'],
+        oriented: [cleanApplied ? 'clean' : 'edges'],
+        clean: ['edges'],
+        edges: chromaContributed ? ['canny', 'chroma'] : ['canny'],
+        canny: ['blur'],
+        blur: ['clahe'],
+        clahe: ['gray'],
+        gray: ['foto'],
+        chroma: ['foto'],
+        morph: ['mbinh', 'mbinv'],
+        mbinh: ['mridgeh'],
+        mbinv: ['mridgev'],
+        mridgeh: ['gray'],
+        mridgev: ['gray'],
+        foto: [],
+      };
+      const used = new Set<string>();
+      const stack = ['overlay'];
+      while (stack.length) {
+        const id = stack.pop()!;
+        if (used.has(id) || !executed[id]) continue;
+        used.add(id);
+        for (const inp of realInput[id] ?? []) stack.push(inp);
+      }
+      result.debugSteps = Object.keys(topo).map((id) => ({
+        id,
+        label: label[id],
+        image: previews[id],
+        inputs: topo[id],
+        executed: executed[id],
+        used: used.has(id),
+      }));
+
+      // Per-candidate confidence (main luminance fit vs the morphological fallback).
+      const statOf = (id: string, lbl: string, r: GridResult, chosen: boolean): PipelineStat => ({
+        id,
+        label: lbl,
+        strength: gridStrength(r),
+        confidence: r.info.confidence,
+        cells: [Math.max(0, r.info.aCount - 1), Math.max(0, r.info.bCount - 1)],
+        degenerate: r.info.degenerate,
+        chosen,
+      });
+      result.debugPipelines = [statOf('main', 'Principale', mainFit, !morphChosen)];
+      if (morphFit) result.debugPipelines.push(statOf('morph', 'Morfologica', morphFit, morphChosen));
+      result.debugAgreement = agreement;
+    }
+
+    // Fold the two-method agreement into the FINAL confidence (after the panel above read
+    // each fit's RAW score). No effect when the fits aren't comparable, and confidence
+    // never gates whether a grid is drawn, so this only changes the reported number.
+    if (agreement != null) result.info.confidence = withAgreement(result.info.confidence, agreement);
 
     return result;
   } finally {
@@ -509,13 +738,126 @@ function houghToGrid(
       thetaDeg = ((thetaDeg % 180) + 180) % 180;
       raw.push({ rho, thetaDeg });
     }
-    const result = buildGrid(raw, scale, W0, H0, params, orientPrior);
+    let result = buildGrid(raw, scale, W0, H0, params, orientPrior);
+    // Degenerate fit = a phantom SUB-PITCH: thick / wavy lines (a physical mat, a
+    // morphological mask) produce many close Hough responses that the default merge
+    // distance doesn't collapse, so the lattice locks onto half/third the real pitch.
+    // Re-fit the SAME raw lines with a progressively LARGER merge distance and take the
+    // first non-degenerate result. Only triggers on a degenerate fit, so fine grids
+    // (never degenerate) keep the tight default merge — no risk of merging real lines.
+    if (result.info.degenerate) {
+      for (let m = 2; m <= 4; m++) {
+        const alt = buildGrid(raw, scale, W0, H0, { ...params, mergeFrac: params.mergeFrac * m }, orientPrior);
+        if (!alt.info.degenerate) {
+          result = alt;
+          break;
+        }
+      }
+    }
     result.info.usedHough = usedHough;
     return result;
   } finally {
     linesMat.delete();
   }
 }
+
+/** Angular half-width (deg) an edge pixel's gradient may deviate from the LOCAL
+ * expected grid normal and still be kept. Vanishing-point-aware, so it can stay tight. */
+const ORIENT_TOL_DEG = 15;
+/** If the gate would keep less than this fraction of the edge pixels, the families
+ * probably don't describe the real grid — skip it. */
+const ORIENT_MIN_KEEP = 0.15;
+/** Only run the oriented re-extraction as a RECOVERY: skip it once the first fit already
+ * has this many detected lines per family (it's a clear grid, nothing to rescue). */
+const ORIENT_SKIP_STRENGTH = 6;
+
+/**
+ * Vanishing-point-aware oriented edge re-extraction. Using the FIRST fit's two families
+ * (their vanishing points, or mean orientation when parallel), keep only edge pixels
+ * whose gradient (= line-normal) matches the **locally** expected grid normal of either
+ * family within `tolDeg`. Because the expected normal is computed from the pixel's
+ * direction to each vanishing point, it FOLLOWS the perspective fan — a fixed global
+ * angle would erase the strongly-converging family. Returns a NEW mask (caller owns it)
+ * + kept fraction, or null if the fit has no usable family orientation. Does not mutate
+ * `edges`. Coordinates: family lines are in original image space, `edges` is at working
+ * resolution, so vanishing points are scaled by `scale`.
+ */
+function orientEdgesVP(
+  cv: any,
+  gray: any,
+  edges: any,
+  scale: number,
+  familyA: Line2[],
+  familyB: Line2[],
+  tolDeg: number,
+): { mask: any; keptFrac: number } | null {
+  const meanNorm = (fam: Line2[]): number | null =>
+    fam.length ? meanAngle180(fam.map((l) => angleOfDeg(l.nx, l.ny))) : null;
+  const mnA = meanNorm(familyA);
+  const mnB = meanNorm(familyB);
+  if (mnA == null && mnB == null) return null;
+  const vpA = familyA.length >= 2 ? vanishingPoint(familyA) : null; // original coords
+  const vpB = familyB.length >= 2 ? vanishingPoint(familyB) : null;
+  const axw = vpA ? vpA.x * scale : 0;
+  const ayw = vpA ? vpA.y * scale : 0;
+  const bxw = vpB ? vpB.x * scale : 0;
+  const byw = vpB ? vpB.y * scale : 0;
+
+  const gx = new cv.Mat();
+  const gy = new cv.Mat();
+  try {
+    cv.Sobel(gray, gx, cv.CV_32F, 1, 0, 3);
+    cv.Sobel(gray, gy, cv.CV_32F, 0, 1, 3);
+    const out = edges.clone();
+    const em = out.data as Uint8Array;
+    const gxD = gx.data32F as Float32Array;
+    const gyD = gy.data32F as Float32Array;
+    const W = out.cols;
+    const fold = (deg: number): number => (((deg % 180) + 180) % 180);
+    let kept = 0;
+    let total = 0;
+    for (let i = 0; i < em.length; i++) {
+      if (!em[i]) continue;
+      total++;
+      const px = i % W;
+      const py = (i / W) | 0;
+      const gnorm = fold(Math.atan2(gyD[i], gxD[i]) * DEG); // gradient = line normal
+      // Expected normal of family A at this pixel: line points to VP_A (finite) or has
+      // the constant parallel orientation; its normal is that direction + 90°.
+      let ok = false;
+      if (mnA != null) {
+        const nA = vpA ? fold(Math.atan2(ayw - py, axw - px) * DEG + 90) : mnA;
+        ok = angDist180(gnorm, nA) <= tolDeg;
+      }
+      if (!ok && mnB != null) {
+        const nB = vpB ? fold(Math.atan2(byw - py, bxw - px) * DEG + 90) : mnB;
+        ok = angDist180(gnorm, nB) <= tolDeg;
+      }
+      if (ok) kept++;
+      else em[i] = 0;
+    }
+    return { mask: out, keptFrac: total ? kept / total : 0 };
+  } finally {
+    gx.delete();
+    gy.delete();
+  }
+}
+
+/** Detected lines per family at which the morphological fit counts as a clear grid, so
+ * the deskew angle sweep can stop early. */
+const MORPH_STRONG = 6;
+/** Deskew sweep step (deg) over a square grid's [-45,45] tilt range. Small enough that
+ * some candidate lands within the axis-aligned openings' few-degrees tolerance; larger
+ * = fewer (but coarser) morphology passes. */
+const MORPH_SWEEP_STEP = 7.5;
+/** Signed tilt (deg, [-45,45]) of an angle from the nearest image axis. Normal vs line
+ * angle folds away (they differ by 90°), so the caller's convention doesn't matter. */
+const residualTilt = (deg: number): number => {
+  if (!Number.isFinite(deg)) return 0;
+  let r = ((deg % 90) + 90) % 90; // [0,90)
+  if (r > 45) r -= 90; // [-45,45]
+  return r;
+};
 
 /** Morphological line extractor for noisy / low-contrast photos (e.g. a grid drawn
  * on a dirt or cork texture) where Canny drowns in speckle. Isotropic texture is
@@ -527,16 +869,37 @@ function houghToGrid(
  * a directional opening MINUS an isotropic opening = a line-only response in which
  * the background and speckle cancel -> threshold at mean + K·σ -> re-open ALONG the
  * line to drop residual blobs -> combine -> dilate. Broken lines are fine: Hough
- * sums the fragments that share a (rho, theta), and the lattice fit rebuilds gaps. */
-function enhanceGridLines(cv: any, gray: any): any {
+ * sums the fragments that share a (rho, theta), and the lattice fit rebuilds gaps.
+ *
+ * NOTE (orientation bias): the directional openings use AXIS-ALIGNED structuring
+ * elements (L×1, 1×L), so this responds to near-horizontal / near-vertical lines.
+ * A grid strongly rotated leaves little response — so `deskewDeg` (when the grid's
+ * tilt is known, e.g. from the FFT prior) rotates the image to straighten the grid
+ * BEFORE the morphology and rotates the resulting mask back, extending the fallback
+ * to oblique-but-flat shots. (Strong perspective, where lines converge, still can't be
+ * straightened by a single angle.) `snap` (optional) exposes the intermediate H/V
+ * stages to the debug graph. */
+function rotateMat(cv: any, src: any, deg: number, interp: number, border: number): any {
+  const center = new cv.Point(src.cols / 2, src.rows / 2);
+  const M = cv.getRotationMatrix2D(center, deg, 1);
+  const dst = new cv.Mat();
+  cv.warpAffine(src, dst, M, new cv.Size(src.cols, src.rows), interp, border, new cv.Scalar());
+  M.delete();
+  return dst;
+}
+function enhanceGridLines(cv: any, gray: any, snap?: (id: string, mat: any) => void, deskewDeg = 0): any {
+  // Straighten a tilted grid first (BORDER_REPLICATE, so the rotated-in corners don't
+  // become a hard frame edge that looks like a grid line). `src` is the caller's gray
+  // when there's no deskew, or a NEW rotated Mat we own and free at the end.
+  const src = deskewDeg ? rotateMat(cv, gray, deskewDeg, cv.INTER_LINEAR, cv.BORDER_REPLICATE) : gray;
   const MW = 1000; // work around ~1000px on the longer side (the SE sizes and the
   // mean+K·σ threshold below are tuned for this scale — changing it needs retuning)
-  const down = Math.min(1, MW / Math.max(gray.cols, gray.rows));
-  let g = gray;
+  const down = Math.min(1, MW / Math.max(src.cols, src.rows));
+  let g = src;
   let tempG: any = null;
   if (down < 1) {
     tempG = new cv.Mat();
-    cv.resize(gray, tempG, new cv.Size(Math.round(gray.cols * down), Math.round(gray.rows * down)), 0, 0, cv.INTER_AREA);
+    cv.resize(src, tempG, new cv.Size(Math.round(src.cols * down), Math.round(src.rows * down)), 0, 0, cv.INTER_AREA);
     g = tempG;
   }
   const minDim = Math.min(g.cols, g.rows);
@@ -561,8 +924,10 @@ function enhanceGridLines(cv: any, gray: any): any {
   cv.morphologyEx(inv, oS, cv.MORPH_OPEN, sq);
   const rH = new cv.Mat();
   const rV = new cv.Mat();
-  cv.subtract(oH, oS, rH);
-  cv.subtract(oV, oS, rV);
+  cv.subtract(oH, oS, rH); // horizontal directional opening minus isotropic → H line ridge
+  cv.subtract(oV, oS, rV); // …and the vertical one
+  snap?.('mridgeh', rH);
+  snap?.('mridgev', rV);
 
   const hSE2 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(L2, 1));
   const vSE2 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(1, L2));
@@ -586,6 +951,8 @@ function enhanceGridLines(cv: any, gray: any): any {
   };
   const bH = binDir(rH, hSE2, hSEc);
   const bV = binDir(rV, vSE2, vSEc);
+  snap?.('mbinh', bH);
+  snap?.('mbinv', bV);
   let mask = new cv.Mat();
   cv.max(bH, bV, mask);
   const d3 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
@@ -594,18 +961,30 @@ function enhanceGridLines(cv: any, gray: any): any {
   // Back up to the caller's (work) resolution so Hough shares the same scale.
   if (down < 1) {
     const up = new cv.Mat();
-    cv.resize(mask, up, new cv.Size(gray.cols, gray.rows), 0, 0, cv.INTER_NEAREST);
+    cv.resize(mask, up, new cv.Size(src.cols, src.rows), 0, 0, cv.INTER_NEAREST);
     mask.delete();
     mask = up;
   }
 
   [blur, inv, hSE, vSE, sq, oH, oV, oS, rH, rV, hSE2, vSE2, hSEc, vSEc, bH, bV, d3].forEach((x) => x.delete());
   if (tempG) tempG.delete();
+  // Rotate the mask back into the original (un-deskewed) frame so its lines line up
+  // with the real photo for Hough + the lattice fit. INTER_NEAREST keeps it binary.
+  if (deskewDeg) {
+    const back = rotateMat(cv, mask, -deskewDeg, cv.INTER_NEAREST, cv.BORDER_CONSTANT);
+    mask.delete();
+    mask = back;
+    src.delete(); // the rotated-in gray we allocated (never the caller's gray)
+  }
   return mask;
 }
 
 /** Below this std (0..255) a Lab chroma channel is treated as neutral (no colour
- * information) and skipped, so a near-grayscale photo adds no chromatic edges. */
+ * information) and skipped, so a near-grayscale photo adds no chromatic edges.
+ * Conservative on purpose: a LOWER gate lets a textured surface's micro hue-variation
+ * (cork/sand speckle) leak in as noise, which then pollutes the merged edge map the
+ * main Hough sees. If chroma ever becomes its own independent "second opinion" fit
+ * (not OR'd into the luminance edges) this can be relaxed safely. */
 const CHROMA_MIN_STD = 3;
 
 /**
@@ -650,6 +1029,9 @@ function chromaEdges(cv: any, work: any): any {
           const otsu = cv.threshold(blur, otsuTmp, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
           otsuTmp.delete();
           const e = new cv.Mat();
+          // Mirror the luminance path's hysteresis (0.5/1.0·otsu): a lower threshold
+          // catches subtler hue steps but drags in texture noise, which pollutes the
+          // merged edges the main Hough sees — not worth it while chroma is OR'd in.
           cv.Canny(blur, e, Math.max(1, Math.round(0.5 * otsu)), Math.max(1, Math.round(otsu)));
           cv.max(out, e, out);
           blur.delete();
@@ -937,86 +1319,35 @@ function fftOrientations(cv: any, gray: any): { a: number; b: number } | null {
   }
 }
 
-/** Angular half-width (deg) an edge pixel's gradient may deviate from the LOCAL
- * expected grid normal and still be kept. The gate is vanishing-point-aware (the
- * expected normal follows the perspective fan), so this can stay tight. */
-const ORIENT_TOL_DEG = 15;
-/** Self-disable guard: if the gate would keep less than this fraction of the edge
- * pixels, the families probably don't describe the real grid — skip it. */
-const ORIENT_MIN_KEEP = 0.15;
-/** Skip the oriented re-extraction when the first fit is already this strong (detected
- * lines per family): a confident grid needs no cleanup, and re-fitting risks nothing. */
-const ORIENT_SKIP_STRENGTH = 6;
+/** Min line length (px, working res) below which a connected component is treated as a
+ * short fragment (texture/speckle), not part of a grid line. */
+const shortLen = (mask: any): number => Math.max(12, Math.round(Math.min(mask.rows, mask.cols) / 45));
 
 /**
- * Vanishing-point-aware oriented edge re-extraction. Using the FIRST fit's two families
- * (their vanishing points, or mean orientation when parallel), keep only edge pixels
- * whose gradient (= line-normal) matches the **locally** expected grid normal of either
- * family within `tolDeg`. Because the expected normal is computed from the pixel's
- * direction to each vanishing point, it FOLLOWS the perspective fan — a fixed global
- * angle would erase the strongly-converging family. Returns a NEW mask (caller owns it)
- * + kept fraction, or null if the fit has no usable family orientation. Does not mutate
- * `edges`. Coordinates: family lines are in original image space, `edges` is at working
- * resolution, so vanishing points are scaled by `scale`.
+ * Zero the connected components of a binary `mask` whose longer bounding-box side is
+ * below `minLen` (in-place). A grid is long rows/columns, so this removes the many
+ * short fragments a high-frequency texture (sand/dirt) leaves in the edge map, without
+ * touching the long grid lines (a broken line is still several long-enough pieces).
  */
-function orientEdgesVP(
-  cv: any,
-  gray: any,
-  edges: any,
-  scale: number,
-  familyA: Line2[],
-  familyB: Line2[],
-  tolDeg: number,
-): { mask: any; keptFrac: number } | null {
-  const meanNorm = (fam: Line2[]): number | null =>
-    fam.length ? meanAngle180(fam.map((l) => angleOfDeg(l.nx, l.ny))) : null;
-  const mnA = meanNorm(familyA);
-  const mnB = meanNorm(familyB);
-  if (mnA == null && mnB == null) return null;
-  const vpA = familyA.length >= 2 ? vanishingPoint(familyA) : null; // original coords
-  const vpB = familyB.length >= 2 ? vanishingPoint(familyB) : null;
-  const axw = vpA ? vpA.x * scale : 0;
-  const ayw = vpA ? vpA.y * scale : 0;
-  const bxw = vpB ? vpB.x * scale : 0;
-  const byw = vpB ? vpB.y * scale : 0;
-
-  const gx = new cv.Mat();
-  const gy = new cv.Mat();
+function dropShortComponents(cv: any, mask: any, minLen: number): void {
+  const labels = new cv.Mat();
+  const stats = new cv.Mat();
+  const centroids = new cv.Mat();
   try {
-    cv.Sobel(gray, gx, cv.CV_32F, 1, 0, 3);
-    cv.Sobel(gray, gy, cv.CV_32F, 0, 1, 3);
-    const out = edges.clone();
-    const em = out.data as Uint8Array;
-    const gxD = gx.data32F as Float32Array;
-    const gyD = gy.data32F as Float32Array;
-    const W = out.cols;
-    const fold = (deg: number): number => (((deg % 180) + 180) % 180);
-    let kept = 0;
-    let total = 0;
-    for (let i = 0; i < em.length; i++) {
-      if (!em[i]) continue;
-      total++;
-      const px = i % W;
-      const py = (i / W) | 0;
-      const gnorm = fold(Math.atan2(gyD[i], gxD[i]) * DEG); // gradient = line normal
-      // Expected normal of family A at this pixel: line points to VP_A (finite) or has
-      // the constant parallel orientation; its normal is that direction + 90°.
-      let ok = false;
-      if (mnA != null) {
-        const nA = vpA ? fold(Math.atan2(ayw - py, axw - px) * DEG + 90) : mnA;
-        ok = angDist180(gnorm, nA) <= tolDeg;
-      }
-      if (!ok && mnB != null) {
-        const nB = vpB ? fold(Math.atan2(byw - py, bxw - px) * DEG + 90) : mnB;
-        ok = angDist180(gnorm, nB) <= tolDeg;
-      }
-      if (ok) kept++;
-      else em[i] = 0;
+    const nLab = cv.connectedComponentsWithStats(mask, labels, stats, centroids, 8, cv.CV_32S);
+    // stats: nLab × 5 (LEFT, TOP, WIDTH, HEIGHT, AREA), CV_32S.
+    const sd = stats.data32S as Int32Array;
+    const keep = new Uint8Array(nLab);
+    for (let l = 1; l < nLab; l++) {
+      if (Math.max(sd[l * 5 + cv.CC_STAT_WIDTH], sd[l * 5 + cv.CC_STAT_HEIGHT]) >= minLen) keep[l] = 1;
     }
-    return { mask: out, keptFrac: total ? kept / total : 0 };
+    const lab = labels.data32S as Int32Array;
+    const md = mask.data as Uint8Array;
+    for (let i = 0; i < md.length; i++) if (md[i] && !keep[lab[i]]) md[i] = 0;
   } finally {
-    gx.delete();
-    gy.delete();
+    labels.delete();
+    stats.delete();
+    centroids.delete();
   }
 }
 

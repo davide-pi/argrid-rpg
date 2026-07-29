@@ -535,63 +535,236 @@ body {
   color: #93b4fd;
 }
 
-/* --- Debug step viewer (numbered stage chips, top; debug mode only) --- */
+/* --- Debug pipeline graph (nodes + arrows, top; debug mode only) ------ */
 .debug-bar {
   position: absolute;
   left: 8px;
   right: 8px;
   top: calc(8px + env(safe-area-inset-top));
   z-index: 30; /* above the HUD while inspecting the pipeline */
-  display: flex;
-  gap: 6px;
-  padding: 6px;
+  padding: 6px 8px 8px;
   border-radius: 12px;
-  background: rgba(10, 14, 19, 0.82);
+  background: rgba(10, 14, 19, 0.86);
   border: 1px solid var(--line);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
   backdrop-filter: blur(8px);
+}
+.debug-bar[hidden] {
+  display: none;
+}
+.debug-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.debug-title {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.debug-collapse {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--fg);
+  border-radius: 7px;
+  cursor: pointer;
+}
+.debug-collapse .chev {
+  transition: transform 0.2s ease;
+}
+.debug-bar.collapsed .debug-collapse .chev {
+  transform: rotate(-90deg);
+}
+.debug-scroll {
+  margin-top: 6px;
   overflow-x: auto;
   overflow-y: hidden;
   -webkit-overflow-scrolling: touch;
   scrollbar-width: thin;
 }
-.debug-bar[hidden] {
+.debug-bar.collapsed .debug-scroll {
   display: none;
 }
-.debug-chip {
-  appearance: none;
-  flex: none;
-  display: inline-flex;
-  align-items: baseline;
-  gap: 5px;
-  padding: 6px 10px;
-  border-radius: 8px;
-  border: 1px solid var(--line);
-  background: var(--panel-2);
-  color: var(--muted);
-  font-size: 12px;
-  font-weight: 600;
-  white-space: nowrap;
-  cursor: pointer;
-  transition: background 0.12s, color 0.12s, border-color 0.12s;
+
+/* --- Confidence strip: per-pipeline quality + the final decision --- */
+.debug-stats {
+  display: flex;
+  gap: 6px;
+  margin-top: 7px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
 }
-.debug-chip .n {
-  font-variant-numeric: tabular-nums;
+.debug-bar.collapsed .debug-stats {
+  display: none;
+}
+.pstat {
+  flex: 0 0 auto;
+  min-width: 98px;
+  padding: 5px 8px 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+.pstat-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.pstat-name {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.pstat-val {
+  font-size: 12px;
   font-weight: 700;
   color: var(--fg);
-  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
 }
-.debug-chip:hover {
+.pstat-bar {
+  display: block;
+  height: 4px;
+  margin-top: 5px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.09);
+  overflow: hidden;
+}
+.pstat-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: #6b7d92;
+  transition: width 0.2s ease;
+}
+/* The fit that won → accent (matches a used graph node). */
+.pstat.chosen {
+  border-color: #2f6d7a;
+  background: rgba(34, 211, 238, 0.1);
+}
+.pstat.chosen .pstat-name {
+  color: var(--accent);
+}
+.pstat.chosen .pstat-fill {
+  background: var(--accent);
+}
+/* Agreement: a cross-check between the two fits, not a fit's own quality — dashed to
+   read as a meta-metric, separated from the candidate chips. */
+.pstat-agree {
+  margin-left: 6px;
+  border-style: dashed;
+}
+.pstat-agree .pstat-fill {
+  background: #a78bfa;
+}
+/* Final decision: separated from the candidates and coloured by the reliability gate. */
+.pstat-final {
+  margin-left: 6px;
+  border-left-width: 3px;
+}
+.pstat-final.ok {
+  border-color: #2f6d7a;
+  background: rgba(34, 211, 238, 0.1);
+}
+.pstat-final.ok .pstat-name {
+  color: var(--accent);
+}
+.pstat-final.ok .pstat-fill {
+  background: var(--accent);
+}
+.pstat-final.bad {
+  border-color: #7a3b2f;
+  background: rgba(248, 113, 113, 0.08);
+}
+.pstat-final.bad .pstat-fill {
+  background: #f8776b;
+}
+.debug-graph {
+  position: relative;
+}
+.debug-arrows {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+.debug-arrows .arrow {
+  fill: none;
+  stroke: #6b7d92;
+  stroke-width: 1.5;
+}
+/* Used = on the winning path (accent). Off = a stage that never ran (faint dashed). */
+.debug-arrows .arrow.used {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+.debug-arrows .arrow.off {
+  opacity: 0.22;
+  stroke-width: 1.2;
+  stroke-dasharray: 3 3;
+}
+.debug-node {
+  position: absolute;
+  width: 62px;
+  height: 32px;
+  padding: 0 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  font-size: 10px;
+  line-height: 1.05;
+  font-weight: 600;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color 0.12s, color 0.12s, background 0.12s;
+}
+.debug-node:hover {
   background: #1f2b3b;
 }
-.debug-chip.on {
-  color: var(--accent-ink);
-  background: linear-gradient(135deg, var(--accent), #16b8d4);
-  border-color: var(--accent);
+/* USED: on the winning path — highlighted. */
+.debug-node.used {
+  color: var(--fg);
+  border-color: #2f6d7a;
+  background: rgba(34, 211, 238, 0.1);
 }
-.debug-chip.on .n {
-  color: var(--accent-ink);
-  opacity: 0.85;
+/* OFF: the stage never ran — deactivated, shown (with arrows) but not clickable. */
+.debug-node.off,
+.debug-node:disabled {
+  opacity: 0.38;
+  border-style: dashed;
+  cursor: default;
+}
+.debug-node:disabled:hover {
+  background: var(--panel-2);
+}
+/* Selected (for the canvas preview) — a strong accent ring, on top of any state. */
+.debug-node.on {
+  color: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+.debug-node.no-img {
+  cursor: default;
 }
 
 /* --- Contextual help: a single (i) button + popover (bottom-left) --- */

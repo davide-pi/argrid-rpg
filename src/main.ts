@@ -71,6 +71,9 @@ const processingPct = $<HTMLSpanElement>('processingPct');
 
 const btnCapture = $<HTMLButtonElement>('btnCapture');
 const btnRetake = $<HTMLButtonElement>('btnRetake');
+// Debug-only: load a saved photo from the gallery instead of the camera.
+const btnLoadImage = $<HTMLButtonElement>('btnLoadImage');
+const fileInput = $<HTMLInputElement>('fileInput');
 // The retake (camera) button lives in the top bar and shows only in result mode.
 const topActions = $<HTMLDivElement>('topActions');
 
@@ -100,9 +103,9 @@ const manualCollapse = $<HTMLButtonElement>('manualCollapse');
 // and the debug step viewer lets you inspect each pipeline stage.
 let debug = false;
 const debugBar = $<HTMLDivElement>('debugBar');
-// Selected debug stage: an index into lastResult.debugSteps, or === its length for the
-// final live line overlay (the default). Reset to the overlay on each detection.
-let debugStepIdx = 0;
+// Selected debug pipeline node id ('overlay' = the live line overlay, the default).
+let debugStepId = 'overlay';
+let debugCollapsed = false;
 // Floating "add" speed-dial.
 const fabWrap = $<HTMLDivElement>('fabWrap');
 const fab = $<HTMLButtonElement>('fab');
@@ -518,7 +521,7 @@ async function runDetection() {
     // user decides if it's good (they can edit it or retake); we no longer auto-hide
     // low-confidence grids behind a panel.
     applyDetectedGrid();
-    debugStepIdx = lastResult?.debugSteps?.length ?? 0; // default to the final overlay
+    debugStepId = 'overlay'; // default to the final overlay on each new detection
     if (selectedCell) {
       const [i, j] = selectedCell;
       if (!gridMap || i >= gridDims.na - 1 || j >= gridDims.nb - 1) deselectCell();
@@ -1273,28 +1276,35 @@ function reportStatus(dt: number) {
     setStatus(`${i.rawCount} linee grezze ma nessuna griglia — inquadra più da vicino`);
     return;
   }
-  const base = `Griglia ${i.detectedA}×${i.detectedB} · conf ${(i.confidence * 100).toFixed(0)}% · ${i.angleADeg.toFixed(0)}°/${i.angleBDeg.toFixed(0)}° · ${dt}ms`;
-  // On success the top-right shows the action buttons instead of a status line;
-  // only surface the (verbose) grid info while debugging.
-  setStatus(debug ? `${base} · grezze ${i.rawCount} · Hough ${i.usedHough} · edge ${i.edgePixels}` : '');
+  // On success the top-right shows the action buttons; no grid status line in the
+  // header (the debug step viewer + on-canvas labels carry the diagnostics instead).
+  void dt;
+  setStatus('');
 }
 
 // --- Drawing (photo + overlay on one canvas => perfect alignment) ------
 let edgeCanvas: HTMLCanvasElement | null = null;
 let debugStepCanvas: HTMLCanvasElement | null = null;
 
-/** True when a pipeline-stage preview (not the final overlay) is selected. Never while
- * editing a manual grid (that view needs the photo + quad). */
+/** The currently selected pipeline node, or undefined. */
+function selectedStep() {
+  return lastResult?.debugSteps?.find((s) => s.id === debugStepId);
+}
+
+/** True when a pipeline-stage preview (a node WITH an image, not the overlay) is
+ * selected. Never while editing a manual grid (that view needs the photo + quad). */
 function debugStepActive(): boolean {
-  const steps = lastResult?.debugSteps;
-  return debug && !manualActive && !!steps && debugStepIdx < steps.length;
+  if (!debug || manualActive) return false;
+  const s = selectedStep();
+  return !!(s && s.image && s.id !== 'overlay');
 }
 
 /** Blit the selected pipeline-stage preview onto the view canvas (scaled up from the
  * downscaled snapshot), with the stage name labelled top-left. */
 function drawDebugStep() {
   const r = lastResult!;
-  const step = r.debugSteps![debugStepIdx];
+  const step = selectedStep();
+  if (!step?.image) return;
   view.width = r.width;
   view.height = r.height;
   const ctx = view.getContext('2d')!;
@@ -1307,7 +1317,7 @@ function drawDebugStep() {
   ctx.imageSmoothingEnabled = true;
   const fs = Math.max(16, Math.round(r.width / 40));
   ctx.font = `700 ${fs}px system-ui, sans-serif`;
-  const label = `${debugStepIdx + 1}. ${step.label}`;
+  const label = step.label + (step.used ? '' : ' — non usato');
   const pad = fs * 0.5;
   ctx.fillStyle = 'rgba(10,14,19,0.72)';
   ctx.fillRect(pad, pad, ctx.measureText(label).width + pad * 2, fs + pad);
@@ -1316,31 +1326,192 @@ function drawDebugStep() {
   ctx.fillText(label, pad * 2, pad * 1.5);
 }
 
-/** Build the debug step chips from lastResult.debugSteps (+ a final "Overlay" chip).
- * Hidden unless debug is on, a result is shown, and we're not editing a manual grid. */
+// --- Debug pipeline graph (nodes + arrows) ------------------------------
+// Fixed layout (col, row) per node id; row 0 is the main luminance line, row 1 the
+// parallel branches (colour/chroma, morphological fallback).
+// Single root 'foto' on the left. Row 0 = luminance main line; row 1 = chromatic
+// branch; rows 2/3 = the morphological fallback, itself forked into a horizontal
+// (row 2) and vertical (row 3) line extractor that rejoin into 'morph'. All lanes
+// converge back into the luminance lane at 'overlay'.
+const GRAPH_LAYOUT: Record<string, [number, number]> = {
+  foto: [0, 1.5],
+  gray: [1, 0],
+  clahe: [2, 0],
+  blur: [3, 0],
+  canny: [4, 0],
+  edges: [5, 0],
+  clean: [6, 0],
+  oriented: [7, 0],
+  overlay: [8, 0],
+  chroma: [1, 1],
+  mridgeh: [2, 2],
+  mbinh: [3, 2],
+  mridgev: [2, 3],
+  mbinv: [3, 3],
+  morph: [4, 2.5],
+};
+const GN_W = 62;
+const GN_H = 32;
+const GN_CGAP = 30;
+const GN_RGAP = 34;
+const gnX = (col: number) => col * (GN_W + GN_CGAP);
+const gnY = (row: number) => row * (GN_H + GN_RGAP);
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+/** Highlight the currently-selected node in place (no rebuild → scroll is preserved). */
+function markSelectedNode() {
+  for (const el of Array.from(debugBar.querySelectorAll('.debug-node'))) {
+    el.classList.toggle('on', (el as HTMLElement).dataset.id === debugStepId);
+  }
+}
+
+/** Build the debug pipeline graph from lastResult.debugSteps. Hidden unless debug is
+ * on, a result is shown, and we're not editing a manual grid. Three visual states per
+ * node: USED (on the winning path, highlighted), executed-but-not-used (normal), and
+ * not executed (deactivated). Arrows follow the same three states. */
 function rebuildDebugBar() {
   const steps = lastResult?.debugSteps ?? [];
   const show = debug && showingResult && !manualActive && steps.length > 0;
   debugBar.hidden = !show;
   if (!show) return;
-  const overlayIdx = steps.length; // the final live line overlay
-  if (debugStepIdx > overlayIdx) debugStepIdx = overlayIdx;
+  if (!steps.some((s) => s.id === debugStepId)) debugStepId = 'overlay';
+  const byId = new Map(steps.map((s) => [s.id, s]));
+
+  let maxCol = 0;
+  let maxRow = 0;
+  for (const s of steps) {
+    const p = GRAPH_LAYOUT[s.id];
+    if (!p) continue;
+    maxCol = Math.max(maxCol, p[0]);
+    maxRow = Math.max(maxRow, p[1]);
+  }
+  const W = gnX(maxCol) + GN_W;
+  const H = gnY(maxRow) + GN_H;
+
+  debugBar.classList.toggle('collapsed', debugCollapsed);
   debugBar.textContent = '';
-  const mk = (idx: number, name: string) => {
+
+  // Header: title + collapse toggle.
+  const head = document.createElement('div');
+  head.className = 'debug-head';
+  head.innerHTML = '<span class="debug-title">Pipeline</span>';
+  const collapse = document.createElement('button');
+  collapse.type = 'button';
+  collapse.className = 'debug-collapse';
+  collapse.setAttribute('aria-label', 'Riduci o espandi la pipeline');
+  collapse.innerHTML =
+    '<svg class="chev" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>';
+  collapse.addEventListener('click', () => {
+    debugCollapsed = !debugCollapsed;
+    debugBar.classList.toggle('collapsed', debugCollapsed);
+  });
+  head.appendChild(collapse);
+  debugBar.appendChild(head);
+
+  // Confidence strip: each independent fit's quality + the final decision. Sits under
+  // the head; hidden when the bar is collapsed (like the graph).
+  const pipes = lastResult?.debugPipelines ?? [];
+  if (pipes.length) {
+    const pct = (c: number) => Math.round(c * 100);
+    const stats = document.createElement('div');
+    stats.className = 'debug-stats';
+    const chip = (cls: string, name: string, conf: number) => {
+      const el = document.createElement('div');
+      el.className = 'pstat ' + cls;
+      el.innerHTML =
+        `<span class="pstat-top"><span class="pstat-name">${name}</span>` +
+        `<span class="pstat-val">${pct(conf)}%</span></span>` +
+        `<span class="pstat-bar"><span class="pstat-fill" style="width:${pct(conf)}%"></span></span>`;
+      return el;
+    };
+    for (const p of pipes) stats.appendChild(chip(p.chosen ? 'chosen' : '', p.label, p.confidence));
+    // Option B: how much the two independent fits agree (a cross-check, not a fit's own
+    // quality) — shown only when comparable. Styled dashed to read as a meta-metric.
+    const agree = lastResult?.debugAgreement;
+    if (agree != null) stats.appendChild(chip('pstat-agree', 'Accordo', agree));
+    // Final decision: the chosen fit's confidence (already lifted/cut by the agreement);
+    // the reliability gate (grid drawn vs not) is conveyed by the chip's colour.
+    stats.appendChild(chip('pstat-final ' + (gridReliable ? 'ok' : 'bad'), 'Finale', lastResult?.info.confidence ?? 0));
+    debugBar.appendChild(stats);
+  }
+
+  // Scrollable graph body.
+  const scroll = document.createElement('div');
+  scroll.className = 'debug-scroll';
+  const graph = document.createElement('div');
+  graph.className = 'debug-graph';
+  graph.style.width = W + 'px';
+  graph.style.height = H + 'px';
+
+  // Connector LINES (no arrowheads — cleaner), behind the nodes. Same-row links are a
+  // straight horizontal; branch/merge links run horizontally along the SOURCE row, then
+  // a rounded right-angle turn rises into the target near its own column — so a line
+  // never cuts diagonally across a block.
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('class', 'debug-arrows');
+  svg.setAttribute('width', String(W));
+  svg.setAttribute('height', String(H));
+  const elbow = (sx: number, sy: number, ex: number, ey: number): string => {
+    if (sy === ey) return `M ${sx} ${sy} L ${ex} ${ey}`;
+    const turnX = ex - 14; // rise just before the target
+    const r = 7;
+    const dir = ey > sy ? 1 : -1;
+    return (
+      `M ${sx} ${sy} L ${turnX - r} ${sy}` +
+      ` Q ${turnX} ${sy} ${turnX} ${sy + dir * r}` +
+      ` L ${turnX} ${ey - dir * r}` +
+      ` Q ${turnX} ${ey} ${turnX + r} ${ey}` +
+      ` L ${ex} ${ey}`
+    );
+  };
+  for (const s of steps) {
+    const p = GRAPH_LAYOUT[s.id];
+    if (!p) continue;
+    const tx = gnX(p[0]);
+    const ty = gnY(p[1]) + GN_H / 2;
+    for (const inId of s.inputs) {
+      const ip = GRAPH_LAYOUT[inId];
+      if (!ip) continue;
+      const inp = byId.get(inId);
+      const sx = gnX(ip[0]) + GN_W;
+      const sy = gnY(ip[1]) + GN_H / 2;
+      const path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('d', elbow(sx, sy, tx, ty));
+      const bothUsed = !!(s.used && inp?.used);
+      const bothExec = s.executed && !!inp?.executed;
+      path.setAttribute('class', bothUsed ? 'arrow used' : bothExec ? 'arrow' : 'arrow off');
+      svg.appendChild(path);
+    }
+  }
+  graph.appendChild(svg);
+
+  // Nodes.
+  for (const s of steps) {
+    const p = GRAPH_LAYOUT[s.id];
+    if (!p) continue;
     const b = document.createElement('button');
     b.type = 'button';
-    b.className = 'debug-chip' + (idx === debugStepIdx ? ' on' : '');
-    b.innerHTML = `<span class="n">${String(idx + 1).padStart(2, '0')}</span>${name}`;
+    b.dataset.id = s.id;
+    b.disabled = !s.executed; // a skipped stage is shown (with its arrows) but not clickable
+    b.className =
+      'debug-node' +
+      (s.id === debugStepId ? ' on' : '') +
+      (!s.executed ? ' off' : s.used ? ' used' : '') +
+      (s.image ? '' : ' no-img');
+    b.style.left = gnX(p[0]) + 'px';
+    b.style.top = gnY(p[1]) + 'px';
+    b.textContent = s.label;
+    b.title = !s.executed ? s.label + ' — non eseguito' : s.used ? s.label : s.label + ' — non usato';
     b.addEventListener('click', () => {
-      debugStepIdx = idx;
-      for (const c of Array.from(debugBar.children)) c.classList.remove('on');
-      b.classList.add('on');
+      debugStepId = s.id;
+      markSelectedNode(); // update selection in place — do NOT rebuild (keeps scroll)
       draw();
     });
-    return b;
-  };
-  steps.forEach((s, i) => debugBar.appendChild(mk(i, s.label)));
-  debugBar.appendChild(mk(overlayIdx, 'Overlay')); // the live line overlay (default)
+    graph.appendChild(b);
+  }
+
+  scroll.appendChild(graph);
+  debugBar.appendChild(scroll);
 }
 
 function draw() {
@@ -2647,6 +2818,7 @@ brand.addEventListener('click', () => {
   if (brandTaps.length >= 3) {
     brandTaps = [];
     debug = !debug;
+    btnLoadImage.hidden = !debug; // the gallery-load button is a debug affordance
     setStatus(debug ? 'Debug attivo' : 'Debug disattivato');
     if (lastCapture) runDetection();
   }
@@ -2710,6 +2882,30 @@ function retake() {
 
 // --- Wiring ------------------------------------------------------------
 btnCapture.addEventListener('click', capture);
+// Debug-only: pick a saved photo from the gallery and analyse it like a capture.
+btnLoadImage.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+  const file = fileInput.files?.[0];
+  fileInput.value = ''; // let the same file be picked again
+  if (!file || !debug) return; // debug-only, even if debug was toggled off mid-pick
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = () => {
+    URL.revokeObjectURL(url);
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth;
+    c.height = img.naturalHeight;
+    c.getContext('2d')!.drawImage(img, 0, 0);
+    if (camera.isRunning) camera.stop();
+    video.hidden = true;
+    processImage(c);
+  };
+  img.onerror = () => {
+    URL.revokeObjectURL(url);
+    setStatus('Immagine non valida');
+  };
+  img.src = url;
+});
 // Fallback for a denied/failed camera: on the camera screen (no result yet),
 // tapping the stage (re)starts it. There is no dedicated Camera button.
 stage.addEventListener('click', () => {

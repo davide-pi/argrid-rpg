@@ -610,7 +610,6 @@ body {
   gap: 12px;
   font-size: 11px;
   line-height: 1.7;
-  white-space: pre;
 }
 .debug-log-k {
   color: var(--muted);
@@ -619,14 +618,37 @@ body {
   color: var(--fg);
   font-weight: 700;
 }
-.debug-log-row:last-child {
-  margin-top: 3px;
-  padding-top: 4px;
+/* Group header: the pipeline name + its subtotal. */
+.debug-log-group {
+  margin-top: 4px;
+}
+.debug-log-group:first-child {
+  margin-top: 0;
+}
+.debug-log-group .debug-log-k {
+  color: var(--fg);
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+/* Items sit under their group header, indented. */
+.debug-log-row.indent {
+  padding-left: 12px;
+}
+.debug-log-row.indent .debug-log-v {
+  font-weight: 600;
+}
+/* Grand total. */
+.debug-log-total {
+  margin-top: 5px;
+  padding-top: 5px;
   border-top: 1px solid var(--line);
 }
-.debug-log-row:last-child .debug-log-k,
-.debug-log-row:last-child .debug-log-v {
+.debug-log-total .debug-log-k,
+.debug-log-total .debug-log-v {
   color: var(--accent);
+  font-weight: 700;
 }
 .debug-scroll {
   margin-top: 6px;

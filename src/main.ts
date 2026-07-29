@@ -1531,45 +1531,49 @@ function rebuildDebugBar() {
   scroll.appendChild(graph);
   debugBar.appendChild(scroll);
 
-  // Timing log (toggled by the scroll-text button): every stage's compute time + total.
+  // Timing log (toggled by the scroll-text button): compute time per stage, grouped by
+  // pipeline (shared prep → luminance → morphology) with a per-group subtotal + grand total.
   const timings = lastResult?.debugTimings;
   if (debugLogOpen && timings && !debugCollapsed) {
     const ms = (v: number) => `${Math.round(v)} ms`;
-    // Ordered so it reads top-to-bottom like the pipeline.
-    const order: [string, string][] = [
-      ['gray', 'Grigio'],
-      ['clahe', 'Contrasto'],
-      ['blur', 'Sfocatura'],
-      ['canny', 'Canny'],
-      ['chroma', 'Cromatica'],
-      ['clean', 'Pulizia texture'],
-      ['fft', 'Prior FFT'],
-      ['houghMain', 'Hough luminanza'],
-      ['oriented', 'Orientati'],
-      ['morphEnhance', 'Morfologia · estrazione'],
-      ['morphHough', 'Morfologia · Hough'],
+    const groups: { title: string; items: [string, string][] }[] = [
+      {
+        title: 'Preparazione',
+        items: [
+          ['gray', 'Grigio'],
+          ['clahe', 'Contrasto'],
+          ['blur', 'Sfocatura'],
+          ['canny', 'Canny'],
+          ['chroma', 'Cromatica'],
+          ['clean', 'Pulizia texture'],
+          ['fft', 'Prior FFT'],
+        ],
+      },
+      { title: 'Luminanza', items: [['houghMain', 'Hough'], ['oriented', 'Orientati']] },
+      { title: 'Morfologia', items: [['morphEnhance', 'Estrazione'], ['morphHough', 'Hough']] },
     ];
-    const rows: [string, string][] = [];
+    let html = '';
     let total = 0;
-    for (const [key, label] of order) {
-      const v = timings[key];
-      if (v == null) continue;
-      total += v;
-      rows.push([label, ms(v)]);
+    for (const g of groups) {
+      const present = g.items.filter(([k]) => timings[k] != null);
+      if (!present.length && !(g.title === 'Morfologia' && timings.morphAngles != null)) continue;
+      const sub = present.reduce((s, [k]) => s + (timings[k] ?? 0), 0);
+      total += sub;
+      html +=
+        `<div class="debug-log-row debug-log-group"><span class="debug-log-k">${g.title}</span>` +
+        `<span class="debug-log-v">${ms(sub)}</span></div>`;
+      for (const [k, label] of present) {
+        html += `<div class="debug-log-row indent"><span class="debug-log-k">${label}</span><span class="debug-log-v">${ms(timings[k])}</span></div>`;
+      }
+      if (g.title === 'Morfologia' && timings.morphAngles != null) {
+        const n = timings.morphAngles;
+        html += `<div class="debug-log-row indent"><span class="debug-log-k">Angoli provati</span><span class="debug-log-v">${n}</span></div>`;
+      }
     }
-    if (timings.morphAngles != null) {
-      const n = timings.morphAngles;
-      rows.push(['Morfologia · angoli', `${n} ${n === 1 ? 'angolo' : 'angoli'}`]);
-    }
-    rows.push(['Totale misurato', ms(total)]);
+    html += `<div class="debug-log-row debug-log-total"><span class="debug-log-k">Totale misurato</span><span class="debug-log-v">${ms(total)}</span></div>`;
     const log = document.createElement('div');
     log.className = 'debug-log';
-    log.innerHTML = rows
-      .map(
-        ([k, v]) =>
-          `<div class="debug-log-row"><span class="debug-log-k">${k}</span><span class="debug-log-v">${v}</span></div>`,
-      )
-      .join('');
+    log.innerHTML = html;
     debugBar.appendChild(log);
   }
 }

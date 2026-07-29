@@ -438,6 +438,21 @@ export function* detectGridFromMatSteps(
     yield { frac: 0.2, label: 'Rilevamento dei bordi…' };
     cannyEdges = new cv.Mat();
     timed('canny', () => cv.Canny(blurred, cannyEdges, cannyLow, cannyHigh));
+    // If the LUMINANCE Canny is flooded (a textured surface), it's mostly noise — re-run
+    // with higher thresholds so only the strong edges (the grid) survive. We remember the
+    // flood so the downstream noise defences (cleanup, morph preference) still engage even
+    // though the map is now sparse. The morphology covers any faint grid this drops.
+    const lumFlooded = cv.countNonZero(cannyEdges) / (cannyEdges.rows * cannyEdges.cols) > NOISE_EDGE_FRAC;
+    if (lumFlooded) {
+      timed('canny', () => {
+        cv.Canny(
+          blurred,
+          cannyEdges,
+          Math.max(1, Math.round(cannyLow * NOISE_CANNY_BOOST)),
+          Math.max(1, Math.round(cannyHigh * NOISE_CANNY_BOOST)),
+        );
+      });
+    }
     snap('canny', cannyEdges);
 
     // Chromatic edges: a grid that differs from its background in HUE but not in
@@ -466,7 +481,7 @@ export function* detectGridFromMatSteps(
     // dirt/cork/fabric texture floods it. This gates BOTH the cleanup below and (later)
     // whether we distrust a disagreeing luminance fit in favour of the morphology.
     const edgeDensity = cv.countNonZero(cannyEdges) / (cannyEdges.rows * cannyEdges.cols);
-    const noisy = edgeDensity > NOISE_EDGE_FRAC;
+    const noisy = lumFlooded || edgeDensity > NOISE_EDGE_FRAC; // stay noisy even after the boost thinned it
 
     // Texture cleaning: drop the short components (sand/dirt speckle) so Hough sees the
     // long grid lines instead of a web of tiny fragments. ONLY on a noisy frame — on a
@@ -555,7 +570,7 @@ export function* detectGridFromMatSteps(
       morphRan = true;
       let alt = timed('morphHough', () => houghToGrid(cv, morphEdges, work, scale, W0, H0, params, orient));
       if (gridStrength(alt) < MORPH_STRONG) {
-        for (let a = -45; a <= 45; a += MORPH_SWEEP_STEP) {
+        for (const a of deskewSweepAngles(off, orient != null)) {
           if (Math.abs(a - primary) < MORPH_SWEEP_STEP / 2) continue; // ~already tried
           morphAngles++;
           const m = timed('morphEnhance', () => enhanceGridLines(cv, gray, undefined, a));
@@ -886,6 +901,10 @@ const MORPH_SWEEP_STEP = 7.5;
  * the short-component cleanup is applied, and a disagreeing main fit is distrusted. Kept
  * high enough that a clean grid (thin, sparse edges) stays below it. */
 const NOISE_EDGE_FRAC = 0.08;
+/** When the raw luminance Canny is flooded (density above the frac), re-run it with the
+ * thresholds scaled by this, keeping only the strong edges — a textured surface's weak
+ * edges drop out while the sharper grid lines survive. */
+const NOISE_CANNY_BOOST = 1.6;
 /** On a noisy frame, distrust the luminance fit and prefer the (noise-robust) morphology
  * when the two DISAGREE below this and the morph fit is at least this solid. */
 const NOISE_AGREE_MAX = 0.4;
@@ -898,6 +917,25 @@ const residualTilt = (deg: number): number => {
   if (r > 45) r -= 90; // [-45,45]
   return r;
 };
+
+/** Deskew angles to try when the first morphology guess is weak, ordered most-likely
+ * first (for early-out). With a reliable orientation prior we probe only a NARROW window
+ * around it — BOTH signs cover the ± ambiguity of the tilt, ±step a small prior error —
+ * which is far fewer passes than the full [-45,45] sweep used when there's no prior. */
+function deskewSweepAngles(off: number, hasPrior: boolean): number[] {
+  const step = MORPH_SWEEP_STEP;
+  const out: number[] = [];
+  const add = (a: number) => {
+    if (a >= -45 && a <= 45 && !out.some((x) => Math.abs(x - a) < step / 2)) out.push(a);
+  };
+  if (hasPrior) {
+    for (const base of [-off, off]) for (const d of [base, base - step, base + step]) add(d);
+    add(0);
+  } else {
+    for (let a = -45; a <= 45; a += step) add(a);
+  }
+  return out;
+}
 
 /** Morphological line extractor for noisy / low-contrast photos (e.g. a grid drawn
  * on a dirt or cork texture) where Canny drowns in speckle. Isotropic texture is
@@ -998,6 +1036,9 @@ function enhanceGridLines(cv: any, gray: any, snap?: (id: string, mat: any) => v
   snap?.('mbinv', bV);
   let mask = new cv.Mat();
   cv.max(bH, bV, mask);
+  // Drop the isolated small blobs the ridge left behind (residual texture noise) before
+  // dilating — a grid line survives as a long component, a speck doesn't.
+  dropShortComponents(cv, mask, shortLen(mask));
   const d3 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3));
   cv.dilate(mask, mask, d3);
 

@@ -1315,7 +1315,7 @@ function debugStepActive(): boolean {
   if (!debug || manualActive) return false;
   const s = selectedStep();
   // The Hough nodes have no snapshot image — they're drawn live (raw lines over the photo).
-  const houghNode = s?.id === 'houghLum' || s?.id === 'houghChroma' || s?.id === 'houghMorph';
+  const houghNode = s?.id === 'houghLum' || s?.id === 'houghMorph';
   return !!(s && (s.image || houghNode) && s.id !== 'overlay');
 }
 
@@ -1329,15 +1329,13 @@ function drawDebugStep() {
   view.height = r.height;
   const ctx = view.getContext('2d')!;
   let labelText: string;
-  if (step.id === 'houghLum' || step.id === 'houghChroma' || step.id === 'houghMorph') {
+  if (step.id === 'houghLum' || step.id === 'houghMorph') {
     // Raw Hough lines (before the lattice fit) over the photo — one node per pipeline, so
     // you can compare what each Hough detected vs the fitted grid (overlay).
     const src =
-      step.id === 'houghChroma'
-        ? { lines: r.debugRawChroma, color: 'rgba(52, 211, 153, 0.9)', name: 'Cromatica' }
-        : step.id === 'houghMorph'
-          ? { lines: r.debugRawMorph, color: 'rgba(167, 139, 250, 0.9)', name: 'Morfologica' }
-          : { lines: r.debugRawLum, color: 'rgba(34, 211, 238, 0.85)', name: 'Luminanza' };
+      step.id === 'houghMorph'
+        ? { lines: r.debugRawMorph, color: 'rgba(167, 139, 250, 0.9)', name: 'Morfologica' }
+        : { lines: r.debugRawLum, color: 'rgba(34, 211, 238, 0.85)', name: 'Luminanza' };
     const lines = src.lines ?? [];
     ctx.drawImage(lastCapture!, 0, 0, r.width, r.height);
     ctx.strokeStyle = src.color;
@@ -1373,19 +1371,14 @@ function drawDebugStep() {
 }
 
 // --- Debug pipeline graph (nodes + arrows) ------------------------------
-// Fixed layout (col, row) per node id; row 0 is the main luminance line, row 1 the
-// parallel branches (colour/chroma, morphological fallback).
-// Single root 'foto' on the left. Row 0 = luminance main line; row 1 = chromatic
-// branch; rows 2/3 = the morphological fallback, itself forked into a horizontal
-// (row 2) and vertical (row 3) line extractor that rejoin into 'morph'. All lanes
-// converge back into the luminance lane at 'overlay'.
-// Chromatic branch on top (row 0), the luminance main line in the MIDDLE (row 1), the
-// morphological fork at the bottom (rows 2/3). Each pipeline ends in its own Hough node;
-// both converge into the final grid (overlay), vertically centred on the right.
+// Fixed layout (col, row) per node id. Single root 'foto' on the left. Row 0 = the colour-edge
+// extraction ('chroma'), which is OR'd INTO the luminance edges (it has no Hough of its own). Row 1
+// = the luminance main line, ending in its Hough node ('houghLum'). Rows 2/3 = the morphological
+// fallback, forked into a horizontal (row 2) and vertical (row 3) line extractor that rejoin into
+// 'morph'/'houghMorph'. Both Hough pipelines converge into the final grid ('overlay') on the right.
 const GRAPH_LAYOUT: Record<string, [number, number]> = {
   foto: [0, 1.5],
   chroma: [1, 0],
-  houghChroma: [8, 0],
   gray: [1, 1],
   clahe: [2, 1],
   blur: [3, 1],
@@ -1582,7 +1575,7 @@ function rebuildDebugBar() {
       'debug-node' +
       (s.id === debugStepId ? ' on' : '') +
       (!s.executed ? ' off' : s.used ? ' used' : '') +
-      (s.image || s.id === 'houghLum' || s.id === 'houghChroma' || s.id === 'houghMorph'
+      (s.image || s.id === 'houghLum' || s.id === 'houghMorph'
         ? ''
         : ' no-img'); // hough drawn live
     b.style.left = gnX(p[0]) + 'px';
@@ -1624,8 +1617,8 @@ function rebuildDebugBar() {
           { key: 'houghMain', label: 'Hough' },
         ],
       },
-      // Chroma is its own independent candidate (edge extraction + its own Hough).
-      { title: 'Cromatica', items: [{ key: 'chroma', label: 'Estrazione' }, { key: 'chromaHough', label: 'Hough' }] },
+      // Colour edges are extracted then OR'd into the luminance edges (no separate Hough).
+      { title: 'Colore', items: [{ key: 'chroma', label: 'Estrazione' }] },
       {
         title: 'Morfologia',
         items: [

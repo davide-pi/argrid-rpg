@@ -130,7 +130,6 @@ export interface GridResult {
   debugAgreement?: number | null; // 0..1 main↔morph agreement, or null (debug only)
   debugTimings?: Record<string, number>; // ms per phase + counts, for the debug log (debug only)
   debugRawLum?: Line2[]; // raw Hough lines of the luminance fit (debug only)
-  debugRawChroma?: Line2[]; // raw Hough lines of the chromatic fit (debug only)
   debugRawMorph?: Line2[]; // raw Hough lines of the morphology fit (debug only)
   // Line attrition through the fit stages, per family [A,B] (debug/diagnostic only): how many
   // lines survive raw→angle-split→duplicate-merge→VP-concurrency→regular-lattice. Pinpoints

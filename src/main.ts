@@ -109,13 +109,6 @@ const debugBar = $<HTMLDivElement>('debugBar');
 let debugStepId = 'overlay';
 let debugCollapsed = false;
 let debugLogOpen = false; // the timing log panel (scroll-text button) is showing
-// EXPERIMENTAL detector flags (default OFF): overrides merged into currentParams(), toggled from the
-// debug panel's flag row (tap = flip + re-detect) or the console (`__argrid.setFlags({...})`). Lets us
-// measure a flag on real captures without a rebuild. Empty ⇒ pure DEFAULT_PARAMS.
-const flagOverrides: Partial<DetectorParams> = {};
-const DEBUG_FLAGS: { key: keyof DetectorParams; label: string }[] = [
-  { key: 'ridgeHysteresis', label: 'Isteresi' },
-];
 // Floating "add" speed-dial.
 const fabWrap = $<HTMLDivElement>('fabWrap');
 const fab = $<HTMLButtonElement>('fab');
@@ -351,9 +344,8 @@ function removeActiveArea() {
 function currentParams(): DetectorParams {
   // Reconstruct the full 2-D lattice and rebuild every row/column (occluded ones
   // included) — with the vanishing-point + rectification model these are
-  // reliable, so the complete grid is shown. `flagOverrides` layers any experimental
-  // flags toggled in the debug panel / console on top (empty in normal use).
-  return { ...DEFAULT_PARAMS, fillGrid: true, ...flagOverrides };
+  // reliable, so the complete grid is shown.
+  return { ...DEFAULT_PARAMS, fillGrid: true };
 }
 
 const mb = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1);
@@ -405,14 +397,6 @@ function boot() {
           effectiveAngle: () => effectiveAngle(),
           // Current detection state, for test assertions.
           state: () => ({ gridReliable, gridDims: { ...gridDims }, showingResult }),
-          // Experimental-flag overrides (same store the debug panel's chips use): read the
-          // current overrides, or set some and re-detect on the last capture.
-          flags: () => ({ ...flagOverrides }),
-          setFlags: (o: Partial<DetectorParams>) => {
-            Object.assign(flagOverrides, o);
-            if (lastCapture) runDetection();
-            return { ...flagOverrides };
-          },
         };
       }
       btnCapture.disabled = false;
@@ -1493,29 +1477,6 @@ function rebuildDebugBar() {
   actions.appendChild(collapse);
   head.appendChild(actions);
   debugBar.appendChild(head);
-
-  // Experimental-flag toggles: one tappable chip per flag (on = amber). Tapping flips the
-  // override and re-runs detection on the current capture, so a flag can be measured live.
-  // Shown in both views, hidden when collapsed. Needs a capture to re-detect against.
-  if (!debugCollapsed) {
-    const flags = document.createElement('div');
-    flags.className = 'dbg-flags';
-    for (const f of DEBUG_FLAGS) {
-      const on = flagOverrides[f.key] ?? DEFAULT_PARAMS[f.key];
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'dbg-flag' + (on ? ' on' : '');
-      b.textContent = f.label;
-      b.title = `${String(f.key)} = ${on ? 'on' : 'off'} — tocca per invertire e ri-analizzare`;
-      b.addEventListener('click', () => {
-        (flagOverrides as Record<string, boolean>)[f.key] = !on;
-        if (lastCapture) runDetection();
-        else rebuildDebugBar();
-      });
-      flags.appendChild(b);
-    }
-    debugBar.appendChild(flags);
-  }
 
   const pct = (c: number) => Math.round(c * 100);
   const chip = (cls: string, name: string, conf: number) => {

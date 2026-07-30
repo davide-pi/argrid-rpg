@@ -63,11 +63,6 @@ export interface DetectorParams {
    * combPitch) that replaces robustCell+coarsenPitch and climbs out of a sub-pitch seed; and
    * (3c) a perspective-safe degeneracy test (comb fillRatio) + rectified-pitch squareness. */
   periodicPitch: boolean;
-  /** Ridge binarisation (`binDir`): evaluate a DOUBLE-threshold HYSTERESIS on the ridge instead of the
-   * (now baked-in) single local threshold. Keeps the STRONG ridge pixels (> local mean + K_HI·σ) plus
-   * the WEAK ones (> local mean + K_LO·σ) that are CONNECTED to a strong pixel — recovering faint-but-
-   * continuous grid lines while still rejecting isolated texture. Default off — evaluation flag. */
-  ridgeHysteresis: boolean;
 }
 
 export const DEFAULT_PARAMS: DetectorParams = {
@@ -83,7 +78,6 @@ export const DEFAULT_PARAMS: DetectorParams = {
   orientGate: true,
   edgeClean: true,
   periodicPitch: false,
-  ridgeHysteresis: false,
 };
 
 /** A line as normal form: nx*x + ny*y = d, with (nx,ny) a unit vector. */
@@ -688,14 +682,14 @@ export function* detectGridFromMatSteps(
       const primary = Math.abs(off) > 12 ? -off : 0;
       let bestDeskew = primary;
       let morphAngles = 1;
-      morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, primary, timed, params.ridgeHysteresis));
+      morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, primary, timed));
       morphRan = true;
       let alt = timed('morphHough', () => houghToGrid(cv, morphEdges, work, scale, W0, H0, params, orient));
       if (gridStrength(alt) < MORPH_STRONG) {
         for (const a of deskewSweepAngles(off, orient != null)) {
           if (Math.abs(a - primary) < MORPH_SWEEP_STEP / 2) continue; // ~already tried
           morphAngles++;
-          const m = timed('morphEnhance', () => enhanceGridLines(cv, gray, undefined, a, undefined, params.ridgeHysteresis));
+          const m = timed('morphEnhance', () => enhanceGridLines(cv, gray, undefined, a, undefined));
           const f = timed('morphHough', () => houghToGrid(cv, m, work, scale, W0, H0, params, orient));
           if (gridStrength(f) > gridStrength(alt)) {
             morphEdges.delete();
@@ -710,7 +704,7 @@ export function* detectGridFromMatSteps(
         // Re-run the winning angle WITH snap so the graph shows its (deskewed) stages.
         if (bestDeskew !== primary) {
           morphEdges.delete();
-          morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, bestDeskew, timed, params.ridgeHysteresis));
+          morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, bestDeskew, timed));
         }
       }
       timings.morphAngles = morphAngles;
@@ -1193,11 +1187,6 @@ function deskewSweepAngles(off: number, hasPrior: boolean): number[] {
  * to oblique-but-flat shots. (Strong perspective, where lines converge, still can't be
  * straightened by a single angle.) `snap` (optional) exposes the intermediate H/V
  * stages to the debug graph. */
-/** Ridge hysteresis (`binDir`, ridgeHysteresis) bracket around the fixed local threshold's 1σ:
- * a pixel is STRONG above local mean + RIDGE_HYST_HI·σ and WEAK (kept only if connected to a strong
- * one) above local mean + RIDGE_HYST_LO·σ. The 1σ single-threshold sits between the two. */
-const RIDGE_HYST_HI = 1.5;
-const RIDGE_HYST_LO = 0.5;
 function rotateMat(cv: any, src: any, deg: number, interp: number, border: number): any {
   const center = new cv.Point(src.cols / 2, src.rows / 2);
   const M = cv.getRotationMatrix2D(center, deg, 1);
@@ -1212,7 +1201,6 @@ function enhanceGridLines(
   snap?: (id: string, mat: any) => void,
   deskewDeg = 0,
   time?: <X>(key: string, fn: () => X) => X,
-  hysteresis = false,
 ): any {
   // Optional per-sub-node timing (debug): wraps the ridge / line-binarisation phases so the
   // graph's morph nodes (Cresta/Linee H·V) each get a measured time. Identity when absent.
@@ -1288,46 +1276,12 @@ function enhanceGridLines(
     // Scalar-as-Mat binding this OpenCV.js build rejects) and keeps r's 8-bit depth.
     const lm = new cv.Mat();
     cv.boxFilter(r, lm, -1, new cv.Size(LC, LC)); // local mean (ridge is 8-bit → ddepth -1)
-    if (hysteresis) {
-      // Hysteresis (Canny-style) on the ridge (ridgeHysteresis, evaluation): keep the STRONG pixels
-      // (> local mean + K_HI·σ) PLUS the WEAK pixels (> local mean + K_LO·σ) that are CONNECTED to a
-      // strong one — recovering a faint-but-continuous ridge without passing isolated texture (weak
-      // and connected to nothing strong). `hi` is the strong mask; `b` is the weak (LOW) mask; a
-      // connected component of `b` is kept only if it contains a strong pixel, else it's zeroed.
-      const thrHi = new cv.Mat();
-      lm.convertTo(thrHi, -1, 1, RIDGE_HYST_HI * gSig); // local mean + K_HI·σ
-      const hi = new cv.Mat();
-      cv.compare(r, thrHi, hi, cv.CMP_GT); // hi = STRONG mask
-      const thrLo = new cv.Mat();
-      lm.convertTo(thrLo, -1, 1, RIDGE_HYST_LO * gSig); // local mean + K_LO·σ
-      cv.compare(r, thrLo, b, cv.CMP_GT); // b = LOW (weak) mask
-      // Same connectedComponents flavour/ltype as dropShortComponents (proven in this OpenCV.js
-      // build); stats/centroids are unused here but required by the signature.
-      const labels = new cv.Mat();
-      const stats = new cv.Mat();
-      const centroids = new cv.Mat();
-      const ncc = cv.connectedComponentsWithStats(b, labels, stats, centroids, 8, cv.CV_32S);
-      const lab = labels.data32S as Int32Array;
-      const hd = hi.data as Uint8Array;
-      const keep = new Uint8Array(ncc);
-      for (let i = 0; i < lab.length; i++) if (hd[i]) keep[lab[i]] = 1; // label touches a strong pixel
-      const bd = b.data as Uint8Array;
-      for (let i = 0; i < bd.length; i++) bd[i] = keep[lab[i]] ? 255 : 0;
-      thrHi.delete();
-      hi.delete();
-      thrLo.delete();
-      labels.delete();
-      stats.delete();
-      centroids.delete();
-    } else {
-      // Fixed single-level local threshold (ex ridgeLocalThresh, now the baked-in default): keep a
-      // pixel when its ridge response exceeds the LOCAL mean by ~1σ. A flat gridless region has
-      // r≈local mean, so nothing passes there.
-      const thr = new cv.Mat();
-      lm.convertTo(thr, -1, 1, gSig); // thr = local mean + 1σ (same type as r → compare is valid)
-      cv.compare(r, thr, b, cv.CMP_GT); // b = 255 where r > thr, else 0
-      thr.delete();
-    }
+    // Keep a pixel when its ridge response exceeds the LOCAL mean by ~1σ. A flat gridless region
+    // has r≈local mean, so nothing passes there.
+    const thr = new cv.Mat();
+    lm.convertTo(thr, -1, 1, gSig); // thr = local mean + 1σ (same type as r → compare is valid)
+    cv.compare(r, thr, b, cv.CMP_GT); // b = 255 where r > thr, else 0
+    thr.delete();
     lm.delete();
     // Open ALONG the line to drop residual blobs, then close ALONG the line to bridge the gaps the
     // speckle left — turning broken faint lines into continuous ones so Hough forms one strong peak.

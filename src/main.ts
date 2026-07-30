@@ -632,7 +632,6 @@ function updateResultChrome() {
     fabWrap.hidden = !gridReliable;
     if (!gridReliable) {
       hud.hidden = true;
-      infoOpen = true; // auto-reveal "no grid — use ✎ or ↺"
     }
   }
   updateEditGridButton();
@@ -895,7 +894,6 @@ function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
   drawEndpointDrag = null;
   manualPointerPos.clear();
   pinchState = null;
-  infoOpen = true; // reveal the editing instructions right away
   applyManualBarMode();
   showManualBar(true);
   rebuildDebugBar(); // hide the debug step bar while editing a manual grid
@@ -2592,7 +2590,6 @@ function setPlaceMode(m: 'ally' | 'enemy' | 'area' | 'none') {
   fabWrap.classList.remove('open'); // a choice closes the speed-dial
   if (placeMode !== 'none') {
     deselectCell();
-    infoOpen = true; // auto-reveal what to tap for this placement mode
   } else {
     setStatus('');
   }

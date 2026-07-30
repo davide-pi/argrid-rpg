@@ -63,6 +63,10 @@ export interface DetectorParams {
    * combPitch) that replaces robustCell+coarsenPitch and climbs out of a sub-pitch seed; and
    * (3c) a perspective-safe degeneracy test (comb fillRatio) + rectified-pitch squareness. */
   periodicPitch: boolean;
+  /** Ridge extractor: use a LOCAL adaptive threshold (per-pixel: local mean + σ, floored at the
+   * global mean+0.5σ) instead of the single global `mean+K·σ`. A faint grid on a textured surface
+   * raises the GLOBAL σ so the global threshold drowns it; a local threshold recovers it. */
+  ridgeLocalThresh: boolean;
 }
 
 export const DEFAULT_PARAMS: DetectorParams = {
@@ -78,6 +82,7 @@ export const DEFAULT_PARAMS: DetectorParams = {
   orientGate: true,
   edgeClean: true,
   periodicPitch: false,
+  ridgeLocalThresh: false,
 };
 
 /** A line as normal form: nx*x + ny*y = d, with (nx,ny) a unit vector. */
@@ -484,7 +489,6 @@ export function* detectGridFromMatSteps(
   let blurred: any = null;
   let cannyEdges: any = null;
   let morphEdges: any = null;
-  let chromaMask: any = null; // chroma-only edges, kept alive for the independent chroma fit
   // Debug-only pipeline-graph previews (populated when wantEdges). Each stage's Mat is
   // snapped while still live (they're freed before we return); the graph is assembled
   // at the end from these previews + the applied/discarded flags below.
@@ -575,11 +579,12 @@ export function* detectGridFromMatSteps(
       snap('chroma', chroma); // the colour-only edges (what chroma actually found)
       chromaExecuted = true;
       chromaContributed = cv.countNonZero(chroma) > 0; // empty on a tonal (non-hue) grid
-      // OR into the luminance edges (recall: a faint grid split between tone and hue) AND
-      // keep the chroma-only mask alive for an INDEPENDENT chroma candidate fit below.
+      // Fold the colour-only edges straight INTO the luminance edge map: a grid that differs from
+      // its background in HUE, not brightness (brown-on-earth), leaves no luminance edge, so the
+      // MAIN Hough gains those lines. There is NO separate chroma candidate — it never won and was
+      // always degenerate; the colour now lives inside the luminance flow (per the user's design).
       timed('edges', () => cv.bitwise_or(cannyEdges, chroma, cannyEdges));
-      if (chromaContributed) chromaMask = chroma;
-      else chroma.delete();
+      chroma.delete();
     }
 
     // Focus gating (off by default): the grid sits in the focal plane, so it is
@@ -659,17 +664,8 @@ export function* detectGridFromMatSteps(
     const mainFit = result; // luminance path result (incl. oriented recovery), for the panel
 
     // --- Chromatic candidate ------------------------------------------------
-    // An INDEPENDENT fit on the colour-only (Lab a/b) edges. A grid that differs from its
-    // background in hue but not brightness is invisible to the luminance Canny yet obvious
-    // here, so this is a genuine third opinion for the consensus — not just OR'd in for
-    // recall (that still happens too). Only when chroma actually carried edges.
-    let chromaFit: GridResult | null = null;
-    if (chromaMask) {
-      chromaFit = timed('chromaHough', () => houghToGrid(cv, chromaMask, work, scale, W0, H0, params, orient));
-      chromaMask.delete();
-      chromaMask = null;
-    }
-
+    // (The chroma candidate was removed: the colour-only edges are folded into the luminance edge
+    // map above, so the MAIN fit already sees them — a separate chroma Hough added no value.)
     let morphFit: GridResult | null = null;
     let agreement: number | null = null; // winner's consensus agreement, set by fuseGrids below
 
@@ -691,14 +687,14 @@ export function* detectGridFromMatSteps(
       const primary = Math.abs(off) > 12 ? -off : 0;
       let bestDeskew = primary;
       let morphAngles = 1;
-      morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, primary, timed));
+      morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, primary, timed, params.ridgeLocalThresh));
       morphRan = true;
       let alt = timed('morphHough', () => houghToGrid(cv, morphEdges, work, scale, W0, H0, params, orient));
       if (gridStrength(alt) < MORPH_STRONG) {
         for (const a of deskewSweepAngles(off, orient != null)) {
           if (Math.abs(a - primary) < MORPH_SWEEP_STEP / 2) continue; // ~already tried
           morphAngles++;
-          const m = timed('morphEnhance', () => enhanceGridLines(cv, gray, undefined, a));
+          const m = timed('morphEnhance', () => enhanceGridLines(cv, gray, undefined, a, undefined, params.ridgeLocalThresh));
           const f = timed('morphHough', () => houghToGrid(cv, m, work, scale, W0, H0, params, orient));
           if (gridStrength(f) > gridStrength(alt)) {
             morphEdges.delete();
@@ -713,7 +709,7 @@ export function* detectGridFromMatSteps(
         // Re-run the winning angle WITH snap so the graph shows its (deskewed) stages.
         if (bestDeskew !== primary) {
           morphEdges.delete();
-          morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, bestDeskew, timed));
+          morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, bestDeskew, timed, params.ridgeLocalThresh));
         }
       }
       timings.morphAngles = morphAngles;
@@ -729,7 +725,6 @@ export function* detectGridFromMatSteps(
     const candidates: { id: string; label: string; r: GridResult }[] = [
       { id: 'main', label: 'Luminanza', r: mainFit },
     ];
-    if (chromaFit) candidates.push({ id: 'chroma', label: 'Cromatica', r: chromaFit });
     if (morphFit) candidates.push({ id: 'morph', label: 'Morfologica', r: morphFit });
     const fused = fuseGrids(candidates.map((c) => c.r));
     let winnerIdx = fused.index;
@@ -815,20 +810,17 @@ export function* detectGridFromMatSteps(
     if (wantEdges) {
       // FIXED structural topology — every stage is drawn (even skipped ones) with its
       // in/out arrows.
-      const chromaFitRan = chromaFit != null;
       // The Hough node of the pipeline that actually won (so the graph highlights the real path).
-      const winnerHough =
-        result === morphFit ? 'houghMorph' : result === chromaFit ? 'houghChroma' : 'houghLum';
+      const winnerHough = result === morphFit ? 'houghMorph' : 'houghLum';
       const topo: Record<string, string[]> = {
         foto: [],
         gray: ['foto'],
         clahe: ['gray'],
         blur: ['clahe'],
         canny: ['blur'],
-        // Chromatic branch: colour-only edges → its OWN Hough (an independent candidate). The
-        // same edges are ALSO OR'd into the luminance 'edges' for recall, hence chroma feeds both.
+        // Chromatic branch: colour-only edges are folded INTO the luminance 'edges' (no separate
+        // candidate) — a hue-only grid (brown-on-earth) reaches the MAIN Hough this way.
         chroma: ['foto'],
-        houghChroma: ['chroma'],
         edges: ['canny', 'chroma'],
         clean: ['edges'],
         oriented: ['clean'],
@@ -844,18 +836,18 @@ export function* detectGridFromMatSteps(
         // consensus fusion selected.
         houghLum: ['oriented'],
         houghMorph: ['morph'],
-        overlay: ['houghLum', 'houghChroma', 'houghMorph'],
+        overlay: ['houghLum', 'houghMorph'],
       };
       const label: Record<string, string> = {
         foto: 'Foto', gray: 'Grigio', clahe: 'Contrasto', blur: 'Sfocatura', canny: 'Canny',
-        chroma: 'Cromatica', houghChroma: 'Hough C', edges: 'Bordi uniti', clean: 'Pulizia texture',
+        chroma: 'Bordi colore', edges: 'Bordi uniti', clean: 'Pulizia texture',
         oriented: 'Orientati', mridgeh: 'Cresta H', mridgev: 'Cresta V', mbinh: 'Linee H',
         mbinv: 'Linee V', morph: 'Morfologica', houghLum: 'Hough L', houghMorph: 'Hough M',
         overlay: 'Griglia',
       };
       const executed: Record<string, boolean> = {
         foto: true, gray: true, clahe: true, blur: true, canny: true,
-        chroma: chromaExecuted, houghChroma: chromaFitRan, edges: true, clean: cleanApplied,
+        chroma: chromaExecuted, edges: true, clean: cleanApplied,
         oriented: orientedRan, mridgeh: morphRan, mridgev: morphRan, mbinh: morphRan, mbinv: morphRan,
         morph: morphRan, houghLum: true, houghMorph: morphRan, overlay: true,
       };
@@ -864,7 +856,6 @@ export function* detectGridFromMatSteps(
       const realInput: Record<string, string[]> = {
         overlay: [winnerHough],
         houghLum: [orientedAdopted ? 'oriented' : cleanApplied ? 'clean' : 'edges'],
-        houghChroma: ['chroma'],
         houghMorph: ['morph'],
         oriented: [cleanApplied ? 'clean' : 'edges'],
         clean: ['edges'],
@@ -913,7 +904,6 @@ export function* detectGridFromMatSteps(
       result.debugAgreement = agreement;
       result.debugTimings = timings;
       result.debugRawLum = mainFit.rawLines;
-      if (chromaFit) result.debugRawChroma = chromaFit.rawLines;
       if (morphFit) result.debugRawMorph = morphFit.rawLines;
     }
 
@@ -928,7 +918,6 @@ export function* detectGridFromMatSteps(
     if (blurred) blurred.delete();
     if (cannyEdges) cannyEdges.delete();
     if (morphEdges) morphEdges.delete();
-    if (chromaMask) chromaMask.delete();
   }
 }
 
@@ -1214,6 +1203,7 @@ function enhanceGridLines(
   snap?: (id: string, mat: any) => void,
   deskewDeg = 0,
   time?: <X>(key: string, fn: () => X) => X,
+  localThresh = false,
 ): any {
   // Optional per-sub-node timing (debug): wraps the ridge / line-binarisation phases so the
   // graph's morph nodes (Cresta/Linee H·V) each get a measured time. Identity when absent.
@@ -1279,11 +1269,28 @@ function enhanceGridLines(
     const me = new cv.Mat();
     const st = new cv.Mat();
     cv.meanStdDev(r, me, st);
-    const t = me.data64F[0] + K * st.data64F[0];
+    const gMean = me.data64F[0];
+    const gSig = st.data64F[0];
     me.delete();
     st.delete();
     const b = new cv.Mat();
-    cv.threshold(r, b, t, 255, cv.THRESH_BINARY);
+    if (localThresh) {
+      // Per-pixel adaptive threshold: keep a pixel when its ridge response exceeds the LOCAL mean
+      // (over an LC window) by ~1σ. On a textured surface the GLOBAL σ is inflated by texture so the
+      // global mean+K·σ drowns a faint grid; the local mean tracks the background, so the faint ridge
+      // still stands out. `convertTo(dst,-1,1,β)` adds the σ margin per-element (avoids the
+      // Scalar-as-Mat binding this OpenCV.js build rejects); a flat gridless region has r≈local mean,
+      // so nothing passes there.
+      const lm = new cv.Mat();
+      cv.boxFilter(r, lm, -1, new cv.Size(LC, LC)); // -1 = keep r's depth (the ridge is 8-bit)
+      const thr = new cv.Mat();
+      lm.convertTo(thr, -1, 1, gSig); // thr = local mean + 1σ (same type as r → compare is valid)
+      cv.compare(r, thr, b, cv.CMP_GT); // b = 255 where r > thr, else 0
+      lm.delete();
+      thr.delete();
+    } else {
+      cv.threshold(r, b, gMean + K * gSig, 255, cv.THRESH_BINARY);
+    }
     cv.morphologyEx(b, b, cv.MORPH_OPEN, seOpen);
     cv.morphologyEx(b, b, cv.MORPH_CLOSE, seClose);
     return b;
@@ -2182,6 +2189,20 @@ export function cellCountPlausibility(cells: number): number {
  * NOTE: cell-count plausibility is deliberately NOT a factor here — it was zeroing real grids
  * and contradicts the draw gate (whose cell-count limit was removed). It survives only as a
  * fusion tie-break (see `fuseGrids`/`shapeOf`). Pure — unit-tested directly. */
+/** Harmonic-aware aspect (audit BUG-2): a family whose pitch is an integer SUB-multiple of the
+ * other's — a ×m harmonic sub-pitch fabricated by an over-merge (e.g. #9's spA=20 vs spB=65 ≈ ×3)
+ * — must NOT be punished by `squareness` as a "rectangular cell". Try the small integer ratios and,
+ * if one lands near a square cell, use it; a genuinely rectangular grid keeps its aspect. Pure. */
+export function harmonicAspect(aspect: number): number {
+  if (!(aspect > 1) || !isFinite(aspect)) return aspect;
+  let best = aspect; // no correction
+  for (const m of [2, 3, 4]) {
+    const cand = aspect / m;
+    if (Math.abs(cand - 1) < 0.35 && Math.abs(cand - 1) < Math.abs(best - 1)) best = cand;
+  }
+  return best;
+}
+
 export function gridConfidence(
   a: FamilyMetrics,
   b: FamilyMetrics,
@@ -2191,7 +2212,7 @@ export function gridConfidence(
   const qA = familyQuality(a);
   const qB = familyQuality(b);
   const pair = 0.7 * Math.min(qA, qB) + 0.3 * Math.max(qA, qB);
-  const ar = aspect > 0 && isFinite(aspect) ? aspect : MAX_CELL_ASPECT;
+  const ar = harmonicAspect(aspect > 0 && isFinite(aspect) ? aspect : MAX_CELL_ASPECT);
   const squareness = 0.25 + 0.75 * clamp01(1 - (ar - 1) / (MAX_CELL_ASPECT - 1));
   const geom = degenerate ? 0.1 : squareness;
   return clamp01(pair * geom);
@@ -2269,8 +2290,13 @@ function mergeDuplicateLines(lines: Line2[], mergeDist: number): LineSup[] {
   const groupTheta = () => meanAngle180(group.map((g) => g.th));
   for (let i = 1; i < items.length; i++) {
     const near = items[i].off - items[i - 1].off <= mergeDist;
+    // COMPLETE-linkage (not single-linkage): also cap the group's total WIDTH at mergeDist, so a
+    // dense comb of near-duplicates can't chain into an arbitrarily wide blob that fabricates a
+    // sub-pitch. A real duplicate cluster (one physical line) spans < mergeDist; distinct grid
+    // lines (pitch ≫ mergeDist) still start their own group.
+    const withinWidth = items[i].off - group[0].off <= mergeDist;
     const sameAngle = angDist180(items[i].th, groupTheta()) <= 6;
-    if (near && sameAngle) group.push(items[i]);
+    if (near && withinWidth && sameAngle) group.push(items[i]);
     else {
       flush();
       group = [items[i]];

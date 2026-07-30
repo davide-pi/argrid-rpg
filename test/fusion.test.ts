@@ -8,6 +8,7 @@ import {
   buildGrid,
   familyQuality,
   gridConfidence,
+  harmonicAspect,
   cellCountPlausibility,
   isGridReliable,
   DRAW_THRESHOLD,
@@ -271,6 +272,23 @@ test('fuseGrids: a degenerate candidate neither wins nor corroborates', () => {
   const res = fuseGrids([deg, good]);
   assert.equal(res.index, 1, 'the real grid wins over the degenerate one');
   assert.ok(Math.abs(res.confidence - 0.55) < 1e-9, 'a degenerate fit gives no corroboration boost');
+});
+
+// --- harmonicAspect (a ×m sub-pitch must not read as a rectangular cell) ------
+
+test('harmonicAspect: a ×m sub-pitch reads near-square; a real rectangle keeps its aspect', () => {
+  assert.ok(Math.abs(harmonicAspect(3.25) - 3.25 / 3) < 1e-9, '3.25 ≈ ×3 sub-pitch → ~1.08');
+  assert.ok(harmonicAspect(6) > 3, 'a genuinely elongated 6:1 cell is NOT "corrected"');
+  assert.equal(harmonicAspect(1), 1, 'a square cell is unchanged');
+});
+
+test('gridConfidence: a harmonic sub-pitch is not punished as a rectangular cell (fixes #9)', () => {
+  const s: FamilyMetrics = { count: 6, span: 6, fill: 1, inlier: 1 };
+  const square = gridConfidence(s, s, false, 1);
+  const harmonic = gridConfidence(s, s, false, 3.25); // a ×3 sub-pitch on one axis
+  const rect = gridConfidence(s, s, false, 6); // a genuinely elongated cell
+  assert.ok(harmonic > 0.9 * square, 'the ×3 harmonic reads ~square, not penalised');
+  assert.ok(rect < harmonic, 'a genuinely elongated cell still scores lower');
 });
 
 // --- isGridReliable (the single draw decision) -------------------------------

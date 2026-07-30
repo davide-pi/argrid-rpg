@@ -48,6 +48,10 @@ morphological path recovers low-contrast texture — neither replaces the other.
 live: an **iso-luminance** grid (magenta lines on a gray of identical Y) is `0×0` with
 `colorEdges:false` and the full grid with it on; clean gray grids and the dirt photo are
 unchanged (near-neutral chroma adds nothing).
+**Removed:** an earlier *separate* chromatic candidate (its own Hough + fusion entry, `houghChroma`)
+never won and was always degenerate, so the colour edges now live **only** inside the luminance
+flow (OR'd in before the main Hough). In the debug graph the colour node is extraction-only
+('Bordi colore' → *Bordi uniti*; the 'Colore' log group is just 'Estrazione').
 
 ### Perspective robustness: stable VP, orthogonal split, sub-multiple rejection
 **Decision:** two cheap, pure-geometry fixes make the lattice fit survive strong
@@ -88,10 +92,14 @@ a larger task tracked for the corner-node fallback.
 
 ### Unreliable auto grid → photo alone + (i) guidance + on-demand manual editor, never a wrong grid
 **Decision:** the app **always draws the grid it found when it is reliable, or the photo alone
-otherwise** — there is **no** automatic fallback card. Reliability is structural, in
-`applyDetectedGrid` (`src/main.ts`): `detectedA,detectedB ≥ 2`, drawn cells per side
-`≥ MIN_GRID_CELLS` (5), `!degenerate`, and cell-aspect `≤ MAX_CELL_ASPECT` — **not** a
-`confidence` threshold. When no grid is drawn, the single info **(i)** button (bottom-left)
+otherwise** — there is **no** automatic fallback card. Reliability is ONE calibrated score, in
+`applyDetectedGrid` (`src/main.ts`) → `isGridReliable` (`src/grid-detector.ts`): the
+`gridConfidence` must clear `DRAW_THRESHOLD` (0.65), plus two HARD guards the score can't
+override (`!degenerate`, `detectedA,detectedB ≥ 2`). Regularity, size and cell-aspect are
+**folded into** `confidence` (`familyQuality` × `squareness`, the latter via `harmonicAspect`),
+so the earlier scattered structural gate (cell-count / inlier / aspect floors) is gone — the
+debug chip, the winner choice and "drawn?" now share the same number. When no grid is drawn, the
+single info **(i)** button (bottom-left)
 carries the guidance ("Nessuna griglia rilevata — usa il tasto griglia / fotocamera"). A top-bar
 **edit-grid** button opens an on-demand chooser (`#editChooser`: **grid to adapt** / **draw by
 hand**) on *any* result, so a well-detected grid can also be tweaked. **Cancelling** the editor
@@ -119,14 +127,13 @@ photo + an honest choice (edit it yourself / retake) is far better than a confid
 grid.
 **Calibration (user-labelled 16-photo corpus).** The user labelled which auto-detections are
 actually correct — **only 3/16** were (auto-detection accuracy is genuinely low on hard photos).
-`confidence` = `clamp((min(detectedA,detectedB)−2)/4,0,1)` tracks correctness reasonably (the 3
-correct scored high; most wrong scored low, save one confident-but-wrong outlier — a full lattice
-at the wrong orientation — that no metric separates). **The product choice, however, is "always
-show the grid you found and let the user judge/edit it", not to hide grids behind a confidence
-gate** — so `confidence` is now diagnostic only, and reliability is the structural test above
-(`!degenerate` + cell-aspect + `MIN_GRID_CELLS`). Do NOT re-tune detection against my own guesses —
-establish ground truth from the user first (see the memory note). The remaining gap is detection
-*accuracy*, not the gate.
+The calibrated `gridConfidence` now separates most of them: the genuinely-correct grids score
+≥ ~0.86 while the false positives / imprecise fits (a self-consistent but wrong lattice, a texture
+sub-pitch) sit at 0.43–0.53, so `DRAW_THRESHOLD` = **0.65** splits them with ~zero recall cost on
+the real grids and kills the #13-style false positive. Confidence measures lattice self-consistency
++ size + squareness, **not image support yet**, so the bar stays here rather than trusting a low
+score outright. Do NOT re-tune detection against my own guesses — establish ground truth from the
+user first (see the memory note). The remaining gap is detection *accuracy*, not the gate.
 
 ### Map-boundary quad auto-rescue was attempted and dropped (unreliable segmentation)
 **Decision:** an auto "map boundary" step (restrict the edges to the detected map quad before
@@ -138,6 +145,20 @@ were near-frame or nothing, and the target grids in the distractor cases are too
 even when isolated). It improved nothing, so it was reverted rather than shipped as inert code.
 The reliable path for these hard cases is the **manual grid** above. A corner/intersection-node
 fallback remains a possible future direction.
+
+### Periodicity-first rework (v2/v3) prototyped and reverted
+**Decision:** the periodicity-first detection rework — a global 2-D periodic model fit from an FFT
+orientation prior + projection/autocorrelation pitch (planned in the former `detection-v2-plan.md`
+/ `detection-v3-plan.md`) — was implemented (`periodicPitch` / `periodicExtract`, ~535 lines) and
+then **removed in full**; the pipeline is back to the bottom-up chain (Canny → Hough → family split
+→ VP RANSAC → rectify → lattice fit) with the calibrated `gridConfidence` draw gate above.
+**Why:** it did not beat the existing pipeline on the labelled corpus and added a large, interacting
+surface (comb-pitch / rectify-stability / horizon-sweep experiments — `combPitch`, `periodicExtract`,
+`rectifyStability`, etc.). The related tuning flags (`profilePitch`, `cornerVerify`, `lineSupport`,
+`morphCloseFirst`, `ridgeHysteresis`, `ridgeLocalThresh`) were likewise added and reverted — **no
+experimental detector flags remain** (the ridge binarisation `ridgeLocalThresh` became the fixed
+local-mean + 1σ threshold in `enhanceGridLines`). The two plan docs were retired to obsolete
+tombstones; this note is the historical record.
 
 ### Grid extrapolated to the whole frame by default (`extend: 'frame'`)
 **Decision:** after fitting the regular lattice, continue it `a + b·k` outward past the

@@ -148,14 +148,13 @@ export interface GridResult {
     cellsB: number;
     // Per-family lattice REGULARITY = fraction of the family's (merged, VP-concurrent) raw
     // lines that land on the fitted lattice — high for a real grid, low for a texture stumble
-    // whose lines don't sit on a regular pitch. Surfaced (not just folded into `confidence`)
-    // so the UI reliability gate can reject a low-regularity fit per family. 0 when the family
-    // took a degenerate / early-out fit path.
+    // whose lines don't sit on a regular pitch. Folded into `confidence` (via familyQuality) and
+    // also surfaced here for diagnostics. 0 when the family took a degenerate / early-out fit path.
     inlierA: number;
     inlierB: number;
-    // true when the fit collapsed to an implausible SUB-PITCH (micro-cells) — a
-    // degenerate/garbage grid. This (not a confidence threshold) is what the UI gates
-    // on to decide whether to draw the auto grid or offer the manual fallback.
+    // true when the fit collapsed to an implausible SUB-PITCH (micro-cells) — a degenerate/garbage
+    // grid. A HARD guard in isGridReliable (alongside the confidence ≥ DRAW_THRESHOLD gate): a
+    // degenerate fit is never drawn, whatever its score; the manual fallback is offered instead.
     degenerate: boolean;
     // Detected lattice EXTENT per family (kmax−kmin+1, rectified plane) — the size of the grid
     // ACTUALLY SEEN. Used by the fusion size tie-break instead of the frame-relative cell count

@@ -41,9 +41,11 @@ Works in **image-centred** coordinates for numerical stability (`:458`), then ma
    finds the dominant axis `axisA`; `axisB = axisA + 90°`; each line joins the nearer
    axis with **no discard** (`grid-detector.ts:472`), so perspective spread never
    drops a real line.
-2. **Merge Hough duplicates** — `mergeDuplicateLines` (`grid-detector.ts:617`) collapses
+2. **Merge Hough duplicates** — `mergeDuplicateLines` (`grid-detector.ts:2148`) collapses
    the several Hough hits on one physical line into one, keeping a `support` count;
-   offsets/angles averaged sign-safely across the 0/180° wrap.
+   offsets/angles averaged sign-safely across the 0/180° wrap. **Complete-linkage** (the
+   group's total width is capped at `mergeDist`, not just adjacent gaps), so a dense comb of
+   near-duplicates can't chain into a wide blob that fabricates a sub-pitch.
 3. **Vanishing point per family (RANSAC)** — `ransacVP` (`grid-detector.ts:556`) picks
    the VP where the most lines concur (≤1.5° residual, `vpResidualDeg` `:531`); lines
    that don't converge like the grid (text, drawings, stray marks) are rejected.
@@ -100,38 +102,51 @@ exact synthetic θ do **not** catch it — only real Hough output does.
 | `colorEdges` | `true` | Also detect **chromatic** edges (Lab a/b) and OR them into the luminance Canny, so a grid distinguished from its background by hue (not brightness) is found (`chromaEdges`, stage 5). |
 | `fftPrior` | `true` | FFT periodicity prior: fix the family-orientation split when the angle histogram locks onto a wrong orientation (`fftOrientations`). Overrides only when it confidently disagrees. |
 | `orientGate` | `true` | VP-aware oriented re-extraction on a weak first fit (`orientEdgesVP`); contained (kept only if strictly stronger), so it can only help. |
+| `edgeClean` | `true` | Texture cleaning before Hough (`dropShortComponents`): **only on a noisy/texture-flooded frame**, drop the SHORT connected components (dirt/sand speckle leaves many tiny fragments; grid lines are long). Skipped on clean/faint grids, where the "short" pieces are the grid's own broken lines. |
 
-## `GridResult.info` (diagnostics, `grid-detector.ts:52`)
+## `GridResult.info` (diagnostics, `grid-detector.ts:130`)
 
 `rawCount`, `aCount`, `bCount`, `angleADeg/BDeg`, `spacingA/B` (px, original coords),
-`usedHough` (settled threshold), `cannyHigh` (from Otsu), `edgePixels`, plus
-`detectedA`/`detectedB` (real DETECTED lines per family) and `confidence` (0..1).
-Surfaced in the status line when `debug` is on. Note `aCount`/`bCount` are the **total**
-family sizes (detected + filled + extended); the `lineMorph` fallback and `confidence`
-gate on the **detected-only** counts instead, so fill/extension never inflate them.
-`confidence` = `clamp((min(detectedA, detectedB) − 2) / 4, 0, 1)` (diagnostic only). The
-UI no longer gates on `confidence` or shows a toast: `applyDetectedGrid()` (in `main.ts`)
-sets `gridReliable = detectedA ≥ 2 && detectedB ≥ 2 && cellsA,cellsB ≥ MIN_GRID_CELLS (5)
-&& !degenerate && aspect ≤ MAX_CELL_ASPECT` and draws the grid it found, or the photo
-alone when unreliable. The `MIN_GRID_CELLS` floor (drawn cells per side) rejects the
-tiny 2×2 a bad perspective fit collapses to. Contextual guidance ("Nessuna griglia
-rilevata — usa il tasto griglia / fotocamera", etc.) is carried by the single info
-**(i)** button (bottom-left), not a transient toast.
+`usedHough` (settled threshold), `cannyHigh` (from Otsu), `edgePixels`, `detectedA`/`detectedB`
+(real DETECTED lines per family), `cellsA/B` + `spanA/B` (frame-relative grid size / detected
+lattice extent), `inlierA/B` (per-family lattice regularity), `degenerate` (sub-pitch collapse),
+and `confidence` (0..1). Surfaced in the debug panel when `debug` is on. Note `aCount`/`bCount`
+are the **total** family sizes (detected + filled + extended); the `lineMorph` fallback and the
+confidence gate work off the **detected-only** counts, so fill/extension never inflate them.
 
-## Debug output (edges, raw Hough lines, step viewer)
+**Reliability gate (the draw decision).** `confidence` is the calibrated `gridConfidence`
+(`grid-detector.ts:2082`): a soft-AND of the two families' `familyQuality` (evidence × regularity/
+completeness) times a `squareness` term (aspect via `harmonicAspect`), heavily penalised when
+`degenerate`. Cell-count, aspect and regularity are **folded into it**, not checked separately.
+`applyDetectedGrid()` (`main.ts:577`) then sets `gridReliable = isGridReliable(info)`
+(`grid-detector.ts:2111`) = `!degenerate && detectedA,detectedB ≥ 2 && confidence ≥
+DRAW_THRESHOLD` (**0.65**). Above the bar the found grid is drawn; below it the photo shows
+alone (no toast, no auto panel). `DRAW_THRESHOLD` is calibrated on the labelled corpus (correct
+grids ≥ ~0.86; false positives 0.43–0.53). When no grid is drawn, contextual guidance ("Nessuna
+griglia rilevata — disegnala a mano / rifai la foto") is carried by the single info **(i)** button
+(bottom-left); in debug, `gridRejectReason` spells out which clause failed.
 
-`detectGrid(…, wantEdges=true)` fills `result.edges` (Canny mask as `ImageData`).
+## Debug output (edges, raw Hough lines, pipeline graph)
+
+`detectGrid(…, wantEdges=true)` fills `result.edges` (edge mask as `ImageData`).
 `draw()` blits it at 0.45 alpha and strokes every `rawLines` entry in translucent red.
 Debug is a module boolean toggled by **triple-tapping the logo**, which re-runs
-detection so the diagnostics appear/disappear.
+detection so the diagnostics appear/disappear; a translucent **DBG** chip sits next to
+the version badge while it's on.
 
-When `wantEdges`, the generator also captures a downscaled RGBA snapshot of each stage
-into `result.debugSteps` (`DebugStep[]`: Grigio → CLAHE → Sfocatura → Canny → +cromatica
-→ orientati → morfologico — the last two only appear when those optional stages run) via
-`matToPreview`. `main.ts` renders a top **step-chip bar** (`#debugBar`,
-`rebuildDebugBar`) — the default chip is the live line overlay, the others blit that
-stage's image onto the view canvas (`drawDebugStep`), so you can inspect where the
-pipeline diverges from the photo.
+When `wantEdges`, the generator captures a downscaled RGBA snapshot of each stage **plus the
+fixed pipeline topology** into `result.debugSteps` (`DebugStep[]` — every node carries
+`inputs`, `executed`, `used`), and per-candidate quality into `result.debugPipelines`
+(`PipelineStat[]`), `result.debugAgreement`, `result.debugTimings`, `debugRawLum`/`debugRawMorph`.
+`main.ts` renders these as a top panel (`#debugBar`, `rebuildDebugBar`, positioned by
+`GRAPH_LAYOUT`): a **pipeline graph** (Foto → Grigio → Contrasto → Sfocatura → Canny → Bordi
+uniti → Pulizia texture → Orientati → Hough L, plus the morphology sub-graph Cresta H/V → Linee
+H/V → Morfologica → Hough M, with the colour extractor **Bordi colore** folded into *Bordi uniti*
+— **no separate chroma Hough**; skipped stages are drawn deactivated and the real data path is
+highlighted) alongside a **confidence strip** (each candidate's fused confidence, Accordo, Finale).
+Tapping a node blits that stage's image onto the view (`drawDebugStep`); the default node is the
+live overlay. The **timing-log button** in the header is a *view selector*: it swaps the body
+between the graph+confidence view and a scrollable **timing log** (`debugLogOpen`) — never both.
 
 ## Verifying the pipeline
 

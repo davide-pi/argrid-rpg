@@ -47,10 +47,11 @@ rotating the angle ring, editing an area — only mutates module state and calls
 does not touch OpenCV. This is what keeps the UI responsive on a phone.
 
 **Reliability gate + manual grid.** After detection, `applyDetectedGrid` sets
-`gridReliable` **structurally** (`detectedA,detectedB ≥ 2`, drawn cells per side
-`≥ MIN_GRID_CELLS`, `!degenerate`, cell-aspect `≤ MAX_CELL_ASPECT`) — not from a
-`confidence` threshold. When it's false, the grid + tactical layer are simply **not**
-drawn (the photo shows alone); there is **no** automatic panel. Guidance lives in the
+`gridReliable = isGridReliable(info)`: the calibrated `confidence` must clear
+`DRAW_THRESHOLD` (0.65), plus two HARD guards the score can't override (`!degenerate`,
+`detectedA,detectedB ≥ 2`) — cell-count, aspect and regularity are folded into the
+`confidence` itself (see [decisions.md](decisions.md)). When it's false, the grid + tactical
+layer are simply **not** drawn (the photo shows alone); there is **no** automatic panel. Guidance lives in the
 single info **(i)** button (bottom-left), and a top-bar **edit-grid** button opens an
 on-demand chooser (`#editChooser`: *grid to adapt* / *draw by hand*) on any result;
 **cancel restores the detected grid**. Both manual modes synthesise the same

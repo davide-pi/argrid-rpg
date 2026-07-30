@@ -210,10 +210,9 @@ function setStatus(msg: string) {
 
 // --- Contextual help (single (i) button, bottom-left) ------------------
 // One affordance carries all the "what can I do now" guidance that used to be
-// scattered across HUD hints and transient toasts. It's shown only when there's
-// something to say for the current state; tapping (i) toggles the popover. It
-// auto-opens on the moments that need immediate guidance (entering placement /
-// manual editing, or a photo with no grid); otherwise it stays where the user left it.
+// scattered across HUD hints and transient toasts. It's shown (the (i) button) only when
+// there's something to say for the current state; the popover text stays CLOSED until the
+// user taps (i) — it never auto-opens.
 let infoOpen = false;
 
 // The exact top-bar button icons (Lucide), inlined so the (i) guidance points at the

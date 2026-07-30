@@ -257,6 +257,11 @@
         <div class="version-row">
           <span id="versionBadge" class="version-badge" aria-hidden="true"></span>
           <span id="dbgBadge" class="dbg-badge" aria-hidden="true" hidden>DBG</span>
+          <!-- Debug-only focus indicator (Lucide `focus`): BLUE when the last detection ran with a
+               tap-to-focus point, GREY otherwise. Shown together with the DBG chip. -->
+          <span id="focusBadge" class="focus-badge" aria-hidden="true" hidden>
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3"/></svg>
+          </span>
         </div>
       </main>
     </div>

@@ -71,6 +71,16 @@ test('gridConfidence: both axes strong → high; one weak axis pulls it down (bu
   assert.ok(lopsided > 0, 'a strong axis + a weak one is NOT zeroed — this is the anti-cliff fix');
 });
 
+test('gridConfidence: low perpendicularity (sheared cells) penalises; perp=1 is a no-op', () => {
+  const strong: FamilyMetrics = { count: 10, span: 10, fill: 1, inlier: 1 };
+  const square = gridConfidence(strong, strong, false, 1, 1); // perpendicular → default behaviour
+  const noPerp = gridConfidence(strong, strong, false, 1); // perp defaults to 1 (backward-compatible)
+  const sheared = gridConfidence(strong, strong, false, 1, 0.5); // rhombus: equal pitches, but skewed
+  assert.equal(square, noPerp, 'perp defaults to 1 → identical to the pre-perp behaviour');
+  assert.ok(sheared < square, 'a sheared (low-perpendicularity) fit scores lower than a square one');
+  assert.ok(Math.abs(sheared - square * 0.5) < 1e-9, 'perp enters as a linear multiplicative factor');
+});
+
 // --- dedupeHoughLines --------------------------------------------------------
 
 test('dedupeHoughLines: collapses a cluster of near-duplicate detections to one', () => {

@@ -314,6 +314,44 @@ body {
   object-fit: contain;
 }
 
+/* Tap-to-focus reticle: a Lucide `focus` glyph flashed where the user tapped the live
+   preview. Centred on its (left,top) anchor; pops + fades over ~700ms then hides. */
+.focus-reticle {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%);
+  color: #fbbf24;
+  pointer-events: none;
+  z-index: 6;
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.6));
+  opacity: 0;
+}
+.focus-reticle svg {
+  display: block;
+}
+.focus-reticle.show {
+  animation: focus-pop 700ms ease-out both;
+}
+@keyframes focus-pop {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(1.35);
+  }
+  25% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  70% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
 .hint {
   position: absolute;
   /* Sits BELOW the (raised) Scatta button so it stays readable. Kept short so it
@@ -488,6 +526,14 @@ body {
   box-shadow: 0 5px 16px rgba(0, 0, 0, 0.5);
   cursor: pointer;
   transition: transform 0.2s ease, background 0.2s ease;
+}
+/* No grid → the FAB stays visible but inert: greyed, flattened, non-interactive. */
+.fab:disabled {
+  background: var(--panel-2);
+  color: var(--muted);
+  box-shadow: none;
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 .fab.mode-ally {
   background: #22c55e;
@@ -668,6 +714,89 @@ body {
   color: var(--accent);
   font-weight: 700;
 }
+/* LOG view tabs (Tempi | Confidenza) — sit above the shared .debug-log panel. */
+.debug-log-tabs {
+  display: flex;
+  gap: 4px;
+  margin-top: 7px;
+}
+.debug-log-tab {
+  flex: 0 0 auto;
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+}
+.debug-log-tab.on {
+  color: var(--fg);
+  border-color: var(--accent);
+  background: rgba(34, 211, 238, 0.12);
+}
+.debug-log-tabs + .debug-log {
+  margin-top: 6px;
+}
+/* Confidence tab: the chosen candidate's group header is accented + left-barred. */
+.debug-log-group.chosen {
+  border-left: 2px solid var(--accent);
+  padding-left: 6px;
+}
+.debug-log-group.chosen .debug-log-k,
+.debug-log-group.chosen .debug-log-v {
+  color: var(--accent);
+}
+/* Confidence tab: the fused/final row of each candidate, emphasised. */
+.debug-log-row.conf-final .debug-log-k,
+.debug-log-row.conf-final .debug-log-v {
+  color: var(--fg);
+  font-weight: 700;
+}
+/* Confidence tab: the plain-language verdict — the headline "why", full-width, no value column. */
+.debug-log-row.conf-why {
+  margin: 3px 0 1px;
+}
+.debug-log-row.conf-why .debug-log-k {
+  color: var(--fg);
+  font-weight: 600;
+  font-style: italic;
+}
+.debug-log-row.conf-why.warn .debug-log-k {
+  color: #fbbf24;
+}
+/* Confidence tab: the internal-confidence line (the product), lightly emphasised. */
+.debug-log-row.conf-mid .debug-log-v {
+  color: var(--fg);
+  font-weight: 700;
+}
+/* Per-axis evidence table (count / inlier / fill / span / q). */
+.conf-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 3px 0 5px 12px;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.conf-table td {
+  padding: 2px 6px 2px 0;
+  color: var(--fg);
+  text-align: right;
+  white-space: nowrap;
+}
+.conf-table td:first-child {
+  text-align: left;
+  color: var(--muted);
+}
+.conf-table tr.conf-h td {
+  color: var(--muted);
+  font-weight: 700;
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
 .debug-scroll {
   margin-top: 6px;
   overflow-x: auto;
@@ -696,31 +825,6 @@ body {
   font-size: 11px;
   font-weight: 600;
   line-height: 1.5;
-}
-
-/* --- Detector-flag toggle chips (debug panel) ----------------------- */
-.dbg-flags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-  margin-top: 7px;
-}
-.dbg-flag {
-  appearance: none;
-  padding: 3px 8px;
-  border-radius: 999px;
-  border: 1px solid var(--line);
-  background: var(--panel-2);
-  color: var(--muted);
-  font-size: 10.5px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  cursor: pointer;
-}
-.dbg-flag.on {
-  border-color: rgba(251, 191, 36, 0.9);
-  background: rgba(251, 191, 36, 0.16);
-  color: #fbbf24;
 }
 
 /* --- Confidence strip: per-pipeline quality + the final decision --- */
@@ -1240,6 +1344,22 @@ body {
   user-select: none;
 }
 .dbg-badge[hidden] {
+  display: none;
+}
+/* Debug-only focus indicator (Lucide `focus`), next to the DBG chip: GREY by default, BLUE when
+   the last detection ran with a tap-to-focus point. Shown/hidden with the DBG chip. */
+.focus-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6));
+  user-select: none;
+}
+.focus-badge.on {
+  color: #3b82f6;
+}
+.focus-badge[hidden] {
   display: none;
 }
 

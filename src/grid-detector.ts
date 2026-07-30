@@ -23,9 +23,11 @@ export interface DetectorParams {
   mergeFrac: number;
   /** Interpolate missing interior lines from the estimated cell pitch. */
   fillGrid: boolean;
-  /** Suppress edges outside the in-focus plane before detection (blunt; off by
-   * default — the lattice reconstruction rejects non-grid lines more safely). */
-  focusGating: boolean;
+  /** Tap-to-focus point (NORMALIZED [0,1] coordinates of the captured frame) the user
+   * touched on the live preview, or `null` when no focus point is active. When set, the
+   * edge map is spatially weighted toward this point before Hough (keep the nearby grid,
+   * discard the far background); `null` leaves detection identical to the untapped path. */
+  focusPoint: { x: number; y: number } | null;
   /** Rebuild the regular lattice and drop lines that don't fit it. */
   reconstruct: boolean;
   /** Fallback for noisy/low-contrast photos (a grid drawn on a textured surface):
@@ -62,7 +64,7 @@ export const DEFAULT_PARAMS: DetectorParams = {
   maxDim: 1600,
   mergeFrac: 0.012,
   fillGrid: true,
-  focusGating: false,
+  focusPoint: null,
   reconstruct: true,
   lineMorph: true,
   extend: 'frame',
@@ -104,10 +106,42 @@ export interface PipelineStat {
   id: string; // 'main' | 'morph'
   label: string;
   strength: number; // detected (non-filled) lines in the weaker family
-  confidence: number; // 0..1 heuristic
+  confidence: number; // 0..1 heuristic — the candidate's FUSED confidence (its own, lifted by consensus)
   cells: [number, number]; // a × b cells
   degenerate: boolean;
   chosen: boolean; // became the final result
+  // Why THIS candidate got its confidence — the real sub-scores (qA/qB, pair, squareness, …) that
+  // produced its INTERNAL confidence, for the debug "Confidenza" panel. `internal` is the pre-fusion
+  // value; `confidence` above is after the consensus lift. Absent only if the fit had no pair.
+  breakdown?: ConfBreakdown;
+}
+
+/** The family line sets (image space) at each stage of the fit, for the per-stage debug nodes:
+ * split into two directions → per-family duplicate merge → vanishing-point concurrency filter.
+ * Lets the debug UI show, node by node, how the raw Hough lines are whittled down before the
+ * lattice rebuild — so a "fan" of near-duplicate lines can be watched getting filtered. */
+export interface StageLines {
+  splitA: Line2[];
+  splitB: Line2[];
+  mergedA: Line2[];
+  mergedB: Line2[];
+  vpA: Line2[];
+  vpB: Line2[];
+}
+
+/** One grid crossing (image space) with its foreground-weighted perpendicularity, for the
+ * "Perpendicolarità" debug node: `perp` ∈ [0,1] (1 = right-angle after rectification, →0 = sheared);
+ * `weight` = foreground weight (∝ squared distance from the horizon — larger near the viewer). */
+export interface PerpCross {
+  x: number;
+  y: number;
+  perp: number;
+  weight: number;
+}
+export interface PerpDebug {
+  crossings: PerpCross[];
+  score: number; // foreground-weighted mean perpendicularity fed to the confidence's squareness
+  hypotheses?: number; // how many (VP_A × VP_B × rectification) hypotheses this winner beat
 }
 
 export interface GridResult {
@@ -123,6 +157,12 @@ export interface GridResult {
   debugTimings?: Record<string, number>; // ms per phase + counts, for the debug log (debug only)
   debugRawLum?: Line2[]; // raw Hough lines of the luminance fit (debug only)
   debugRawMorph?: Line2[]; // raw Hough lines of the morphology fit (debug only)
+  debugStageLines?: StageLines; // this fit's own per-stage lines (buildGrid sets it; debug only)
+  debugStagesLum?: StageLines; // luminance fit's per-stage lines (winner carries both; debug only)
+  debugStagesMorph?: StageLines; // morphology fit's per-stage lines (debug only)
+  debugPerp?: PerpDebug; // this fit's crossings + foreground-weighted perpendicularity (debug only)
+  debugPerpLum?: PerpDebug; // luminance fit's perpendicularity (winner carries both; debug only)
+  debugPerpMorph?: PerpDebug; // morphology fit's perpendicularity (debug only)
   // Line attrition through the fit stages, per family [A,B] (debug/diagnostic only): how many
   // lines survive raw→angle-split→duplicate-merge→VP-concurrency→regular-lattice. Pinpoints
   // WHERE an obvious grid's lines are being discarded.
@@ -161,6 +201,10 @@ export interface GridResult {
     // (cellsA/B), which over-counts by the image margin.
     spanA: number;
     spanB: number;
+    // Interpretable decomposition of `confidence` (the REAL sub-scores that fed gridConfidence),
+    // for the debug "Confidenza" panel. Populated in buildGrid whenever a pair was fitted (always,
+    // now that debug data is computed on every capture); absent on the empty/no-grid path.
+    confBreakdown?: ConfBreakdown;
   };
 }
 
@@ -464,7 +508,7 @@ export function* detectGridFromMatSteps(
   // OpenCV Mats are freed in `finally` so a throw mid-pipeline (a cv.* call) can't
   // leak the WASM heap. Each is nulled right after an explicit early delete; `edges`
   // is just an alias for whichever of cannyEdges/morphEdges is live, so only those
-  // two need tracking. (gateEdgesByFocus / chromaEdges / enhanceGridLines own their
+  // two need tracking. (gateEdgesByFocusPoint / chromaEdges / enhanceGridLines own their
   // own temporaries.)
   let gray: any = null;
   let clahe: any = null;
@@ -570,11 +614,11 @@ export function* detectGridFromMatSteps(
       chroma.delete();
     }
 
-    // Focus gating (off by default): the grid sits in the focal plane, so it is
-    // sharper than an out-of-focus background; suppress edges whose local sharpness
-    // is well below the median among edges. Self-disabling when the frame is
-    // uniformly sharp. See DetectorParams.
-    if (params.focusGating) gateEdgesByFocus(cv, gray, cannyEdges);
+    // Tap-to-focus weighting (off unless the user touched a point on the live preview):
+    // spatially bias the edge map toward that point — keep the grid near where they
+    // focused, drop the far-away background — via a soft radial mask. No-op when the frame
+    // was shot without a focus tap. See DetectorParams.focusPoint.
+    if (params.focusPoint) gateEdgesByFocusPoint(cv, cannyEdges, params.focusPoint);
     snap('edges', cannyEdges); // merged edge map (Canny [+ chroma]) before cleaning
 
     // How texture-saturated is the edge map? A clean grid leaves thin, sparse edges; a
@@ -780,8 +824,9 @@ export function* detectGridFromMatSteps(
     if (wantEdges) {
       // FIXED structural topology — every stage is drawn (even skipped ones) with its
       // in/out arrows.
-      // The Hough node of the pipeline that actually won (so the graph highlights the real path).
-      const winnerHough = result === morphFit ? 'houghMorph' : 'houghLum';
+      // The last FIT/scoring stage (perpendicularity) of the pipeline that actually won — the node
+      // whose fit the overlay is rebuilt from (so the graph highlights the real path).
+      const winnerPerp = result === morphFit ? 'perpMorph' : 'perpLum';
       const topo: Record<string, string[]> = {
         foto: [],
         gray: ['foto'],
@@ -802,17 +847,28 @@ export function* detectGridFromMatSteps(
         mbinh: ['mridgeh'],
         mbinv: ['mridgev'],
         morph: ['mbinh', 'mbinv'],
-        // Each pipeline runs its OWN Hough → raw detected lines; the final grid is the fit the
-        // consensus fusion selected.
+        // Each pipeline runs its OWN Hough → raw detected lines, then the fit whittles them down in
+        // three stages (split into two directions → per-family duplicate merge → vanishing-point
+        // concurrency) before the shared lattice rebuild. The final grid is the fit the fusion picked.
         houghLum: ['oriented'],
+        splitLum: ['houghLum'],
+        mergeLum: ['splitLum'],
+        vpLum: ['mergeLum'],
+        perpLum: ['vpLum'],
         houghMorph: ['morph'],
-        overlay: ['houghLum', 'houghMorph'],
+        splitMorph: ['houghMorph'],
+        mergeMorph: ['splitMorph'],
+        vpMorph: ['mergeMorph'],
+        perpMorph: ['vpMorph'],
+        overlay: ['perpLum', 'perpMorph'],
       };
       const label: Record<string, string> = {
         foto: 'Foto', gray: 'Grigio', clahe: 'Contrasto', blur: 'Sfocatura', canny: 'Canny',
         chroma: 'Bordi colore', edges: 'Bordi uniti', clean: 'Pulizia texture',
         oriented: 'Orientati', mridgeh: 'Cresta H', mridgev: 'Cresta V', mbinh: 'Linee H',
         mbinv: 'Linee V', morph: 'Morfologica', houghLum: 'Hough L', houghMorph: 'Hough M',
+        splitLum: 'Split L', mergeLum: 'Merge L', vpLum: 'Fuga L', perpLum: 'Perp L',
+        splitMorph: 'Split M', mergeMorph: 'Merge M', vpMorph: 'Fuga M', perpMorph: 'Perp M',
         overlay: 'Griglia',
       };
       const executed: Record<string, boolean> = {
@@ -820,11 +876,21 @@ export function* detectGridFromMatSteps(
         chroma: chromaExecuted, edges: true, clean: cleanApplied,
         oriented: orientedRan, mridgeh: morphRan, mridgev: morphRan, mbinh: morphRan, mbinv: morphRan,
         morph: morphRan, houghLum: true, houghMorph: morphRan, overlay: true,
+        splitLum: true, mergeLum: true, vpLum: true, perpLum: true,
+        splitMorph: morphRan, mergeMorph: morphRan, vpMorph: morphRan, perpMorph: morphRan,
       };
       // The ACTUAL data path to the final grid (walk back through the input each stage
       // really used — bypassing skipped stages / non-contributing branches).
       const realInput: Record<string, string[]> = {
-        overlay: [winnerHough],
+        overlay: [winnerPerp],
+        perpLum: ['vpLum'],
+        vpLum: ['mergeLum'],
+        mergeLum: ['splitLum'],
+        splitLum: ['houghLum'],
+        perpMorph: ['vpMorph'],
+        vpMorph: ['mergeMorph'],
+        mergeMorph: ['splitMorph'],
+        splitMorph: ['houghMorph'],
         houghLum: [orientedAdopted ? 'oriented' : cleanApplied ? 'clean' : 'edges'],
         houghMorph: ['morph'],
         oriented: [cleanApplied ? 'clean' : 'edges'],
@@ -872,11 +938,18 @@ export function* detectGridFromMatSteps(
         cells: [Math.max(0, c.r.info.aCount - 1), Math.max(0, c.r.info.bCount - 1)],
         degenerate: c.r.info.degenerate,
         chosen: i === winnerIdx,
+        // The candidate's own confidence decomposition (pure arithmetic; always present once a pair
+        // was fitted), so the "Confidenza" tab can explain WHY each got its score.
+        breakdown: c.r.info.confBreakdown,
       }));
       result.debugAgreement = agreement;
       result.debugTimings = timings;
       result.debugRawLum = mainFit.rawLines;
       if (morphFit) result.debugRawMorph = morphFit.rawLines;
+      result.debugStagesLum = mainFit.debugStageLines;
+      if (morphFit) result.debugStagesMorph = morphFit.debugStageLines;
+      result.debugPerpLum = mainFit.debugPerp;
+      if (morphFit) result.debugPerpMorph = morphFit.debugPerp;
     }
 
     // Stamp the FUSED confidence (after the panel above captured each candidate's value).
@@ -1367,74 +1440,39 @@ function chromaEdges(cv: any, work: any): any {
 }
 
 /**
- * Suppress edge pixels that lie in out-of-focus regions. `gray` is the working
- * grayscale image, `edges` the Canny mask (modified in place). We build a local
- * sharpness map = mean |Laplacian| over a window, then keep only edges whose
- * local sharpness is at least a fraction of the MEDIAN sharpness among all edge
- * pixels. The median is robust, so a few very sharp/blurry outliers don't skew
- * it, and when everything is equally sharp the threshold is far below the bulk
- * and nothing is dropped.
+ * Spatially weight the edge map toward the user's tap-to-focus point. `edges` is the
+ * Canny mask (modified in place); `point` is normalized [0,1] in the frame. We build a
+ * soft radial mask centred on the point — a generous filled disc, lightly feathered so
+ * the falloff isn't a hard ring — and AND it into the edges: the grid the user pointed at
+ * is kept, the far background is discarded. The radius is deliberately large (it must not
+ * clip the grid, only shed distant clutter). A degenerate or out-of-range point is a no-op.
  */
-function gateEdgesByFocus(cv: any, gray: any, edges: any): void {
-  const minDim = Math.min(gray.cols, gray.rows);
-  if (minDim < 40) return;
+function gateEdgesByFocusPoint(cv: any, edges: any, point: { x: number; y: number }): void {
+  const cols = edges.cols;
+  const rows = edges.rows;
+  if (cols < 2 || rows < 2) return;
+  if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return;
+  if (point.x < 0 || point.x > 1 || point.y < 0 || point.y > 1) return;
 
-  // Local sharpness: mean of |Laplacian| over a window (~4% of the short side).
-  let win = Math.round(minDim * 0.04);
-  win = Math.max(9, win | 1); // odd, >= 9
-  const lap = new cv.Mat();
-  const absLap = new cv.Mat();
-  const sharp = new cv.Mat();
+  // Normalized → working-resolution edge coordinates.
+  const px = Math.round(point.x * cols);
+  const py = Math.round(point.y * rows);
+  // Generous radius so the whole grid around the tap survives — we only mean to shed the
+  // far-away background, not crop the map.
+  const R = Math.round(0.55 * Math.max(cols, rows));
+  if (R < 1) return;
+  // Light feather (odd kernel) so the disc edge isn't a hard cut.
+  let k = Math.round(0.12 * R) | 1; // force odd
+  k = Math.max(9, k);
+
+  const mask = cv.Mat.zeros(rows, cols, cv.CV_8U);
   try {
-    // Explicit args: OpenCV.js (embind) is strict about argument counts.
-    cv.Laplacian(gray, lap, cv.CV_16S, 3, 1, 0, cv.BORDER_DEFAULT);
-    cv.convertScaleAbs(lap, absLap, 1, 0); // |Laplacian| as 8U
-    cv.boxFilter(
-      absLap,
-      sharp,
-      cv.CV_32F,
-      new cv.Size(win, win),
-      new cv.Point(-1, -1),
-      true,
-      cv.BORDER_DEFAULT,
-    ); // local mean of |Laplacian|
-
-    // Collect the local sharpness at edge pixels (subsampled for speed).
-    const em = edges.data as Uint8Array;
-    const sm = sharp.data32F as Float32Array;
-    const n = em.length;
-    const step = Math.max(1, Math.floor(n / 200000)); // cap the sample size
-    const vals: number[] = [];
-    let edgeCount = 0;
-    for (let i = 0; i < n; i += step) {
-      if (em[i]) {
-        edgeCount++;
-        vals.push(sm[i]);
-      }
-    }
-    if (edgeCount < 500) return; // too few edges to judge focus reliably
-    const med = median(vals);
-    if (med <= 0) return;
-
-    // Keep edges with local sharpness >= 0.35 * median. Only clearly-blurry
-    // edges (well below the typical grid sharpness) are removed.
-    const thr = 0.35 * med;
-    const mask = new cv.Mat();
-    try {
-      cv.threshold(sharp, mask, thr, 255, cv.THRESH_BINARY);
-      mask.convertTo(mask, cv.CV_8U);
-      // If gating would wipe out almost everything, it's likely mis-firing on a
-      // faint grid — bail out and keep the original edges.
-      cv.bitwise_and(edges, mask, mask);
-      if (cv.countNonZero(mask) < 0.15 * cv.countNonZero(edges)) return;
-      mask.copyTo(edges);
-    } finally {
-      mask.delete();
-    }
+    cv.circle(mask, new cv.Point(px, py), R, new cv.Scalar(255), -1);
+    cv.GaussianBlur(mask, mask, new cv.Size(k, k), 0);
+    cv.threshold(mask, mask, 40, 255, cv.THRESH_BINARY);
+    cv.bitwise_and(edges, mask, edges);
   } finally {
-    lap.delete();
-    absLap.delete();
-    sharp.delete();
+    mask.delete();
   }
 }
 
@@ -1775,12 +1813,14 @@ export function buildGrid(
   const mA = mergeDuplicateLines(famA, mergeDist);
   const mB = mergeDuplicateLines(famB, mergeDist);
 
-  // --- Vanishing point per family (RANSAC) — keeps only concurrent lines --
-  // Lines are in centred coords, so the frame half-extents are W0/2, H0/2.
-  const vA = ransacVP(mA.map((m) => m.line), W0 / 2, H0 / 2);
-  const vB = ransacVP(mB.map((m) => m.line), W0 / 2, H0 / 2);
-  const inA = vA.inliers.map((k) => mA[k]);
-  const inB = vB.inliers.map((k) => mB[k]);
+  // --- Vanishing points per family: MULTI-model (sequential RANSAC) ------
+  // A single per-family VP is corruptible — noise can forge a spurious vanishing point that derails
+  // everything downstream. Instead we extract SEVERAL candidate VPs per family (each a concurrent
+  // sub-fascio), pair them ACROSS families below, and let the foreground perpendicularity pick the
+  // pairing that yields the squarest grid. So a fake VP is a LOSING candidate, not a global
+  // corruption. Lines are in centred coords → frame half-extents W0/2, H0/2 (support-weighted inside).
+  const vpAs = multiVP(mA, W0 / 2, H0 / 2);
+  const vpBs = multiVP(mB, W0 / 2, H0 / 2);
 
   // --- Rectify with the horizon, then fit + rebuild the lattice ---------
   // Extension works in the centred coordinate frame used for fitting; a line
@@ -1797,50 +1837,49 @@ export function buildGrid(
     return (Math.abs(Math.cos(a)) * W0 + Math.abs(Math.sin(a)) * H0) / spacing;
   };
 
-  // Fit BOTH families with ONE rectification and score the resulting pair. `degenerate`,
-  // `cellsAcross`, the sub-pitch guard and each line's backToImage all read the families in
-  // image space but assume they came from a SINGLE coherent plane — so the rectification is
-  // chosen per-PAIR, never mixed between families (a mixed H would be geometrically incoherent).
-  const fitPair = (Hm: M3) => {
-    const A = fitFamilyGrid(inA, Hm, params, crossesImage, minCell);
-    const B = fitFamilyGrid(inB, Hm, params, crossesImage, minCell);
-    // A degenerate (sub-pitch) fit has an implausibly small cell — reconstruction
-    // was already skipped for it; also drop its confidence to ~0 so the UI warns.
-    // Read the per-family MAX-based flag (largest/nearest image cell < minCell), NOT the median
-    // `spacing`: under perspective the extended lines near the vanishing point drag the median
-    // below minCell and would falsely flag a genuine steep grid as degenerate.
+  // Fit ONE candidate pair of sub-families under ONE rectification and score it. The rectification is
+  // per-PAIR (a mixed H would be geometrically incoherent). `perp` is the foreground-weighted metric
+  // squareness AFTER H — it (not raw VP concurrency) is the JUDGE that ranks the hypotheses, so a
+  // spurious VP produces a sheared grid and loses. `degenerate`/`cellsAcross`/backToImage read the
+  // families in image space but assume a single coherent plane, hence the per-pair rectification.
+  const fitPairFor = (inAms: LineSup[], inBms: LineSup[], Hm: M3, vpAv: V3, vpBv: V3) => {
+    const A = fitFamilyGrid(inAms, Hm, params, crossesImage, minCell);
+    const B = fitFamilyGrid(inBms, Hm, params, crossesImage, minCell);
     const degenerate = A.degenerate || B.degenerate;
     const cellsA = cellsAcross(A.angleDeg, A.spacing);
     const cellsB = cellsAcross(B.angleDeg, B.spacing);
-    // Cell squareness (ratio of the two families' pitches) feeds the confidence's soft
-    // squareness term; cellsA/cellsB stay for `info` and the fusion size tie-break.
     const pitchA = A.spacing;
     const pitchB = B.spacing;
     const aspect =
       pitchA > 0 && pitchB > 0 ? Math.max(pitchA / pitchB, pitchB / pitchA) : Infinity;
-    const confidence = gridConfidence(A.metrics, B.metrics, degenerate, aspect);
-    return { A, B, degenerate, cellsA, cellsB, confidence, minCount: Math.min(A.metrics.count, B.metrics.count) };
+    const perp = foregroundPerp(A.lines, B.lines, Hm, vpAv, vpBv, W0, H0);
+    const confidence = gridConfidence(A.metrics, B.metrics, degenerate, aspect, perp.score);
+    return { A, B, degenerate, cellsA, cellsB, aspect, confidence, perp, inA: inAms, inB: inBms, minCount: Math.min(A.metrics.count, B.metrics.count) };
   };
 
-  // Fix 1 (Symptom A — an obvious grid reads confidence 0): a marginally-wrong vanishing point
-  // makes buildRectify's H smear the rectified offsets, collapsing a family to ~2 lines and
-  // zeroing the geometric-mean confidence. Re-fit the WHOLE pair with the IDENTITY rectification
-  // too and keep the better-scoring pair. Chosen per-PAIR (not per-family) so both families
-  // always share one plane — see fitPair. A correctly-rectified perspective grid TYPICALLY keeps
-  // its H-fit (identity smears it → lower confidence); this improves the collapsed-family case
-  // but is a heuristic, not a formal guarantee — a mildly-off VP could still let a plausible-but-
-  // wrong identity lattice edge ahead, so it wants validation on the label gallery. buildRectify
-  // returns the IDENTITY3 const itself when there's no perspective, so the second fit is
-  // redundant then and skipped.
-  const H = buildRectify(vA.vp, vB.vp);
-  // Fit H, and if it's a real rectification also fit identity and keep the better pair,
-  // rescuing a family a marginally-wrong VP smeared to ~2 lines.
-  let chosen = fitPair(H);
-  if (H !== IDENTITY3) {
-    const withIdentity = fitPair(IDENTITY3);
-    if (betterPair(withIdentity, chosen)) chosen = withIdentity;
+  // HYPOTHESISE-AND-VERIFY: try every (VP_A × VP_B) pairing — plus the IDENTITY rectification for each
+  // (rescuing a family a marginally-wrong VP would smear to ~2 lines) — and keep the pair the
+  // perpendicularity-weighted confidence scores highest (betterPair). A spurious/fake vanishing point
+  // yields a sheared, irregular grid and LOSES; the true VP wins. Robust BY CONSTRUCTION to a fake VP —
+  // no single VP can "derail everything" because they all compete and the bad ones are beaten.
+  const firstA = vpAs[0];
+  const firstB = vpBs[0];
+  let chosen = fitPairFor(firstA.lines, firstB.lines, buildRectify(firstA.vp, firstB.vp), firstA.vp, firstB.vp);
+  let hypotheses = 0;
+  for (const ca of vpAs) {
+    for (const cb of vpBs) {
+      const Hc = buildRectify(ca.vp, cb.vp);
+      const rects = Hc !== IDENTITY3 ? [Hc, IDENTITY3] : [Hc];
+      for (const Hm of rects) {
+        hypotheses++;
+        const cand = fitPairFor(ca.lines, cb.lines, Hm, ca.vp, cb.vp);
+        if (betterPair(cand, chosen)) chosen = cand;
+      }
+    }
   }
-  const { A, B, degenerate, cellsA, cellsB, confidence } = chosen;
+  const { A, B, degenerate, cellsA, cellsB, aspect, confidence, perp } = chosen;
+  const inA = chosen.inA; // the WINNING VP's concurrent lines — what the "Fuga" node now shows
+  const inB = chosen.inB;
 
   const familyA = A.lines.map(fromCentered);
   const familyB = B.lines.map(fromCentered);
@@ -1857,6 +1896,17 @@ export function buildGrid(
       vp: [inA.length, inB.length],
       lattice: [A.metrics.count, B.metrics.count],
     },
+    // Same attrition as debugFit above, but the actual LINES (image space) at each stage, for the
+    // per-stage debug nodes. Independent of which rectification `fitPair` chose (all computed before it).
+    debugStageLines: {
+      splitA: famA.map(fromCentered),
+      splitB: famB.map(fromCentered),
+      mergedA: mA.map((m) => fromCentered(m.line)),
+      mergedB: mB.map((m) => fromCentered(m.line)),
+      vpA: inA.map((m) => fromCentered(m.line)),
+      vpB: inB.map((m) => fromCentered(m.line)),
+    },
+    debugPerp: { crossings: perp.crossings, score: perp.score, hypotheses },
     info: {
       rawCount: raw.length,
       aCount: familyA.length,
@@ -1881,6 +1931,9 @@ export function buildGrid(
       degenerate,
       spanA: A.metrics.span,
       spanB: B.metrics.span,
+      // Real sub-scores that produced `confidence` above (same inputs, single source of truth) —
+      // surfaced for the debug "Confidenza" panel.
+      confBreakdown: gridConfidenceBreakdown(A.metrics, B.metrics, degenerate, aspect, perp.score),
     },
   };
 
@@ -1933,6 +1986,7 @@ function ransacVP(
   lines: Line2[],
   halfW = Infinity,
   halfH = Infinity,
+  weights?: number[],
 ): { vp: V3; inliers: number[] } {
   const N = lines.length;
   if (N < 3) return { vp: [0, 0, 1], inliers: lines.map((_, i) => i) };
@@ -1953,6 +2007,31 @@ function ransacVP(
   }
   if (best.length < 3) return { vp: [0, 0, 1], inliers: lines.map((_, i) => i) };
 
+  // GROW the inlier set toward the TRUE vanishing point ("Fuga deletes good lines" fix): the seed
+  // `best` came from ONE (possibly noisy) line pair via a tight 1.5° gate, so it can MISS real family
+  // lines. Refine the (support-weighted) VP on the current inliers, then re-collect every line that
+  // concurs with THAT better VP, keeping the UNION — so a good line is only ever ADDED, never removed.
+  // Repeats a couple of times; converges fast (a real family stabilises, texture doesn't grow).
+  for (let iter = 0; iter < 2; iter++) {
+    const vpR = vanishingPoint(
+      best.map((k) => lines[k]),
+      weights ? best.map((k) => weights[k]) : undefined,
+    );
+    if (!vpR) break; // parallel family → VP at infinity, nothing to grow toward
+    const vpHom: V3 = [vpR.x, vpR.y, 1];
+    const inSet = new Set(best);
+    let grew = false;
+    for (let k = 0; k < N; k++) {
+      if (!inSet.has(k) && vpResidualDeg(lines[k], vpHom) <= angTol) {
+        best.push(k);
+        inSet.add(k);
+        grew = true;
+      }
+    }
+    if (!grew) break;
+  }
+  best.sort((a, b) => a - b);
+
   // Refine the VP, but only TRUST a finite VP when the inliers actually fan (else
   // the far intersection is noise) AND it lands outside the image frame (a real
   // family's VP must be off-frame). Otherwise treat the family as parallel — the
@@ -1960,7 +2039,13 @@ function ransacVP(
   // garbage horizon into buildRectify and compressing the lattice to a sub-pitch.
   const meanA = meanAngle180(best.map((k) => angleOfDeg(lines[k].nx, lines[k].ny)));
   const fan = Math.max(...best.map((k) => angDist180(angleOfDeg(lines[k].nx, lines[k].ny), meanA)));
-  let refined = fan >= VP_MIN_FAN_DEG ? vanishingPoint(best.map((k) => lines[k])) : null;
+  let refined =
+    fan >= VP_MIN_FAN_DEG
+      ? vanishingPoint(
+          best.map((k) => lines[k]),
+          weights ? best.map((k) => weights[k]) : undefined,
+        )
+      : null;
   // A wide fan of many concurrent lines is a GENUINE vanishing point even inside the
   // frame (shallow floor/table shot) — trust it. Otherwise an in-frame VP is spurious.
   const strongVP = fan >= VP_STRONG_FAN_DEG && best.length >= VP_STRONG_MIN_INLIERS;
@@ -1982,6 +2067,27 @@ function ransacVP(
   return { vp, inliers: best };
 }
 
+/** Extract MULTIPLE vanishing-point models from ONE family (sequential RANSAC / "peel-off"). A noise
+ * cluster can forge a spurious VP that corrupts a single per-family estimate; so instead of trusting
+ * ONE VP, we take the strongest, remove its concurrent lines, and repeat — yielding several candidate
+ * (VP, sub-family) models. The caller pairs them across the two families and lets the foreground
+ * perpendicularity JUDGE which pairing is the real square grid, so a fake VP is just a LOSING
+ * candidate, never a global corruption. Each line is support-weighted (`1 + log(support)`). */
+function multiVP(ms: LineSup[], halfW: number, halfH: number, maxModels = 3): { vp: V3; lines: LineSup[] }[] {
+  const models: { vp: V3; lines: LineSup[] }[] = [];
+  let pool = ms.slice();
+  while (models.length < maxModels && pool.length >= 3) {
+    const weights = pool.map((m) => 1 + Math.log(m.support));
+    const { inliers, vp } = ransacVP(pool.map((m) => m.line), halfW, halfH, weights);
+    if (inliers.length < 3) break;
+    const inSet = new Set(inliers);
+    models.push({ vp, lines: inliers.map((k) => pool[k]) });
+    pool = pool.filter((_, k) => !inSet.has(k));
+  }
+  // Never worse than the single-VP path: if nothing peeled off, use the whole family as one model.
+  return models.length ? models : [{ vp: [0, 0, 1], lines: ms }];
+}
+
 /** Rectifying homography that sends the horizon (VP_A × VP_B) to infinity. */
 function buildRectify(vpA: V3, vpB: V3): M3 {
   const horizon = cross3(vpA, vpB);
@@ -1992,6 +2098,53 @@ function buildRectify(vpA: V3, vpB: V3): M3 {
   const l2 = horizon[2] / hn;
   if (!isFinite(l2) || Math.abs(l2) < 1e-6) return IDENTITY3; // horizon through centre
   return [1, 0, 0, 0, 1, 0, l0, l1, l2];
+}
+
+/** Foreground-weighted metric squareness of a fitted grid. A correct square grid, AFTER the
+ * rectification `H`, has PERPENDICULAR crossings; a wrong vanishing point leaves them SHEARED
+ * (rhombus) — which the pitch-ratio `aspect` alone can't see. At each in-frame crossing of the two
+ * families we measure the angle between the two directions IN THE RECTIFIED plane (finite
+ * differences through `H`), score it `|sin θ|` ∈ [0,1] (1 = right angle), and average it WEIGHTED
+ * toward the FOREGROUND — crossings far from the horizon (near the viewer), whose large cells are
+ * least distorted and most reliable (world error ∝ 1/dist²). Returns the aggregate score + the
+ * per-crossing data (image space) for the debug node. Lines & VPs are in CENTRED coords. Pure. */
+function foregroundPerp(aLines: Line2[], bLines: Line2[], H: M3, vpA: V3, vpB: V3, W0: number, H0: number): PerpDebug {
+  const horizon = cross3(vpA, vpB); // centred coords; ≈[·,·,0] when both VPs are at infinity
+  const hn = Math.hypot(horizon[0], horizon[1]);
+  const eps = 0.01 * Math.min(W0, H0);
+  const apply = (x: number, y: number): { x: number; y: number } | null => {
+    const v = mulM3V(H, [x, y, 1]);
+    if (Math.abs(v[2]) < 1e-12) return null;
+    return { x: v[0] / v[2], y: v[1] / v[2] };
+  };
+  const crossings: PerpCross[] = [];
+  let sw = 0;
+  let swp = 0;
+  for (const a of aLines) {
+    for (const b of bLines) {
+      const p = intersect(a, b); // centred
+      if (!p || Math.abs(p.x) > W0 / 2 || Math.abs(p.y) > H0 / 2) continue; // in-frame crossings only
+      const p0 = apply(p.x, p.y);
+      const pa = apply(p.x - a.ny * eps, p.y + a.nx * eps); // step along line a's direction (−ny, nx)
+      const pb = apply(p.x - b.ny * eps, p.y + b.nx * eps); // …and along line b's
+      if (!p0 || !pa || !pb) continue;
+      const ax = pa.x - p0.x, ay = pa.y - p0.y;
+      const bx = pb.x - p0.x, by = pb.y - p0.y;
+      const na = Math.hypot(ax, ay), nb = Math.hypot(bx, by);
+      if (na < 1e-9 || nb < 1e-9) continue;
+      const cos = (ax * bx + ay * by) / (na * nb);
+      const perp = Math.sqrt(Math.max(0, 1 - cos * cos)); // |sin θ|
+      let weight = 1;
+      if (hn >= 1e-9) {
+        const dist = Math.abs(horizon[0] * p.x + horizon[1] * p.y + horizon[2]) / hn;
+        weight = dist * dist; // foreground (far from horizon) weighted quadratically
+      }
+      sw += weight;
+      swp += weight * perp;
+      crossings.push({ x: p.x + W0 / 2, y: p.y + H0 / 2, perp, weight });
+    }
+  }
+  return { crossings, score: sw > 0 ? swp / sw : 1 };
 }
 
 interface FamilyGrid {
@@ -2090,29 +2243,89 @@ export function harmonicAspect(aspect: number): number {
   return best;
 }
 
+/** Full, interpretable decomposition of `gridConfidence` — the REAL sub-scores that produce the
+ * internal confidence, for the debug "Confidenza" panel. `internal` is exactly what
+ * `gridConfidence` returns (that function delegates here), so the panel never re-derives by eye.
+ * `aspect` is the RAW pitch ratio as passed (may be Infinity when a pitch is 0); the square-ness
+ * term uses the sanitized, harmonic-aware `harmonicAspect`. Pure. */
+export interface ConfBreakdown {
+  qA: number; // familyQuality of axis A
+  qB: number; // familyQuality of axis B
+  countA: number;
+  inlierA: number;
+  fillA: number;
+  spanA: number;
+  countB: number;
+  inlierB: number;
+  fillB: number;
+  spanB: number;
+  pair: number; // 0.7·min(qA,qB) + 0.3·max(qA,qB)
+  aspect: number; // raw pitch ratio (as passed in; may be Infinity)
+  harmonicAspect: number; // harmonic-aware aspect actually fed to squareness
+  squareness: number; // soft cell-square-ness (pitch-ratio only) in [0.25,1]
+  perp: number; // foreground-weighted metric perpendicularity in [0,1] (1 = right angle; catches shear)
+  degenerate: boolean; // sub-pitch fit → geom forced to 0.1
+  internal: number; // = clamp01(pair · geom) — equals gridConfidence(...)
+}
+
+export function gridConfidenceBreakdown(
+  a: FamilyMetrics,
+  b: FamilyMetrics,
+  degenerate: boolean,
+  aspect = 1,
+  perp = 1,
+): ConfBreakdown {
+  const qA = familyQuality(a);
+  const qB = familyQuality(b);
+  const pair = 0.7 * Math.min(qA, qB) + 0.3 * Math.max(qA, qB);
+  const safeAspect = aspect > 0 && isFinite(aspect) ? aspect : MAX_CELL_ASPECT;
+  const ar = harmonicAspect(safeAspect);
+  const squareness = 0.25 + 0.75 * clamp01(1 - (ar - 1) / (MAX_CELL_ASPECT - 1));
+  // geom = pitch-ratio squareness (no elongation) × metric perpendicularity (no shear). A rhombus
+  // with equal pitches has squareness≈1 but perp≪1, so it's now penalised where before it wasn't.
+  const geom = degenerate ? 0.1 : squareness * perp;
+  const internal = clamp01(pair * geom);
+  return {
+    qA,
+    qB,
+    countA: a.count,
+    inlierA: a.inlier,
+    fillA: a.fill,
+    spanA: a.span,
+    countB: b.count,
+    inlierB: b.inlier,
+    fillB: b.fill,
+    spanB: b.span,
+    pair,
+    aspect,
+    harmonicAspect: ar,
+    squareness,
+    perp,
+    degenerate,
+    internal,
+  };
+}
+
 export function gridConfidence(
   a: FamilyMetrics,
   b: FamilyMetrics,
   degenerate: boolean,
   aspect = 1,
+  perp = 1,
 ): number {
-  const qA = familyQuality(a);
-  const qB = familyQuality(b);
-  const pair = 0.7 * Math.min(qA, qB) + 0.3 * Math.max(qA, qB);
-  const ar = harmonicAspect(aspect > 0 && isFinite(aspect) ? aspect : MAX_CELL_ASPECT);
-  const squareness = 0.25 + 0.75 * clamp01(1 - (ar - 1) / (MAX_CELL_ASPECT - 1));
-  const geom = degenerate ? 0.1 : squareness;
-  return clamp01(pair * geom);
+  return gridConfidenceBreakdown(a, b, degenerate, aspect, perp).internal;
 }
 
 /** Draw/keep an auto-detected grid when its calibrated confidence clears this bar. SINGLE SOURCE
  * OF TRUTH for the reliability decision (the UI gate imports it). Calibrated on the labelled corpus
- * (Fase A): the genuinely-correct grids all score ≥ ~0.86, while the false positives / imprecise
- * fits (a self-consistent but wrong lattice, a texture sub-pitch) sit at 0.43–0.53 — so 0.65
- * separates them with ~zero recall cost on the real grids and kills the #13-style false positive.
- * Confidence still measures lattice self-consistency + size + squareness, NOT image support yet
- * (see Fase C), so keep the bar here rather than trusting a low score. */
-export const DRAW_THRESHOLD = 0.65;
+ * (Fase A): the genuinely-correct grids scored ≥ ~0.86, while the false positives / imprecise fits
+ * (a self-consistent but wrong lattice, a texture sub-pitch) sat at 0.43–0.53 — a WIDE empty gap.
+ * The bar sits at 0.60: comfortably above the 0.53 false-positive ceiling (no known FP is admitted),
+ * yet low enough to recover borderline-correct grids that later scoring changes (harmonic-lock,
+ * degenerate fix) nudged into the 0.60–0.65 band. Re-validate on the corpus when moving it — do NOT
+ * re-tune against un-labelled guesses. Confidence still measures lattice self-consistency + size +
+ * squareness, NOT image support yet (see Fase C), so keep the bar here rather than trusting a low score. */
+export const DRAW_THRESHOLD = 0.6;
 
 /** THE reliability decision — pure and unit-testable: is this fit good enough to DRAW as the auto
  * grid? One calibrated score above threshold, PLUS two HARD guards kept OUT of the score because
@@ -2193,16 +2406,21 @@ function mergeDuplicateLines(lines: Line2[], mergeDist: number): LineSup[] {
   return out;
 }
 
-/** Least-squares vanishing point of a set of lines (null if ~parallel). */
-function vanishingPoint(lines: Line2[]): Pt | null {
+/** (Optionally weighted) least-squares vanishing point of a set of lines (null if ~parallel).
+ * Weights let a line's Hough SUPPORT (how many raw detections merged into it) pull the VP more:
+ * a strong, real grid line is trusted over a 1-vote straggler. This is the well-conditioned
+ * normal-equations solve, so noise can't blow the VP up the way intersecting two lines does. */
+function vanishingPoint(lines: Line2[], weights?: number[]): Pt | null {
   if (lines.length < 2) return null;
   let Sxx = 0, Sxy = 0, Syy = 0, bx = 0, by = 0;
-  for (const l of lines) {
-    Sxx += l.nx * l.nx;
-    Sxy += l.nx * l.ny;
-    Syy += l.ny * l.ny;
-    bx += l.nx * l.d;
-    by += l.ny * l.d;
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i];
+    const w = weights ? weights[i] : 1;
+    Sxx += w * l.nx * l.nx;
+    Sxy += w * l.nx * l.ny;
+    Syy += w * l.ny * l.ny;
+    bx += w * l.nx * l.d;
+    by += w * l.ny * l.d;
   }
   const det = Sxx * Syy - Sxy * Sxy;
   if (Math.abs(det) < 1e-6) return null; // lines parallel -> VP at infinity

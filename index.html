@@ -2,7 +2,8 @@
 <html lang="it">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="icon" type="image/png" href="/logo.png" />
+    <link rel="apple-touch-icon" href="/logo.png" />
     <meta
       name="viewport"
       content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
@@ -59,6 +60,18 @@
         <span class="tagline">Mappa tattica · PF2e</span>
         <div class="topbar-right">
           <span id="status" class="status">Caricamento…</span>
+          <!-- Debug-only: load a photo from the gallery instead of the camera (for
+               testing detection on saved images). Shown only when debug is active. -->
+          <button id="btnLoadImage" class="icon-btn" type="button" aria-label="Carica un'immagine dalla galleria" title="Carica un'immagine dalla galleria (debug)" hidden>
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M16 5h6" />
+              <path d="M19 2v6" />
+              <path d="M21 11.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h7.5" />
+              <path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" />
+              <circle cx="9" cy="9" r="2" />
+            </svg>
+          </button>
+          <input id="fileInput" type="file" accept="image/*" hidden />
           <!-- Result-mode actions: the (global) measure unit + retake. -->
           <div class="topbar-actions" id="topActions" hidden>
             <select id="areaUnit" class="sel sel-unit" aria-label="Unità di misura" title="Unità di misura">
@@ -66,6 +79,12 @@
               <option value="m">m</option>
               <option value="ft">ft</option>
             </select>
+            <button id="btnEditGrid" class="icon-btn" type="button" aria-label="Modifica la griglia a mano" title="Modifica la griglia a mano" hidden>
+              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="3" y="3" width="18" height="18" rx="1" />
+                <path d="M3 9h18M3 15h18M9 3v18M15 3v18" />
+              </svg>
+            </button>
             <button id="btnRetake" class="icon-btn" type="button" aria-label="Rifai la foto" title="Rifai la foto">
               <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z" />
@@ -81,7 +100,12 @@
         <video id="video" playsinline muted autoplay></video>
         <!-- Captured photo + AR overlay are drawn on this single canvas -->
         <canvas id="view" hidden></canvas>
-        <div id="hint" class="hint">Inquadra una griglia di quadrati e scatta.</div>
+        <div id="hint" class="hint">Inquadra la griglia e scatta</div>
+
+        <!-- Debug step viewer: a scrollable row of numbered stage chips, shown only in
+             debug mode. Chips are injected by main.ts; the last (default) shows the
+             live line overlay, the others show that pipeline stage's image. -->
+        <div id="debugBar" class="debug-bar" hidden></div>
 
         <!-- Contextual heads-up panel, overlaid on the TOP of the map. Shows the
              controls for whatever is active (a selected piece, an area, or a
@@ -126,7 +150,6 @@
                 <select id="areaSizeSel" class="sel" aria-label="Dimensione dell'area" title="Dimensione"></select>
                 <select id="areaCreature" class="sel" aria-label="Taglia della creatura" title="Taglia creatura" hidden></select>
               </div>
-              <p class="hud-hint" id="areaRotHint" hidden>Ruota trascinando la punta sulla mappa.</p>
             </div>
 
             <!-- Piece editor -->
@@ -135,18 +158,72 @@
                 <label class="fld">Taglia <select id="pieceSize" class="sel"></select></label>
                 <label class="fld">Movimento <select id="pieceMove" class="sel"></select></label>
               </div>
-              <p class="hud-hint">Tocca la pedina per il movimento · trascinala per spostarla.</p>
             </div>
 
-            <!-- Movement -->
-            <div class="hud-section" id="hudMove" hidden>
-              <p class="hud-hint">Tocca una cella per vedere i percorsi · tocca un'altra pedina per spostarti su di essa.</p>
-            </div>
+            <!-- Movement (controls live on the map; guidance is behind the (i) button) -->
+            <div class="hud-section" id="hudMove" hidden></div>
           </div>
         </div>
 
-        <!-- Transient hint (e.g. entering placement mode), bottom-left near the FAB. -->
-        <div class="toast" id="toast" hidden></div>
+        <!-- Processing overlay: shown while a captured photo is being analysed.
+             The die spins (compositor-driven, so it keeps turning even while the
+             synchronous OpenCV stages briefly block the main thread) and the bar
+             advances in steps as the detector reports progress. -->
+        <div id="processing" class="processing" hidden>
+          <img class="loader-die" src="/loading.png" alt="" aria-hidden="true" />
+          <p class="processing-msg" id="processingMsg">Analisi dell'immagine…</p>
+          <p class="processing-sub">Individuo la griglia nella foto, riempio le linee occluse ed estendo la griglia al resto dell'immagine.</p>
+          <div class="processing-bar"><div id="processingFill" class="processing-fill"></div></div>
+          <span class="processing-pct" id="processingPct">0%</span>
+        </div>
+
+        <!-- Manual-grid chooser: shown only when the user taps the top-bar edit
+             button. Lets them pick how to make/replace the grid by hand. (There is no
+             automatic fallback panel — a found grid is always drawn, and the user
+             decides whether to edit it or retake.) -->
+        <div id="editChooser" class="grid-fail" hidden>
+          <div class="grid-fail-card">
+            <p class="grid-fail-title">Griglia manuale</p>
+            <p class="grid-fail-sub">Come vuoi crearla?</p>
+            <div class="grid-fail-actions">
+              <button id="chooseAdapt" class="btn btn-primary" type="button">Griglia da adattare</button>
+              <button id="chooseDraw" class="btn btn-ghost" type="button">Disegna a mano</button>
+            </div>
+            <button id="chooseCancel" class="btn-link" type="button">Annulla</button>
+          </div>
+        </div>
+
+        <!-- Manual-grid editor bar: shown (at the TOP, collapsible) while the user
+             adjusts a manual grid. Drag the corner handles on the map to fit the
+             grid; the ± / numeric inputs set how many cells it has. Collapsible so it
+             never hides a corner handle the user needs to reach. -->
+        <div id="manualBar" class="manual-bar" hidden>
+          <div class="manual-bar-head">
+            <button id="manualCancel" class="btn btn-ghost btn-mini" type="button">Annulla</button>
+            <button id="manualDone" class="btn btn-primary btn-mini" type="button">Fatto</button>
+            <button id="manualCollapse" class="hud-icon" type="button" aria-label="Riduci o espandi i controlli">
+              <svg class="chev" xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="m6 9 6 6 6-6" />
+              </svg>
+            </button>
+          </div>
+          <div class="manual-bar-body">
+            <div class="manual-bar-row">
+              <div class="stepper" aria-label="Numero di colonne">
+                <span class="stepper-lbl">Colonne</span>
+                <button id="colsMinus" class="stepper-btn" type="button" aria-label="Meno colonne">−</button>
+                <input id="colsInput" class="stepper-input" type="number" inputmode="numeric" min="1" max="60" step="1" value="10" aria-label="Numero di colonne" />
+                <button id="colsPlus" class="stepper-btn" type="button" aria-label="Più colonne">+</button>
+              </div>
+              <div class="stepper" aria-label="Numero di righe">
+                <span class="stepper-lbl">Righe</span>
+                <button id="rowsMinus" class="stepper-btn" type="button" aria-label="Meno righe">−</button>
+                <input id="rowsInput" class="stepper-input" type="number" inputmode="numeric" min="1" max="60" step="1" value="10" aria-label="Numero di righe" />
+                <button id="rowsPlus" class="stepper-btn" type="button" aria-label="Più righe">+</button>
+              </div>
+            </div>
+          </div>
+        </div>
 
         <!-- Floating "add" speed-dial (pieces / areas), overlaying the map. -->
         <div class="fab-wrap" id="fabWrap" hidden>
@@ -161,8 +238,31 @@
         <!-- Capture button (camera mode only). -->
         <button id="btnCapture" class="capture-btn" disabled>Scatta</button>
 
-        <!-- Build version (computed by GitVersion in CI), overlaid bottom-left. -->
-        <span id="versionBadge" class="version-badge" aria-hidden="true"></span>
+        <!-- Contextual help: a single (i) button (bottom-left, above the version
+             badge), shown only when there's guidance for the current state. Tapping
+             it toggles a small popover with what you can do right now — replaces the
+             scattered hints and transient toasts. -->
+        <div id="infoWrap" class="info-wrap" hidden>
+          <div id="infoPop" class="info-pop" hidden></div>
+          <button id="infoBtn" class="info-btn" type="button" aria-label="Mostra i suggerimenti">
+            <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="10" />
+              <path d="M12 16v-4M12 8h.01" />
+            </svg>
+          </button>
+        </div>
+
+        <!-- Build version (GitVersion in CI) + debug indicator, overlaid bottom-left. The
+             DBG chip shows only while debug mode is on (triple-tap the logo). -->
+        <div class="version-row">
+          <span id="versionBadge" class="version-badge" aria-hidden="true"></span>
+          <span id="dbgBadge" class="dbg-badge" aria-hidden="true" hidden>DBG</span>
+          <!-- Debug-only focus indicator (Lucide `focus`): BLUE when the last detection ran with a
+               tap-to-focus point, GREY otherwise. Shown together with the DBG chip. -->
+          <span id="focusBadge" class="focus-badge" aria-hidden="true" hidden>
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3"/></svg>
+          </span>
+        </div>
       </main>
     </div>
 

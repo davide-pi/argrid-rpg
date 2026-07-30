@@ -13,3 +13,11 @@ coverage
 
 # scratch
 .remember
+
+# local test photos (personal, large binaries — kept for manual/harness testing)
+example-bad-grid.jpg
+test-images/
+photo_*.jpg
+chroma-example.png
+public/tst/
+.playwright-mcp/

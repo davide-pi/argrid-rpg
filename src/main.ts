@@ -2,16 +2,25 @@ import './style.css';
 import { Camera } from './camera';
 import {
   detectGrid,
+  detectGridSteps,
+  buildGrid,
   clipLineToRect,
   intersect,
   DEFAULT_PARAMS,
+  DRAW_THRESHOLD,
+  isGridReliable,
   type DetectorParams,
   type GridResult,
   type Line2,
+  type RawLine,
+  type ConfBreakdown,
+  type StageLines,
 } from './grid-detector';
 import { attachZoomPan } from './zoom';
 import {
   makeGridMap,
+  solveHomography,
+  applyH,
   areaCells,
   moveCells,
   movePareto,
@@ -58,14 +67,51 @@ const loader = $<HTMLDivElement>('loader');
 const loaderMsg = $<HTMLParagraphElement>('loaderMsg');
 const loaderFill = $<HTMLDivElement>('loaderFill');
 
+// Processing overlay (shown while a captured photo is being analysed).
+const processing = $<HTMLDivElement>('processing');
+const processingMsg = $<HTMLParagraphElement>('processingMsg');
+const processingFill = $<HTMLDivElement>('processingFill');
+const processingPct = $<HTMLSpanElement>('processingPct');
+
 const btnCapture = $<HTMLButtonElement>('btnCapture');
 const btnRetake = $<HTMLButtonElement>('btnRetake');
+// Debug-only: load a saved photo from the gallery instead of the camera.
+const btnLoadImage = $<HTMLButtonElement>('btnLoadImage');
+const fileInput = $<HTMLInputElement>('fileInput');
 // The retake (camera) button lives in the top bar and shows only in result mode.
 const topActions = $<HTMLDivElement>('topActions');
 
+// Manual-grid chooser (shown only when the user taps the top-bar edit button).
+const editChooser = $<HTMLDivElement>('editChooser');
+const chooseAdapt = $<HTMLButtonElement>('chooseAdapt');
+const chooseDraw = $<HTMLButtonElement>('chooseDraw');
+const chooseCancel = $<HTMLButtonElement>('chooseCancel');
+
+// Result-mode "edit the grid by hand" button (top bar); always available so any
+// grid — even a well-detected one — can be adjusted.
+const btnEditGrid = $<HTMLButtonElement>('btnEditGrid');
+// Manual-grid editor bar.
+const manualBar = $<HTMLDivElement>('manualBar');
+const colsMinus = $<HTMLButtonElement>('colsMinus');
+const colsPlus = $<HTMLButtonElement>('colsPlus');
+const colsInput = $<HTMLInputElement>('colsInput');
+const rowsMinus = $<HTMLButtonElement>('rowsMinus');
+const rowsPlus = $<HTMLButtonElement>('rowsPlus');
+const rowsInput = $<HTMLInputElement>('rowsInput');
+const manualDone = $<HTMLButtonElement>('manualDone');
+const manualCancel = $<HTMLButtonElement>('manualCancel');
+const manualCollapse = $<HTMLButtonElement>('manualCollapse');
+
 // Debug has no on-screen switch — it's a hidden state toggled by triple-tapping
-// the logo. When on, detection draws its edge/line diagnostics and a verbose status.
+// the logo. When on, detection draws its edge/line diagnostics and a verbose status,
+// and the debug step viewer lets you inspect each pipeline stage.
 let debug = false;
+const debugBar = $<HTMLDivElement>('debugBar');
+// Selected debug pipeline node id ('overlay' = the live line overlay, the default).
+let debugStepId = 'overlay';
+let debugCollapsed = false;
+let debugLogOpen = false; // the timing log panel (scroll-text button) is showing
+let debugLogTab: 'tempi' | 'conf' = 'tempi'; // which log tab: timings vs confidence breakdown
 // Floating "add" speed-dial.
 const fabWrap = $<HTMLDivElement>('fabWrap');
 const fab = $<HTMLButtonElement>('fab');
@@ -84,17 +130,28 @@ const hudPiece = $<HTMLDivElement>('hudPiece');
 const hudMove = $<HTMLDivElement>('hudMove');
 const hudCollapse = $<HTMLButtonElement>('hudCollapse');
 const hudClose = $<HTMLButtonElement>('hudClose');
-const toast = $<HTMLDivElement>('toast');
+// Single contextual-help affordance (bottom-left, above the version badge).
+const infoWrap = $<HTMLDivElement>('infoWrap');
+const infoBtn = $<HTMLButtonElement>('infoBtn');
+const infoPop = $<HTMLDivElement>('infoPop');
 // Area controls (live inside the HUD now).
 const areaTypeBox = $<HTMLDivElement>('areaType');
 const areaSizeSel = $<HTMLSelectElement>('areaSizeSel');
 const areaUnit = $<HTMLSelectElement>('areaUnit');
 const areaCreature = $<HTMLSelectElement>('areaCreature');
-const areaRotHint = $<HTMLParagraphElement>('areaRotHint');
 const brand = $<HTMLElement>('brand');
 // Build version (injected by Vite — GitVersion in CI), shown small on the map.
 const versionBadge = $<HTMLSpanElement>('versionBadge');
 versionBadge.textContent = `v${__APP_VERSION__}`;
+// Debug indicator chip (next to the version); shown only while debug mode is on.
+const dbgBadge = $<HTMLSpanElement>('dbgBadge');
+// Debug-only focus indicator (next to the DBG chip): BLUE when the last detection ran with a
+// tap-to-focus point (`lastFocusPoint` set), GREY otherwise. Shown/hidden together with dbgBadge.
+const focusBadge = $<HTMLSpanElement>('focusBadge');
+function updateFocusBadge() {
+  focusBadge.hidden = !debug;
+  focusBadge.classList.toggle('on', !!lastFocusPoint);
+}
 // Per-piece editor (Taglia / Movimento), shown when a token is selected.
 const pieceSize = $<HTMLSelectElement>('pieceSize');
 const pieceMove = $<HTMLSelectElement>('pieceMove');
@@ -102,15 +159,40 @@ const pieceRemove = $<HTMLButtonElement>('pieceRemove');
 
 // --- State -------------------------------------------------------------
 const camera = new Camera(video);
+// Tap-to-focus: the point (NORMALIZED [0,1] in the video frame) the user tapped on the
+// live preview, or null when they didn't tap. Fed to the detector (currentParams) so the
+// capture weights that area. Reset to null on every (re)entry into camera mode, so each
+// shot starts clean. `lastFocusPoint` records the value the most recent detection ran
+// with, for the debug focus indicator.
+let focusPoint: { x: number; y: number } | null = null;
+let lastFocusPoint: { x: number; y: number } | null = null;
 // While rotating the angle ring OR dragging the selection/arrival, suppress pan
 // so the gesture only turns/moves that thing.
 let ringRotating = false;
 let dragKind: 'origin' | 'target' | 'piece' | null = null;
-const zoom = attachZoomPan(view, { suppress: () => ringRotating || dragKind !== null });
+// Manual-grid editing: which handle is being dragged (0..3 corner, 4 = translate,
+// 5 = tracing a line, 6 = pinch-resize). `manualActive` is true throughout manual
+// editing so the whole gesture surface (incl. image pinch-zoom) is handed to the
+// grid editor instead of the zoom controller.
+let manualDrag: number | null = null;
+let manualActive = false;
+const zoom = attachZoomPan(view, {
+  suppress: () => ringRotating || dragKind !== null || manualDrag !== null || manualActive,
+});
 let cv: any = null;
 let lastCapture: HTMLCanvasElement | null = null;
 let lastResult: GridResult | null = null;
 let showingResult = false; // true while a captured photo + overlay is shown
+// Whether a grid is currently drawn (and tactics can build on it). True when the
+// detector actually found one (both families detected, not a broken/degenerate fit),
+// or the user placed a manual one. When false we simply show the photo alone — there
+// is NO automatic fallback panel; the user edits or retakes from the top-bar buttons.
+let gridReliable = false;
+// When the detector DID synthesize a grid (families present) but the reliability gate rejected
+// it, this holds a human-readable "scartata: …" reason naming the failing condition(s) and their
+// offending values — surfaced only in debug mode (status header + debug info panel). Null when a
+// grid was drawn, or when nothing was detected at all.
+let gridRejectReason: string | null = null;
 
 // Tactical state.
 let gridMap: GridMap | null = null; // grid<->image mapping for the current grid
@@ -143,26 +225,65 @@ function setStatus(msg: string) {
   statusEl.textContent = msg;
 }
 
-// A transient bottom toast (max 2 lines, ~2s) for placement hints — replaces the
-// long "Modalità …" status line in the header.
-let toastTimer: ReturnType<typeof setTimeout> | null = null;
-let toastHide: ReturnType<typeof setTimeout> | null = null;
-function showToast(msg: string) {
-  if (toastTimer) clearTimeout(toastTimer);
-  if (toastHide) clearTimeout(toastHide);
-  toast.textContent = msg;
-  toast.hidden = false;
-  requestAnimationFrame(() => toast.classList.add('show'));
-  toastTimer = setTimeout(() => {
-    toast.classList.remove('show');
-    toastHide = setTimeout(() => (toast.hidden = true), 220); // after the fade-out
-  }, 2000);
+// --- Contextual help (single (i) button, bottom-left) ------------------
+// One affordance carries all the "what can I do now" guidance that used to be
+// scattered across HUD hints and transient toasts. It's shown (the (i) button) only when
+// there's something to say for the current state; the popover text stays CLOSED until the
+// user taps (i) — it never auto-opens.
+let infoOpen = false;
+
+// The exact top-bar button icons (Lucide), inlined so the (i) guidance points at the
+// real controls with their real glyphs — kept in sync with index.html (#btnEditGrid /
+// #btnRetake). Rendered as HTML (see updateInfo), so info strings are treated as HTML;
+// all guidance text is static, so there's no injection surface.
+const ICON_GRID =
+  '<span class="info-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="1"/><path d="M3 9h18M3 15h18M9 3v18M15 3v18"/></svg></span>';
+const ICON_CAM =
+  '<span class="info-ico"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg></span>';
+
+/** The guidance for the current app state (null → nothing to show, button hidden). May
+ * contain inline HTML (the real UI icons); updateInfo renders it as HTML. */
+function currentInfo(): string | null {
+  if (!showingResult) return null; // camera mode — the central on-screen hint suffices
+  if (manualActive) {
+    return manualDrawPending
+      ? 'Traccia una linea lungo ogni colonna e ogni riga (almeno 2 per direzione): da queste genero la griglia.\nTrascina gli estremi per correggere una linea · tocca la × per eliminarla.'
+      : 'Trascina gli angoli per adattare la griglia · trascina il centro per spostarla.\nAvvicina o allontana due dita per ridimensionarla.';
+  }
+  if (placeMode === 'area') return 'Tocca una cella per posizionare l’area.';
+  if (placeMode === 'ally') return 'Tocca le celle per aggiungere o togliere alleati.';
+  if (placeMode === 'enemy') return 'Tocca le celle per aggiungere o togliere nemici.';
+  const ctx = hudContext();
+  if (ctx === 'move')
+    return 'Tocca una cella per vedere i percorsi · tocca un’altra pedina per spostarti su di essa.';
+  if (ctx === 'piece') return 'Tocca la pedina per il movimento · trascinala per spostarla.';
+  if (ctx === 'area') {
+    const base = 'Trascina l’area per spostarla · tocca ✕ per rimuoverla.';
+    return currentAreaType === 'linea' || currentAreaType === 'cono'
+      ? 'Ruota l’area trascinando la punta sulla mappa.\n' + base
+      : base;
+  }
+  if (!gridReliable)
+    return `Nessuna griglia rilevata.\nDisegnala a mano con ${ICON_GRID} o rifai la foto con ${ICON_CAM}.`;
+  // Idle over a good grid: the always-available "what can I do". Point at the real
+  // top-bar buttons with their real icons (grid / camera).
+  return `Tocca ＋ per aggiungere pedine o aree.\nUsa ${ICON_GRID} per modificare la griglia, o ${ICON_CAM} per rifare la foto.`;
 }
-function hideToast() {
-  if (toastTimer) clearTimeout(toastTimer);
-  if (toastHide) clearTimeout(toastHide);
-  toast.classList.remove('show');
-  toast.hidden = true;
+
+/** Sync the (i) button + popover with the current state. */
+function updateInfo() {
+  const text = currentInfo();
+  if (!text) {
+    infoOpen = false;
+    infoWrap.hidden = true;
+    infoPop.hidden = true;
+    infoWrap.classList.remove('open');
+    return;
+  }
+  infoWrap.hidden = false;
+  infoPop.innerHTML = text; // static guidance, may embed the real UI icons (see ICON_*)
+  infoPop.hidden = !infoOpen;
+  infoWrap.classList.toggle('open', infoOpen);
 }
 
 // --- Heads-up panel (contextual controls over the map) -----------------
@@ -186,10 +307,15 @@ function refreshHud() {
   const ctx = hudContext();
   if (!ctx) {
     hud.hidden = true;
+    updateInfo();
     return;
   }
   hud.hidden = false;
   hud.classList.toggle('collapsed', hudCollapsed);
+  // Movement has no body controls (its guidance lives behind the (i) button), so
+  // drop the empty body and its collapse chevron.
+  hud.classList.toggle('bodyless', ctx === 'move');
+  hudCollapse.hidden = ctx === 'move';
   hudArea.hidden = ctx !== 'area';
   hudPiece.hidden = ctx !== 'piece';
   hudMove.hidden = ctx !== 'move';
@@ -209,6 +335,7 @@ function refreshHud() {
     hudTitle.textContent = 'Movimento';
     hudBadge.classList.add(moveGroup());
   }
+  updateInfo();
 }
 
 // Expand + rebuild — only for explicit entry points (add area / open editor / start
@@ -233,8 +360,9 @@ function removeActiveArea() {
 function currentParams(): DetectorParams {
   // Reconstruct the full 2-D lattice and rebuild every row/column (occluded ones
   // included) — with the vanishing-point + rectification model these are
-  // reliable, so the complete grid is shown.
-  return { ...DEFAULT_PARAMS, fillGrid: true };
+  // reliable, so the complete grid is shown. `focusPoint` (set by a tap on the live
+  // preview, null otherwise) makes the detector weight that area; null ⇒ today's behaviour.
+  return { ...DEFAULT_PARAMS, fillGrid: true, focusPoint };
 }
 
 const mb = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1);
@@ -284,6 +412,16 @@ function boot() {
           // the ring from a test harness.
           ringHandle: () => ringHandleGrid(),
           effectiveAngle: () => effectiveAngle(),
+          // Current detection state, for test assertions.
+          state: () => ({ gridReliable, gridDims: { ...gridDims }, showingResult }),
+          // Tap-to-focus point (normalized [0,1]) the next capture will weight: read it, or
+          // set one and re-detect the last capture (mirrors what a tap on the preview does).
+          focus: () => (focusPoint ? { ...focusPoint } : null),
+          setFocus: (p: { x: number; y: number } | null) => {
+            focusPoint = p ? { x: p.x, y: p.y } : null;
+            if (lastCapture) runDetection();
+            return focusPoint ? { ...focusPoint } : null;
+          },
         };
       }
       btnCapture.disabled = false;
@@ -303,6 +441,7 @@ function boot() {
 async function startCamera() {
   try {
     await camera.start();
+    clearFocusPoint(); // every new camera session / retake starts with focus OFF
     video.hidden = false;
     view.hidden = true;
     hint.hidden = false;
@@ -312,13 +451,95 @@ async function startCamera() {
     hud.hidden = true; // no contextual controls on the live camera
     if (placeMode !== 'none') setPlaceMode('none');
     fabWrap.hidden = true; // nothing to add on the live camera
-    setStatus('Fotocamera attiva');
+    setStatus(''); // no header status on the live camera (the on-map hint suffices)
+    updateInfo(); // hide the (i) button — nothing to guide on the camera
   } catch (err) {
     console.error(err);
     setStatus('Fotocamera non disponibile — tocca lo schermo per riprovare');
     throw err;
   }
 }
+
+// --- Tap-to-focus (live preview) ---------------------------------------
+// A tap on the live camera preview (a) drops a focus reticle there, (b) best-effort tells
+// the camera to focus that point, (c) stores it (normalized [0,1] in the video frame) so
+// the NEXT capture weights that area (see currentParams / gateEdgesByFocusPoint). No tap ⇒
+// focus stays off (identical to today's behaviour). The reticle is a Lucide `focus` glyph.
+const focusReticle = document.createElement('div');
+focusReticle.className = 'focus-reticle';
+focusReticle.hidden = true;
+focusReticle.setAttribute('aria-hidden', 'true');
+focusReticle.innerHTML =
+  '<svg viewBox="0 0 24 24" width="76" height="76" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><circle cx="12" cy="12" r="3"/></svg>';
+stage.appendChild(focusReticle);
+let focusReticleTimer: number | null = null;
+
+/** Map a tap on the live preview to the video frame (normalized [0,1]) + a stage-relative
+ * reticle position. The preview is object-fit:contain, so the video is letterboxed inside
+ * its element box — we map through the CONTAINED content rect (dropping the bars, clamping
+ * a tap that lands on one) to intrinsic videoWidth/videoHeight coords. Null if no frame yet. */
+function mapPreviewTap(
+  clientX: number,
+  clientY: number,
+): { nx: number; ny: number; sx: number; sy: number } | null {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return null;
+  const rect = video.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  // object-fit:contain — scale to fit, centre, letterbox the remainder.
+  const scale = Math.min(rect.width / vw, rect.height / vh);
+  const dw = vw * scale;
+  const dh = vh * scale;
+  const offX = (rect.width - dw) / 2;
+  const offY = (rect.height - dh) / 2;
+  // Tap inside the content rect; clamp a tap that fell on a letterbox bar to the content.
+  const lx = Math.max(0, Math.min(dw, clientX - rect.left - offX));
+  const ly = Math.max(0, Math.min(dh, clientY - rect.top - offY));
+  const nx = dw ? lx / dw : 0;
+  const ny = dh ? ly / dh : 0;
+  const stageRect = stage.getBoundingClientRect();
+  const sx = rect.left + offX + lx - stageRect.left;
+  const sy = rect.top + offY + ly - stageRect.top;
+  return { nx, ny, sx, sy };
+}
+
+/** Flash the focus reticle at a stage-relative position (~700ms pop + fade). */
+function showFocusReticle(sx: number, sy: number) {
+  focusReticle.style.left = sx + 'px';
+  focusReticle.style.top = sy + 'px';
+  focusReticle.hidden = false;
+  focusReticle.classList.remove('show');
+  void focusReticle.offsetWidth; // reflow so the animation restarts on rapid taps
+  focusReticle.classList.add('show');
+  if (focusReticleTimer !== null) clearTimeout(focusReticleTimer);
+  focusReticleTimer = window.setTimeout(() => {
+    focusReticle.classList.remove('show');
+    focusReticle.hidden = true;
+    focusReticleTimer = null;
+  }, 700);
+}
+
+/** Drop the active focus point + hide the reticle (each new camera session starts clean). */
+function clearFocusPoint() {
+  focusPoint = null;
+  if (focusReticleTimer !== null) {
+    clearTimeout(focusReticleTimer);
+    focusReticleTimer = null;
+  }
+  focusReticle.classList.remove('show');
+  focusReticle.hidden = true;
+}
+
+video.addEventListener('pointerdown', (e) => {
+  // Live camera only: not on the result canvas, and only once a frame is running.
+  if (showingResult || video.hidden || !camera.isRunning) return;
+  const m = mapPreviewTap(e.clientX, e.clientY);
+  if (!m) return;
+  focusPoint = { x: m.nx, y: m.ny };
+  camera.focusAt(m.nx, m.ny).catch(() => {}); // best-effort; never block the UI
+  showFocusReticle(m.sx, m.sy);
+});
 
 function capture() {
   if (!camera.isRunning) {
@@ -333,50 +554,840 @@ function capture() {
 
 function processImage(canvas: HTMLCanvasElement) {
   lastCapture = canvas;
+  detectGen++; // a new photo supersedes any in-flight analysis
   view.hidden = false;
   hint.hidden = true;
   zoom.reset(); // start each new capture unzoomed
   deselectCell(); // a new photo → drop the previous overlay and selection
   tokens = []; // …and the previous board tokens
+  // A new photo → drop any manual grid / fallback state from the previous one.
+  manualActive = false;
+  manualQuad = null;
+  showManualBar(false);
+  editChooser.hidden = true;
   if (placeMode !== 'none') setPlaceMode('none'); // turn off any active placement
   fabWrap.hidden = false; // the "add" FAB is available once there's a grid
-  runDetection();
-  btnCapture.hidden = true; // no Scatta once we already have a grid
-  topActions.hidden = false; // show the camera (retake) button at the top
-  // Push a history entry so the device/browser "back" returns to the camera
-  // (via popstate) instead of leaving the app.
+  // Enter result mode BEFORE detection so the chrome/(i) updates run by runDetection
+  // (updateResultChrome / updateInfo) see the correct mode — otherwise the FIRST photo
+  // leaves the (i) hidden and the FAB ungated. Push a history entry so the device/
+  // browser "back" returns to the camera (via popstate) instead of leaving the app.
   if (!showingResult) {
     showingResult = true;
     history.pushState({ argrid: 'result' }, '');
   }
+  runDetection();
+  btnCapture.hidden = true; // no Scatta once we already have a grid
+  topActions.hidden = false; // show the camera (retake) button at the top
 }
 
-function runDetection() {
+// Yield to the browser so it paints the overlay (bar + message) and keeps the
+// die's compositor animation running before we block on the next heavy stage.
+const nextFrame = () =>
+  new Promise<void>((resolve) => requestAnimationFrame(() => setTimeout(resolve, 0)));
+
+let detecting = false;
+// Detection generation: bumped on every new capture / retake so an in-flight analysis
+// (staged over many frames) can tell it has been SUPERSEDED and discard its result
+// instead of committing a stale grid over a newer photo. `detectPending` remembers that
+// a fresh photo arrived while a run was busy, so it's analysed once the run finishes.
+let detectGen = 0;
+let detectPending = false;
+
+// The reliability decision lives in `isGridReliable` (grid-detector.ts): confidence ≥ DRAW_THRESHOLD
+// + the hard `degenerate` / ≥2-lines guards. Cell-count, inlier, aspect are all folded into the
+// confidence there — see applyDetectedGrid.
+
+async function runDetection() {
+  // One detection at a time — the pipeline is heavy and holds OpenCV Mats.
   if (!cv || !lastCapture) return;
-  setStatus('Analisi…');
-  // Defer so 'Analisi…' paints before the synchronous CV work.
-  requestAnimationFrame(() => {
-    try {
-      const t0 = performance.now();
-      lastResult = detectGrid(cv, lastCapture!, currentParams(), debug);
-      // Grid↔image mapping for tactical overlays (unchanged across toggles).
-      gridMap = null;
-      if (lastResult && lastResult.familyA.length >= 2 && lastResult.familyB.length >= 2) {
-        gridMap = makeGridMap(lastResult.familyA, lastResult.familyB);
-        gridDims = { na: lastResult.familyA.length, nb: lastResult.familyB.length };
-      }
-      if (selectedCell) {
-        const [i, j] = selectedCell;
-        if (!gridMap || i >= gridDims.na - 1 || j >= gridDims.nb - 1) deselectCell();
-      }
-      const dt = Math.round(performance.now() - t0);
-      draw();
-      reportStatus(dt);
-    } catch (err) {
-      console.error(err);
-      setStatus('Errore analisi: ' + (err as Error).message);
+  if (detecting) {
+    // A run is in flight; it will pick up the latest capture when it finishes, so this
+    // photo isn't silently dropped (retake + quick re-shoot during analysis).
+    detectPending = true;
+    return;
+  }
+  detecting = true;
+  const myGen = detectGen; // the photo this run belongs to
+  showProcessing("Analisi dell'immagine…", 0);
+  await nextFrame(); // paint the overlay before the first blocking stage
+  try {
+    const t0 = performance.now();
+    // Drive the staged detector: paint each step, yield a frame (die spins /
+    // bar advances), then run the next synchronous stage. Always drained to
+    // completion so the generator's own `finally` frees its OpenCV Mats.
+    const params = currentParams();
+    lastFocusPoint = params.focusPoint; // remember what this run used (debug focus indicator)
+    // Compute the debug data (stage previews, timings, confidence breakdown) ONLY in debug mode —
+    // `wantEdges` is gated on `debug`, so a normal capture stays lean (no preview snapshots/extra
+    // allocations). Entering debug recomputes on demand (see the triple-tap handler).
+    const gen = detectGridSteps(cv, lastCapture, params, debug);
+    let step = gen.next();
+    while (!step.done) {
+      setProcessing(step.value.label, step.value.frac);
+      await nextFrame();
+      step = gen.next();
     }
+    // Superseded by a newer capture / retake while we were analysing (the staged run
+    // spans many frames)? Discard this result — committing it would draw an old grid
+    // over a newer photo.
+    if (myGen !== detectGen) return;
+    setProcessing('Quasi pronto…', 1);
+    lastResult = step.value;
+
+    // Draw whatever grid the detector actually FOUND — or nothing if it didn't. The
+    // user decides if it's good (they can edit it or retake); we no longer auto-hide
+    // low-confidence grids behind a panel.
+    applyDetectedGrid();
+    debugStepId = 'overlay'; // default to the final overlay on each new detection
+    if (selectedCell) {
+      const [i, j] = selectedCell;
+      if (!gridMap || i >= gridDims.na - 1 || j >= gridDims.nb - 1) deselectCell();
+    }
+    const dt = Math.round(performance.now() - t0);
+    draw();
+    reportStatus(dt);
+    // No grid found → the photo shows alone; updateResultChrome surfaces the (i)
+    // guidance ("tocca ✎ / ↺") so the user isn't left wondering.
+    updateResultChrome();
+  } catch (err) {
+    console.error(err);
+    // Only surface the error for the CURRENT photo — a superseded run that throws
+    // must not overwrite the header with a stale "Errore analisi" for a discarded photo.
+    if (myGen === detectGen) setStatus('Errore analisi: ' + (err as Error).message);
+  } finally {
+    detecting = false;
+    hideProcessing();
+    // A fresh photo arrived while we were busy → analyse the latest capture now.
+    if (detectPending) {
+      detectPending = false;
+      runDetection();
+    }
+  }
+}
+
+function showProcessing(label: string, frac: number) {
+  processing.hidden = false;
+  setProcessing(label, frac);
+}
+function setProcessing(label: string, frac: number) {
+  processingMsg.textContent = label;
+  const pct = Math.max(0, Math.min(100, Math.round(frac * 100)));
+  processingFill.style.width = pct + '%';
+  processingPct.textContent = pct + '%';
+}
+function hideProcessing() {
+  processing.hidden = true;
+}
+
+// Derive gridReliable + the grid↔image map from the current detector output (lastResult).
+// ONE decision now: `isGridReliable` — the calibrated confidence must clear DRAW_THRESHOLD, plus
+// two HARD guards the score can't override (a confirmed sub-pitch `degenerate`, and a single-line
+// "axis"). Regularity, size and squareness are already folded into `confidence` (see
+// gridConfidence), so the old scattered gate (inlier / detected-line floors / aspect) is gone —
+// the chip, the winner choice and "drawn?" now share the same score. Used after detection AND to
+// RESTORE the auto grid when the user cancels a manual edit (cancel must not lose the grid).
+function applyDetectedGrid() {
+  gridReliable = false;
+  if (lastResult) {
+    const i = lastResult.info;
+    gridReliable = isGridReliable(i, DRAW_THRESHOLD);
+    // Diagnostic: when the detector DID synthesize a grid (both families non-trivial) but the gate
+    // rejected it, spell out why so the user can SEE why an obviously-detected grid wasn't drawn
+    // (debug-gated; see reportStatus / the debug info panel).
+    gridRejectReason = null;
+    const hasLines = lastResult.familyA.length >= 2 && lastResult.familyB.length >= 2;
+    if (!gridReliable && hasLines) {
+      const reasons: string[] = [];
+      if (i.degenerate) reasons.push('degenerate (sub-pitch)');
+      if (i.detectedA < 2 || i.detectedB < 2)
+        reasons.push(`detected ${i.detectedA}×${i.detectedB}: un asse ha meno di 2 linee`);
+      if (!i.degenerate && i.detectedA >= 2 && i.detectedB >= 2 && i.confidence < DRAW_THRESHOLD)
+        reasons.push(`confidenza ${i.confidence.toFixed(2)} < ${DRAW_THRESHOLD} (soglia di disegno)`);
+      gridRejectReason = reasons.length ? 'scartata: ' + reasons.join('; ') : null;
+    }
+  } else {
+    gridRejectReason = null;
+  }
+  gridMap = null;
+  if (gridReliable && lastResult) {
+    gridMap = makeGridMap(lastResult.familyA, lastResult.familyB);
+    gridDims = { na: lastResult.familyA.length, nb: lastResult.familyB.length };
+  }
+}
+
+// Result-mode chrome: there is NO automatic fallback panel. The FAB (place tokens) is always
+// PRESENT once a result is shown, but DISABLED until a grid exists; the edit button + retake are
+// always available so the user can create/replace the grid or reshoot at will.
+function updateResultChrome() {
+  editChooser.hidden = true; // only opened explicitly by the edit button
+  if (showingResult && !manualActive) {
+    fabWrap.hidden = false; // present in result mode…
+    updateFabEnabled(); // …but greyed-out/inert until there's a grid
+    if (!gridReliable) {
+      hud.hidden = true;
+    }
+  }
+  updateEditGridButton();
+  updateInfo();
+  rebuildDebugBar();
+}
+
+// --- Manual grid editor -----------------------------------------------
+// When auto-detection is unreliable the user can place a grid by hand: a quad
+// (4 draggable corners) over the photo, tiled into `manualNa × manualNb` cells.
+// The quad → unit-square homography gives projective (perspective-correct) cell
+// nodes, from which we build the same familyA/familyB Line2[] the detector would,
+// so drawing + all tactical tools work unchanged.
+type ImgPt = { x: number; y: number };
+let manualQuad: ImgPt[] | null = null; // [TL, TR, BR, BL] in image coordinates
+let manualNa = 10; // cells along the top/bottom edge (columns)
+let manualNb = 10; // cells along the left/right edge (rows)
+let manualDragLast: ImgPt | null = null;
+let manualCollapsed = false; // the editor bar can collapse to free the corners under it
+// "Draw by hand" mode: the user TRACES reference lines along columns and rows, and
+// the grid is generated from them (buildGrid: family split + fit + extend to frame).
+let manualDrawPending = false;
+let manualStrokes: [ImgPt, ImgPt][] = []; // traced reference lines (image coords)
+let strokeStart: ImgPt | null = null; // in-progress stroke endpoints
+let strokeEnd: ImgPt | null = null;
+const DRAW_SENTINEL = 5; // manualDrag value while tracing a line
+const PINCH_SENTINEL = 6; // manualDrag value while pinch-resizing the grid
+const ENDPOINT_SENTINEL = 7; // manualDrag value while dragging a traced-line endpoint
+let drawEndpointDrag: { s: number; e: 0 | 1 } | null = null; // which stroke endpoint
+// Live pointer positions (image coords) during manual editing, for pinch.
+const manualPointerPos = new Map<number, ImgPt>();
+let pinchState: { startDist: number; startQuad: ImgPt[]; center: ImgPt } | null = null;
+
+/** Client → image-pixel coordinates (accounts for CSS sizing + the zoom transform,
+ * since the canvas backing store is in image pixels). */
+function pointerToImage(clientX: number, clientY: number): ImgPt | null {
+  const rect = view.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  return {
+    x: ((clientX - rect.left) / rect.width) * view.width,
+    y: ((clientY - rect.top) / rect.height) * view.height,
+  };
+}
+
+/** Line2 (normal form) through two image points. */
+function lineThrough(p1: ImgPt, p2: ImgPt): Line2 {
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len;
+  const ny = dx / len;
+  return { nx, ny, d: nx * p1.x + ny * p1.y };
+}
+
+/** Build the two line families from the current quad + cell counts. */
+function manualToFamilies(): { A: Line2[]; B: Line2[] } | null {
+  if (!manualQuad) return null;
+  const [TL, TR, BR, BL] = manualQuad;
+  const H = solveHomography(
+    [[0, 0], [1, 0], [1, 1], [0, 1]],
+    [[TL.x, TL.y], [TR.x, TR.y], [BR.x, BR.y], [BL.x, BL.y]],
+  );
+  if (!H) return null;
+  const node = (i: number, j: number): ImgPt => {
+    const [x, y] = applyH(H, i / manualNa, j / manualNb);
+    return { x, y };
+  };
+  const A: Line2[] = []; // constant i (columns): na+1 lines
+  for (let i = 0; i <= manualNa; i++) A.push(lineThrough(node(i, 0), node(i, manualNb)));
+  const B: Line2[] = []; // constant j (rows): nb+1 lines
+  for (let j = 0; j <= manualNb; j++) B.push(lineThrough(node(0, j), node(manualNa, j)));
+  return { A, B };
+}
+
+/** Recompute families + grid map from the quad and redraw. */
+function applyManual() {
+  const fam = manualToFamilies();
+  if (!fam || !lastResult) return;
+  lastResult.familyA = fam.A;
+  lastResult.familyB = fam.B;
+  gridMap = makeGridMap(fam.A, fam.B);
+  gridDims = { na: fam.A.length, nb: fam.B.length };
+  gridReliable = true;
+  draw();
+}
+
+/**
+ * Commit the manual grid, EXTENDING the lattice past the drawn quad to fill the
+ * whole frame (like the detector's extend:'frame'): continue the same projective
+ * lattice outward from each edge while the line still crosses the image, capped and
+ * with a crowding guard. Cells beyond the drawn quad are flagged extended (drawn
+ * faint). Returns false if there's no valid quad to commit.
+ */
+function commitManualGrid(): boolean {
+  if (!manualQuad || !lastResult) return false;
+  const [TL, TR, BR, BL] = manualQuad;
+  const H = solveHomography(
+    [[0, 0], [1, 0], [1, 1], [0, 1]],
+    [[TL.x, TL.y], [TR.x, TR.y], [BR.x, BR.y], [BL.x, BL.y]],
+  );
+  if (!H) return false;
+  const W = lastResult.width;
+  const Ht = lastResult.height;
+  const node = (i: number, j: number): ImgPt => {
+    const [x, y] = applyH(H, i / manualNa, j / manualNb);
+    return { x, y };
+  };
+  const CAP = 200; // hard cap on extended lines per side
+  const MIN_GAP = 2; // stop once adjacent lines crowd below this (px) — near a VP
+  const colLine = (i: number) => lineThrough(node(i, 0), node(i, manualNb));
+  const rowLine = (j: number) => lineThrough(node(0, j), node(manualNa, j));
+  const midJ = manualNb / 2;
+  const midI = manualNa / 2;
+  const colGap = (i: number) => Math.hypot(node(i, midJ).x - node(i - 1, midJ).x, node(i, midJ).y - node(i - 1, midJ).y);
+  const rowGap = (j: number) => Math.hypot(node(midI, j).x - node(midI, j - 1).x, node(midI, j).y - node(midI, j - 1).y);
+  const crosses = (l: Line2) => !!clipLineToRect(l, W, Ht);
+
+  let iMin = 0;
+  let iMax = manualNa;
+  let jMin = 0;
+  let jMax = manualNb;
+  for (let i = -1; i > -CAP; i--) {
+    if (!crosses(colLine(i)) || colGap(i + 1) < MIN_GAP) break;
+    iMin = i;
+  }
+  for (let i = manualNa + 1; i < manualNa + CAP; i++) {
+    if (!crosses(colLine(i)) || colGap(i) < MIN_GAP) break;
+    iMax = i;
+  }
+  for (let j = -1; j > -CAP; j--) {
+    if (!crosses(rowLine(j)) || rowGap(j + 1) < MIN_GAP) break;
+    jMin = j;
+  }
+  for (let j = manualNb + 1; j < manualNb + CAP; j++) {
+    if (!crosses(rowLine(j)) || rowGap(j) < MIN_GAP) break;
+    jMax = j;
+  }
+
+  const A: Line2[] = [];
+  for (let i = iMin; i <= iMax; i++) {
+    const l = colLine(i);
+    if (i < 0 || i > manualNa) {
+      l.extended = true;
+      l.filled = true;
+    }
+    A.push(l);
+  }
+  const B: Line2[] = [];
+  for (let j = jMin; j <= jMax; j++) {
+    const l = rowLine(j);
+    if (j < 0 || j > manualNb) {
+      l.extended = true;
+      l.filled = true;
+    }
+    B.push(l);
+  }
+  lastResult.familyA = A;
+  lastResult.familyB = B;
+  gridMap = makeGridMap(A, B);
+  gridDims = { na: A.length, nb: B.length };
+  gridReliable = true;
+  return true;
+}
+
+/** Radius (image px) within which a tap grabs a corner handle. */
+function manualHandleRadius(): number {
+  const W = lastResult?.width ?? view.width;
+  const H = lastResult?.height ?? view.height;
+  return Math.max(W, H) * 0.045;
+}
+
+function pointInQuad(p: ImgPt, q: ImgPt[]): boolean {
+  let inside = false;
+  for (let i = 0, j = 3; i < 4; j = i++) {
+    const a = q[i];
+    const b = q[j];
+    if ((a.y > p.y) !== (b.y > p.y) && p.x < ((b.x - a.x) * (p.y - a.y)) / (b.y - a.y) + a.x)
+      inside = !inside;
+  }
+  return inside;
+}
+
+function showManualBar(show: boolean) {
+  manualBar.hidden = !show;
+  manualBar.classList.toggle('collapsed', manualCollapsed);
+}
+function updateManualBar() {
+  colsInput.value = String(manualNa);
+  rowsInput.value = String(manualNb);
+}
+
+/** Seed the editable quad + counts from the CURRENT grid (its outer lines), so the
+ * user edits the existing grid rather than a fresh default. Returns false if there's
+ * no usable grid to seed from. */
+function seedQuadFromCurrentGrid(): boolean {
+  if (!lastResult) return false;
+  const fA = lastResult.familyA;
+  const fB = lastResult.familyB;
+  if (fA.length < 2 || fB.length < 2) return false;
+  // The detector's two families aren't labelled vertical/horizontal, so map them to the
+  // manual grid's COLUMNS (vertical lines) and ROWS (horizontal lines) by orientation —
+  // a vertical line has a ~horizontal normal (|nx| > |ny|). Otherwise the seeded Colonne
+  // and Righe counts (and the quad's u/v axes) come out swapped.
+  const absNx = (f: typeof fA) => f.reduce((s, l) => s + Math.abs(l.nx), 0) / f.length;
+  const [cols, rows] = absNx(fA) >= absNx(fB) ? [fA, fB] : [fB, fA];
+  const c00 = intersect(cols[0], rows[0]);
+  const c10 = intersect(cols[cols.length - 1], rows[0]);
+  const c11 = intersect(cols[cols.length - 1], rows[rows.length - 1]);
+  const c01 = intersect(cols[0], rows[rows.length - 1]);
+  if (!c00 || !c10 || !c11 || !c01) return false;
+  manualQuad = [
+    { x: c00.x, y: c00.y },
+    { x: c10.x, y: c10.y },
+    { x: c11.x, y: c11.y },
+    { x: c01.x, y: c01.y },
+  ];
+  manualNa = Math.max(1, cols.length - 1); // columns (subdivide the top/bottom edge)
+  manualNb = Math.max(1, rows.length - 1); // rows
+  return true;
+}
+
+function manualDefaultQuad() {
+  if (!lastResult) return;
+  const W = lastResult.width;
+  const H = lastResult.height;
+  // A centred SQUARE 10×10 grid (square cells) — a clean, predictable starting point
+  // the user then drags to fit. (Adapting to a photo's aspect gave odd default counts.)
+  const side = Math.min(W, H) * 0.76;
+  const x0 = (W - side) / 2;
+  const y0 = (H - side) / 2;
+  manualQuad = [
+    { x: x0, y: y0 },
+    { x: x0 + side, y: y0 },
+    { x: x0 + side, y: y0 + side },
+    { x: x0, y: y0 + side },
+  ];
+  manualNa = 10;
+  manualNb = 10;
+}
+
+// Draw-mode bar variant: the grid comes from the traced lines, so there are no cell
+// steppers and nothing to collapse — the bar is just a slim head (Annulla / Fatto).
+function applyManualBarMode() {
+  manualBar.classList.toggle('draw-mode', manualDrawPending);
+  manualCollapse.hidden = manualDrawPending;
+}
+
+function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
+  if (!lastCapture || !lastResult) return;
+  manualActive = true;
+  editChooser.hidden = true;
+  fabWrap.hidden = true;
+  hud.hidden = true;
+  btnEditGrid.hidden = true;
+  manualCollapsed = false;
+  manualDrawPending = mode === 'draw';
+  manualStrokes = [];
+  strokeStart = null;
+  strokeEnd = null;
+  drawEndpointDrag = null;
+  manualPointerPos.clear();
+  pinchState = null;
+  applyManualBarMode();
+  showManualBar(true);
+  rebuildDebugBar(); // hide the debug step bar while editing a manual grid
+  if (manualDrawPending) {
+    // No grid yet — wait for the user to trace lines. Show the photo alone.
+    manualQuad = null;
+    gridReliable = false;
+    gridMap = null;
+    updateManualBar();
+    draw();
+  } else {
+    // Start from the current grid when it's usable, else a default quad — so a
+    // well-detected grid is only tweaked, but a bad/absent one starts from scratch.
+    if (!gridReliable || !seedQuadFromCurrentGrid()) manualDefaultQuad();
+    updateManualBar(); // sync the counters AFTER na/nb are set (was showing stale values)
+    applyManual();
+  }
+  updateInfo();
+}
+
+/** A traced stroke → a RawLine (rho, thetaDeg) in image coords for buildGrid. */
+function strokeToRaw(p1: ImgPt, p2: ImgPt): RawLine {
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  // Normal (nx,ny) = (-dy, dx); its angle in [0,180).
+  let thetaDeg = (Math.atan2(dx, -dy) * 180) / Math.PI;
+  thetaDeg = ((thetaDeg % 180) + 180) % 180;
+  const nx = Math.cos((thetaDeg * Math.PI) / 180);
+  const ny = Math.sin((thetaDeg * Math.PI) / 180);
+  return { rho: nx * p1.x + ny * p1.y, thetaDeg };
+}
+
+/** Generate the grid from the traced lines (buildGrid does the family split, VP,
+ * lattice fit and frame extension). Needs ≥2 lines in each of the two directions. */
+function regenerateFromStrokes() {
+  if (!lastResult) return;
+  if (manualStrokes.length < 2) {
+    gridReliable = false;
+    gridMap = null;
+    draw();
+    return;
+  }
+  const raw = manualStrokes.map(([a, b]) => strokeToRaw(a, b));
+  const res = buildGrid(raw, 1, lastResult.width, lastResult.height, {
+    ...DEFAULT_PARAMS,
+    extend: 'frame',
   });
+  if (res.familyA.length >= 2 && res.familyB.length >= 2) {
+    lastResult.familyA = res.familyA;
+    lastResult.familyB = res.familyB;
+    gridMap = makeGridMap(res.familyA, res.familyB);
+    gridReliable = !!gridMap;
+    gridDims = { na: res.familyA.length, nb: res.familyB.length };
+  } else {
+    gridReliable = false;
+    gridMap = null;
+  }
+  draw();
+}
+
+/** Leave manual editing. keep=true commits the grid; false discards it (back to the
+ * fallback panel). */
+function exitManualMode(keep: boolean) {
+  if (keep) {
+    if (manualDrawPending) {
+      // Draw mode: keep the grid generated from the traced lines (already extended).
+      if (!gridReliable || !gridMap) keep = false;
+    } else if (!manualQuad || !gridMap) {
+      keep = false; // nothing to commit
+    }
+  }
+  const wasDraw = manualDrawPending;
+  manualActive = false;
+  manualDrag = null;
+  manualDragLast = null;
+  manualDrawPending = false;
+  manualStrokes = [];
+  strokeStart = null;
+  strokeEnd = null;
+  drawEndpointDrag = null;
+  manualPointerPos.clear();
+  pinchState = null;
+  manualBar.classList.remove('draw-mode');
+  showManualBar(false);
+  if (keep) {
+    if (!wasDraw) commitManualGrid(); // adjust mode: extend the drawn quad to frame
+    fabWrap.hidden = false;
+    updateFabEnabled(); // a committed manual grid enables it; an empty result leaves it inert
+  } else {
+    // Cancel → restore the auto-detected grid (don't throw it away just because the
+    // user opened the editor and changed their mind).
+    manualQuad = null;
+    applyDetectedGrid();
+    deselectCell();
+  }
+  draw();
+  updateResultChrome();
+}
+
+/** Show the top-bar "edit grid" button whenever a result is on screen and we're not
+ * already editing (so any grid can be adjusted by hand at any time). */
+function updateEditGridButton() {
+  btnEditGrid.hidden = !(showingResult && !manualActive);
+}
+
+// Pointer gestures while editing a manual grid (routed from the map handlers).
+function manualPointerDown(e: PointerEvent) {
+  const p = pointerToImage(e.clientX, e.clientY);
+  if (!p) return;
+  manualPointerPos.set(e.pointerId, p);
+  activePointers.add(e.pointerId);
+
+  // Two fingers on an adjustable quad → pinch-resize the grid about its centre.
+  if (manualPointerPos.size === 2 && !manualDrawPending && manualQuad) {
+    const [a, b] = [...manualPointerPos.values()];
+    const cx = (manualQuad[0].x + manualQuad[1].x + manualQuad[2].x + manualQuad[3].x) / 4;
+    const cy = (manualQuad[0].y + manualQuad[1].y + manualQuad[2].y + manualQuad[3].y) / 4;
+    pinchState = {
+      startDist: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)),
+      startQuad: manualQuad.map((c) => ({ ...c })),
+      center: { x: cx, y: cy },
+    };
+    manualDrag = PINCH_SENTINEL;
+    return;
+  }
+  if (manualPointerPos.size !== 1) {
+    manualDrag = null; // a 3rd finger / can't-pinch state → cancel the current drag
+    return;
+  }
+
+  if (manualDrawPending) {
+    // Hit an existing stroke's delete badge or endpoint first; else start a new line.
+    const hr = manualStrokeHandleRadius() * 0.6;
+    for (let si = manualStrokes.length - 1; si >= 0; si--) {
+      const [a, b] = manualStrokes[si];
+      if (Math.hypot(p.x - (a.x + b.x) / 2, p.y - (a.y + b.y) / 2) <= hr) {
+        manualStrokes.splice(si, 1); // delete badge (midpoint)
+        manualDrag = null;
+        regenerateFromStrokes();
+        return;
+      }
+      if (Math.hypot(p.x - a.x, p.y - a.y) <= hr) {
+        drawEndpointDrag = { s: si, e: 0 };
+        manualDrag = ENDPOINT_SENTINEL;
+        capturePointer(e.pointerId);
+        return;
+      }
+      if (Math.hypot(p.x - b.x, p.y - b.y) <= hr) {
+        drawEndpointDrag = { s: si, e: 1 };
+        manualDrag = ENDPOINT_SENTINEL;
+        capturePointer(e.pointerId);
+        return;
+      }
+    }
+    strokeStart = p;
+    strokeEnd = p;
+    manualDrag = DRAW_SENTINEL;
+    capturePointer(e.pointerId);
+    return;
+  }
+  if (!manualQuad) return;
+  const r = manualHandleRadius();
+  let hit = -1;
+  for (let i = 0; i < 4; i++) {
+    if (Math.hypot(manualQuad[i].x - p.x, manualQuad[i].y - p.y) <= r) {
+      hit = i;
+      break;
+    }
+  }
+  if (hit < 0 && pointInQuad(p, manualQuad)) hit = 4; // inside → translate the whole grid
+  if (hit < 0) return;
+  manualDrag = hit;
+  manualDragLast = p;
+  capturePointer(e.pointerId);
+}
+function manualPointerMove(e: PointerEvent) {
+  const p = pointerToImage(e.clientX, e.clientY);
+  if (!p) return;
+  if (manualPointerPos.has(e.pointerId)) manualPointerPos.set(e.pointerId, p);
+
+  if (manualDrag === PINCH_SENTINEL) {
+    if (!pinchState) return;
+    const pts = [...manualPointerPos.values()];
+    if (pts.length < 2) return;
+    e.preventDefault();
+    const s = Math.max(1, Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y)) / pinchState.startDist;
+    const ctr = pinchState.center;
+    manualQuad = pinchState.startQuad.map((c) => ({
+      x: ctr.x + (c.x - ctr.x) * s,
+      y: ctr.y + (c.y - ctr.y) * s,
+    }));
+    applyManual();
+    return;
+  }
+  if (manualDrag === ENDPOINT_SENTINEL) {
+    if (!drawEndpointDrag) return;
+    e.preventDefault();
+    manualStrokes[drawEndpointDrag.s][drawEndpointDrag.e] = p;
+    regenerateFromStrokes();
+    return;
+  }
+  if (manualDrag === DRAW_SENTINEL) {
+    e.preventDefault();
+    strokeEnd = p;
+    draw();
+    return;
+  }
+  if (manualDrag === null || !manualQuad || !manualDragLast) return;
+  e.preventDefault();
+  if (manualDrag < 4) {
+    manualQuad[manualDrag] = p;
+  } else {
+    const dx = p.x - manualDragLast.x;
+    const dy = p.y - manualDragLast.y;
+    for (const c of manualQuad) {
+      c.x += dx;
+      c.y += dy;
+    }
+  }
+  manualDragLast = p;
+  applyManual();
+}
+function manualPointerUp(e: PointerEvent) {
+  manualPointerPos.delete(e.pointerId);
+  activePointers.delete(e.pointerId);
+  if (manualDrag === PINCH_SENTINEL) {
+    if (manualPointerPos.size < 2) {
+      pinchState = null;
+      manualDrag = null;
+    }
+    return;
+  }
+  if (manualDrag === ENDPOINT_SENTINEL) {
+    manualDrag = null;
+    drawEndpointDrag = null;
+    return;
+  }
+  if (manualDrag === DRAW_SENTINEL) {
+    manualDrag = null;
+    if (strokeStart && strokeEnd && Math.hypot(strokeEnd.x - strokeStart.x, strokeEnd.y - strokeStart.y) >= 12) {
+      manualStrokes.push([strokeStart, strokeEnd]);
+      strokeStart = null;
+      strokeEnd = null;
+      regenerateFromStrokes();
+    } else {
+      strokeStart = null;
+      strokeEnd = null;
+      draw();
+    }
+    return;
+  }
+  manualDrag = null;
+  manualDragLast = null;
+}
+
+/** Radius (image px) for a traced-line endpoint / delete handle hit-test + draw. */
+function manualStrokeHandleRadius(): number {
+  const W = lastResult?.width ?? view.width;
+  const H = lastResult?.height ?? view.height;
+  return Math.max(W, H) * 0.028;
+}
+
+/** Draw the traced reference lines + their endpoint/delete handles + the in-progress
+ * stroke (draw mode). */
+function drawStrokes(ctx: CanvasRenderingContext2D) {
+  const lw = Math.max(2, view.width / 300);
+  const r = manualStrokeHandleRadius();
+  ctx.save();
+  ctx.lineCap = 'round';
+  const seg = (a: ImgPt, b: ImgPt) => {
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.stroke();
+  };
+  // Committed strokes: line + 2 endpoint handles + a delete (×) at the midpoint.
+  ctx.strokeStyle = '#22d3ee';
+  ctx.lineWidth = lw;
+  for (const [a, b] of manualStrokes) {
+    seg(a, b);
+    for (const p of [a, b]) {
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, r * 0.5, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(34, 211, 238, 0.30)';
+      ctx.fill();
+      ctx.lineWidth = Math.max(2, r * 0.12);
+      ctx.strokeStyle = '#22d3ee';
+      ctx.stroke();
+    }
+    // delete badge at the midpoint
+    const mx = (a.x + b.x) / 2;
+    const my = (a.y + b.y) / 2;
+    ctx.beginPath();
+    ctx.arc(mx, my, r * 0.55, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(239, 68, 68, 0.92)';
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = Math.max(2, r * 0.14);
+    const k = r * 0.26;
+    ctx.beginPath();
+    ctx.moveTo(mx - k, my - k);
+    ctx.lineTo(mx + k, my + k);
+    ctx.moveTo(mx + k, my - k);
+    ctx.lineTo(mx - k, my + k);
+    ctx.stroke();
+    ctx.lineWidth = lw;
+    ctx.strokeStyle = '#22d3ee';
+  }
+  // In-progress stroke (no handles yet).
+  if (strokeStart && strokeEnd) seg(strokeStart, strokeEnd);
+  ctx.restore();
+}
+
+// Magnifier loupe over the point being dragged (a grid corner or a traced-line
+// endpoint), so the finger doesn't hide where it lands. Drawn in two steps so it sits
+// ABOVE the handles: (1) CAPTURE the clean photo+grid region into an offscreen canvas
+// BEFORE the handles are drawn; (2) DRAW the loupe last, over everything.
+let loupeSrc: HTMLCanvasElement | null = null;
+
+/** Capture the clean magnified source around `c` and return the loupe placement. */
+function captureLoupe(c: ImgPt): { cx: number; cy: number; R: number } {
+  const zoom = 2.5;
+  const R = Math.max(48, view.width * 0.14);
+  const srcR = R / zoom;
+  let cx = c.x;
+  let cy = c.y - R * 1.7;
+  if (cy - R < 0) cy = c.y + R * 1.7; // flip below if near the top edge
+  cx = Math.max(R, Math.min(view.width - R, cx));
+  cy = Math.max(R, Math.min(view.height - R, cy));
+  if (!loupeSrc) loupeSrc = document.createElement('canvas');
+  const s = Math.max(2, Math.round(srcR * 2));
+  loupeSrc.width = s;
+  loupeSrc.height = s;
+  const lctx = loupeSrc.getContext('2d')!;
+  lctx.clearRect(0, 0, s, s);
+  lctx.drawImage(view, c.x - srcR, c.y - srcR, srcR * 2, srcR * 2, 0, 0, s, s);
+  return { cx, cy, R };
+}
+
+/** Draw the loupe (ring + magnified capture + crosshair) on top of everything. */
+function drawLoupe(ctx: CanvasRenderingContext2D, p: { cx: number; cy: number; R: number }) {
+  const { cx, cy, R } = p;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.closePath();
+  ctx.clip();
+  ctx.fillStyle = '#0a0e13';
+  ctx.fillRect(cx - R, cy - R, R * 2, R * 2);
+  if (loupeSrc) ctx.drawImage(loupeSrc, cx - R, cy - R, R * 2, R * 2);
+  ctx.restore();
+  const lw = Math.max(2, view.width / 300);
+  ctx.save();
+  ctx.strokeStyle = '#22d3ee';
+  ctx.lineWidth = lw;
+  ctx.beginPath();
+  ctx.arc(cx, cy, R, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.lineWidth = Math.max(1, lw * 0.6);
+  ctx.beginPath();
+  ctx.moveTo(cx - R * 0.32, cy);
+  ctx.lineTo(cx + R * 0.32, cy);
+  ctx.moveTo(cx, cy - R * 0.32);
+  ctx.lineTo(cx, cy + R * 0.32);
+  ctx.stroke();
+  ctx.restore();
+}
+
+/** The point currently being dragged that should get a loupe (or null). */
+function loupePoint(): ImgPt | null {
+  if (manualDrawPending) {
+    if (manualDrag === ENDPOINT_SENTINEL && drawEndpointDrag) {
+      return manualStrokes[drawEndpointDrag.s][drawEndpointDrag.e];
+    }
+    return null;
+  }
+  if (manualDrag !== null && manualDrag >= 0 && manualDrag <= 3 && manualQuad) {
+    return manualQuad[manualDrag];
+  }
+  return null;
+}
+
+/** Draw the 4 corner handles over the manual grid. */
+function drawManualHandles(ctx: CanvasRenderingContext2D) {
+  if (!manualQuad) return;
+  const r = manualHandleRadius() * 0.5;
+  ctx.save();
+  for (const c of manualQuad) {
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(34, 211, 238, 0.28)';
+    ctx.fill();
+    ctx.lineWidth = Math.max(2, r * 0.22);
+    ctx.strokeStyle = '#22d3ee';
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(c.x, c.y, Math.max(2, r * 0.18), 0, Math.PI * 2);
+    ctx.fillStyle = '#eaf1fb';
+    ctx.fill();
+  }
+  ctx.restore();
 }
 
 function reportStatus(dt: number) {
@@ -391,18 +1402,604 @@ function reportStatus(dt: number) {
     setStatus(`${i.rawCount} linee grezze ma nessuna griglia — inquadra più da vicino`);
     return;
   }
-  const base = `Griglia ${i.aCount}×${i.bCount} · ${i.angleADeg.toFixed(0)}°/${i.angleBDeg.toFixed(0)}° · ${dt}ms`;
-  // On success the top-right shows the action buttons instead of a status line;
-  // only surface the (verbose) grid info while debugging.
-  setStatus(debug ? `${base} · grezze ${i.rawCount} · Hough ${i.usedHough} · edge ${i.edgePixels}` : '');
+  // The reliability gate's rejection reason is NOT shown in the header anymore — it lives only in
+  // the debug pipeline panel (the `.debug-reason` banner). On success the top-right shows the
+  // action buttons; either way the header carries no grid status line (the debug step viewer +
+  // on-canvas labels carry the diagnostics instead), so clear any stale value.
+  void dt;
+  setStatus('');
 }
 
 // --- Drawing (photo + overlay on one canvas => perfect alignment) ------
 let edgeCanvas: HTMLCanvasElement | null = null;
+let debugStepCanvas: HTMLCanvasElement | null = null;
+
+/** The currently selected pipeline node, or undefined. */
+function selectedStep() {
+  return lastResult?.debugSteps?.find((s) => s.id === debugStepId);
+}
+
+/** Nodes drawn LIVE as line overlays over the photo (no snapshot image): the raw Hough of each
+ * pipeline, plus its three line stages (split → merge → vanishing-point). */
+const LINE_NODES = new Set([
+  'houghLum', 'splitLum', 'mergeLum', 'vpLum',
+  'houghMorph', 'splitMorph', 'mergeMorph', 'vpMorph',
+]);
+/** Nodes drawn LIVE as CROSSING overlays (points coloured by perpendicularity), one per pipeline. */
+const PERP_NODES = new Set(['perpLum', 'perpMorph']);
+/** All live-drawn nodes (line or crossing overlays) — no snapshot image, drawn over the photo. */
+const LIVE_NODES = new Set([...LINE_NODES, ...PERP_NODES]);
+
+/** The line set(s) to draw for a live line-overlay node, with a colour per family and a base label.
+ * Raw Hough is pre-split (one colour); the fit stages show family A vs B in two colours so the
+ * split — and the fan getting filtered by the vanishing-point stage — is visible. */
+function stageLineData(r: GridResult, id: string): { groups: { lines: Line2[]; color: string }[]; base: string } | null {
+  const colA = 'rgba(34, 211, 238, 0.9)'; // family A — cyan
+  const colB = 'rgba(244, 114, 182, 0.9)'; // family B — pink
+  if (id === 'houghLum') return { groups: [{ lines: r.debugRawLum ?? [], color: 'rgba(34, 211, 238, 0.85)' }], base: 'Hough Luminanza' };
+  if (id === 'houghMorph') return { groups: [{ lines: r.debugRawMorph ?? [], color: 'rgba(167, 139, 250, 0.9)' }], base: 'Hough Morfologica' };
+  const m = /^(split|merge|vp)(Lum|Morph)$/.exec(id);
+  if (!m) return null;
+  const stage = m[1] as 'split' | 'merge' | 'vp';
+  const st = m[2] === 'Morph' ? r.debugStagesMorph : r.debugStagesLum;
+  const [a, b] = stageAB(st, stage);
+  const name = { split: 'Split famiglie', merge: 'Merge duplicati', vp: 'Punto di fuga (VP vincente)' }[stage];
+  const pipe = m[2] === 'Morph' ? 'Morfologica' : 'Luminanza';
+  return { groups: [{ lines: a, color: colA }, { lines: b, color: colB }], base: `${name} — ${pipe}` };
+}
+
+/** Pull the [A, B] line arrays for one fit stage out of a StageLines (empty when absent). */
+function stageAB(st: StageLines | undefined, stage: 'split' | 'merge' | 'vp'): [Line2[], Line2[]] {
+  if (!st) return [[], []];
+  if (stage === 'split') return [st.splitA, st.splitB];
+  if (stage === 'merge') return [st.mergedA, st.mergedB];
+  return [st.vpA, st.vpB];
+}
+
+/** True when a pipeline-stage preview (a node WITH an image, or a live line overlay — not the
+ * overlay) is selected. Never while editing a manual grid (that view needs the photo + quad). */
+function debugStepActive(): boolean {
+  if (!debug || manualActive) return false;
+  const s = selectedStep();
+  return !!(s && (s.image || LIVE_NODES.has(s.id)) && s.id !== 'overlay');
+}
+
+/** Blit the selected pipeline-stage preview onto the view canvas (scaled up from the
+ * downscaled snapshot), with the stage name labelled top-left. */
+function drawDebugStep() {
+  const r = lastResult!;
+  const step = selectedStep();
+  if (!step) return;
+  view.width = r.width;
+  view.height = r.height;
+  const ctx = view.getContext('2d')!;
+  let labelText: string;
+  const perp = PERP_NODES.has(step.id)
+    ? step.id === 'perpMorph'
+      ? r.debugPerpMorph
+      : r.debugPerpLum
+    : null;
+  const lineData = LINE_NODES.has(step.id) ? stageLineData(r, step.id) : null;
+  if (perp) {
+    // The SELECTION step (not a post-fit score): perpendicularity is computed for EVERY VP hypothesis
+    // and PICKS the winner. Here we draw the winning grid's crossings coloured by perpendicularity
+    // AFTER rectification (green = right angle, red = sheared), sized by foreground weight (bigger =
+    // nearer the viewer, more trusted). The label reports how many VP hypotheses it judged.
+    ctx.drawImage(lastCapture!, 0, 0, r.width, r.height);
+    const wMax = perp.crossings.reduce((m, c) => Math.max(m, c.weight), 0) || 1;
+    const rBase = Math.max(3, r.width / 160);
+    for (const c of perp.crossings) {
+      const g = Math.round(200 * c.perp); // perp 1 → green, 0 → red
+      const rd = Math.round(220 * (1 - c.perp));
+      const rad = rBase * (0.5 + 0.9 * Math.sqrt(c.weight / wMax));
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, rad, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${rd}, ${g}, 40, 0.8)`;
+      ctx.fill();
+    }
+    const pipe = step.id === 'perpMorph' ? 'Morfologica' : 'Luminanza';
+    const hyp = perp.hypotheses != null ? ` · ha scelto tra ${perp.hypotheses} ipotesi VP` : '';
+    labelText = `Perpendicolarità · SELEZIONE — ${pipe} — ${Math.round(perp.score * 100)}% (${perp.crossings.length} incroci${hyp})`;
+  } else if (lineData) {
+    // Live line overlay over the photo — raw Hough, or a fit stage (split → merge → vanishing-point),
+    // each family in its own colour so you can watch the lines get whittled down stage by stage.
+    ctx.drawImage(lastCapture!, 0, 0, r.width, r.height);
+    ctx.lineWidth = Math.max(1, r.width / 480);
+    const counts: number[] = [];
+    for (const g of lineData.groups) {
+      ctx.strokeStyle = g.color;
+      for (const l of g.lines) {
+        const seg = clipLineToRect(l, r.width, r.height);
+        if (!seg) continue;
+        ctx.beginPath();
+        ctx.moveTo(seg[0][0], seg[0][1]);
+        ctx.lineTo(seg[1][0], seg[1][1]);
+        ctx.stroke();
+      }
+      counts.push(g.lines.length);
+    }
+    // "8 + 6 linee" for a two-family stage, "14 linee" for the pre-split raw Hough.
+    labelText = `${lineData.base} — ${counts.join(' + ')} linee`;
+  } else {
+    if (!step.image) return;
+    if (!debugStepCanvas) debugStepCanvas = document.createElement('canvas');
+    debugStepCanvas.width = step.image.width;
+    debugStepCanvas.height = step.image.height;
+    debugStepCanvas.getContext('2d')!.putImageData(step.image, 0, 0);
+    ctx.imageSmoothingEnabled = false; // show the pipeline pixels, not a blurred upscale
+    ctx.drawImage(debugStepCanvas, 0, 0, r.width, r.height);
+    ctx.imageSmoothingEnabled = true;
+    labelText = step.label + (step.used ? '' : ' — non usato');
+  }
+  const fs = Math.max(16, Math.round(r.width / 40));
+  ctx.font = `700 ${fs}px system-ui, sans-serif`;
+  const pad = fs * 0.5;
+  ctx.fillStyle = 'rgba(10,14,19,0.72)';
+  ctx.fillRect(pad, pad, ctx.measureText(labelText).width + pad * 2, fs + pad);
+  ctx.fillStyle = '#eaf1fb';
+  ctx.textBaseline = 'top';
+  ctx.fillText(labelText, pad * 2, pad * 1.5);
+}
+
+// --- Debug pipeline graph (nodes + arrows) ------------------------------
+// Fixed layout (col, row) per node id. Single root 'foto' on the left. Row 0 = the colour-edge
+// extraction ('chroma'), which is OR'd INTO the luminance edges (it has no Hough of its own). Row 1
+// = the luminance main line, ending in its Hough node ('houghLum'), then the FIT stages
+// ('splitLum' → 'mergeLum' → 'vpLum' → 'perpLum': split into two directions, per-family duplicate
+// merge, vanishing-point concurrency, foreground-weighted perpendicularity/squareness). Rows 2/3 =
+// the morphological fallback, forked into a horizontal (row 2) and vertical (row 3) line extractor
+// that rejoin into 'morph'/'houghMorph' + its own fit stages ('splitMorph'…'perpMorph'). Both
+// pipelines converge into the final grid ('overlay') on the right, rebuilt from the winner's fit.
+const GRAPH_LAYOUT: Record<string, [number, number]> = {
+  foto: [0, 1.5],
+  chroma: [1, 0],
+  gray: [1, 1],
+  clahe: [2, 1],
+  blur: [3, 1],
+  canny: [4, 1],
+  edges: [5, 1],
+  clean: [6, 1],
+  oriented: [7, 1],
+  houghLum: [8, 1],
+  splitLum: [9, 1],
+  mergeLum: [10, 1],
+  vpLum: [11, 1],
+  perpLum: [12, 1],
+  mridgeh: [2, 2],
+  mbinh: [3, 2],
+  mridgev: [2, 3],
+  mbinv: [3, 3],
+  morph: [4, 2.5],
+  houghMorph: [8, 2.5],
+  splitMorph: [9, 2.5],
+  mergeMorph: [10, 2.5],
+  vpMorph: [11, 2.5],
+  perpMorph: [12, 2.5],
+  overlay: [13, 1.5],
+};
+const GN_W = 62;
+const GN_H = 32;
+const GN_CGAP = 30;
+const GN_RGAP = 34;
+const gnX = (col: number) => col * (GN_W + GN_CGAP);
+const gnY = (row: number) => row * (GN_H + GN_RGAP);
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+/** Highlight the currently-selected node in place (no rebuild → scroll is preserved). */
+function markSelectedNode() {
+  for (const el of Array.from(debugBar.querySelectorAll('.debug-node'))) {
+    el.classList.toggle('on', (el as HTMLElement).dataset.id === debugStepId);
+  }
+}
+
+/** Build the debug pipeline graph from lastResult.debugSteps. Hidden unless debug is
+ * on, a result is shown, and we're not editing a manual grid. Three visual states per
+ * node: USED (on the winning path, highlighted), executed-but-not-used (normal), and
+ * not executed (deactivated). Arrows follow the same three states. */
+function rebuildDebugBar() {
+  // Keep the on-map focus indicator (next to the DBG chip) in sync — its colour tracks whether
+  // the last detection used a focus point, independent of whether the pipeline panel is shown.
+  updateFocusBadge();
+  const steps = lastResult?.debugSteps ?? [];
+  const show = debug && showingResult && !manualActive && steps.length > 0;
+  debugBar.hidden = !show;
+  if (!show) return;
+  if (!steps.some((s) => s.id === debugStepId)) debugStepId = 'overlay';
+  const byId = new Map(steps.map((s) => [s.id, s]));
+  const layout = GRAPH_LAYOUT;
+
+  let maxCol = 0;
+  let maxRow = 0;
+  for (const s of steps) {
+    const p = layout[s.id];
+    if (!p) continue;
+    maxCol = Math.max(maxCol, p[0]);
+    maxRow = Math.max(maxRow, p[1]);
+  }
+  const W = gnX(maxCol) + GN_W;
+  const H = gnY(maxRow) + GN_H;
+
+  debugBar.classList.toggle('collapsed', debugCollapsed);
+  debugBar.textContent = '';
+
+  // Header: title + (timing-log toggle) + collapse toggle.
+  const head = document.createElement('div');
+  head.className = 'debug-head';
+  head.innerHTML = '<span class="debug-title">Pipeline</span>';
+  const actions = document.createElement('div');
+  actions.className = 'debug-head-actions';
+  // Timing log (scroll-text): shown only when the result carries timings.
+  if (lastResult?.debugTimings) {
+    const logBtn = document.createElement('button');
+    logBtn.type = 'button';
+    logBtn.className = 'debug-collapse' + (debugLogOpen ? ' on' : '');
+    logBtn.setAttribute('aria-label', 'Mostra i tempi di elaborazione');
+    logBtn.innerHTML =
+      '<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 12h-5"/><path d="M15 8h-5"/><path d="M19 17V5a2 2 0 0 0-2-2H4"/><path d="M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3"/></svg>';
+    logBtn.addEventListener('click', () => {
+      debugLogOpen = !debugLogOpen;
+      rebuildDebugBar();
+    });
+    actions.appendChild(logBtn);
+  }
+  const collapse = document.createElement('button');
+  collapse.type = 'button';
+  collapse.className = 'debug-collapse';
+  collapse.setAttribute('aria-label', 'Riduci o espandi la pipeline');
+  collapse.innerHTML =
+    '<svg class="chev" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>';
+  collapse.addEventListener('click', () => {
+    debugCollapsed = !debugCollapsed;
+    debugBar.classList.toggle('collapsed', debugCollapsed);
+  });
+  actions.appendChild(collapse);
+  head.appendChild(actions);
+  debugBar.appendChild(head);
+
+  const pct = (c: number) => Math.round(c * 100);
+  const chip = (cls: string, name: string, conf: number) => {
+    const el = document.createElement('div');
+    el.className = 'pstat ' + cls;
+    el.innerHTML =
+      `<span class="pstat-top"><span class="pstat-name">${name}</span>` +
+      `<span class="pstat-val">${pct(conf)}%</span></span>` +
+      `<span class="pstat-bar"><span class="pstat-fill" style="width:${pct(conf)}%"></span></span>`;
+    return el;
+  };
+
+  // "Why wasn't the grid drawn?" — the detector synthesized a grid but the gate rejected it.
+  // Stays visible even when collapsed since it's the key diagnostic. Null when a grid was
+  // drawn / nothing was detected.
+  if (!gridReliable && gridRejectReason) {
+    const banner = document.createElement('div');
+    banner.className = 'debug-reason';
+    banner.textContent = gridRejectReason;
+    debugBar.appendChild(banner);
+  }
+
+  // View selector: the timing-log button switches the body between GRAPH view (pipeline graph +
+  // confidence strip, log OFF) and LOG view (the timing log, log ON) — never both at once. The
+  // header + rejection banner stay in either view.
+  // Confidence strip: each independent fit's quality + the final decision. Sits under
+  // the head; hidden when the bar is collapsed (like the graph) or in the log view.
+  const pipes = lastResult?.debugPipelines ?? [];
+  if (pipes.length && !debugLogOpen) {
+    const stats = document.createElement('div');
+    stats.className = 'debug-stats';
+    for (const p of pipes) stats.appendChild(chip(p.chosen ? 'chosen' : '', p.label, p.confidence));
+    // Option B: how much the two independent fits agree (a cross-check, not a fit's own
+    // quality) — shown only when comparable. Styled dashed to read as a meta-metric.
+    const agree = lastResult?.debugAgreement;
+    if (agree != null) stats.appendChild(chip('pstat-agree', 'Accordo', agree));
+    // Final decision: the chosen fit's confidence (already lifted/cut by the agreement);
+    // the reliability gate (grid drawn vs not) is conveyed by the chip's colour.
+    stats.appendChild(chip('pstat-final ' + (gridReliable ? 'ok' : 'bad'), 'Finale', lastResult?.info.confidence ?? 0));
+    debugBar.appendChild(stats);
+  }
+
+  // Scrollable graph body — GRAPH view only (log OFF). The LOG view below replaces it.
+  if (!debugLogOpen) {
+  const scroll = document.createElement('div');
+  scroll.className = 'debug-scroll';
+  const graph = document.createElement('div');
+  graph.className = 'debug-graph';
+  graph.style.width = W + 'px';
+  graph.style.height = H + 'px';
+
+  // Connector LINES (no arrowheads — cleaner), behind the nodes. Same-row links are a
+  // straight horizontal; branch/merge links run horizontally along the SOURCE row, then
+  // a rounded right-angle turn rises into the target near its own column — so a line
+  // never cuts diagonally across a block.
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('class', 'debug-arrows');
+  svg.setAttribute('width', String(W));
+  svg.setAttribute('height', String(H));
+  const elbow = (sx: number, sy: number, ex: number, ey: number): string => {
+    if (sy === ey) return `M ${sx} ${sy} L ${ex} ${ey}`;
+    const turnX = ex - 14; // rise just before the target
+    const r = 7;
+    const dir = ey > sy ? 1 : -1;
+    return (
+      `M ${sx} ${sy} L ${turnX - r} ${sy}` +
+      ` Q ${turnX} ${sy} ${turnX} ${sy + dir * r}` +
+      ` L ${turnX} ${ey - dir * r}` +
+      ` Q ${turnX} ${ey} ${turnX + r} ${ey}` +
+      ` L ${ex} ${ey}`
+    );
+  };
+  for (const s of steps) {
+    const p = layout[s.id];
+    if (!p) continue;
+    const tx = gnX(p[0]);
+    const ty = gnY(p[1]) + GN_H / 2;
+    for (const inId of s.inputs) {
+      const ip = layout[inId];
+      if (!ip) continue;
+      const inp = byId.get(inId);
+      const sx = gnX(ip[0]) + GN_W;
+      const sy = gnY(ip[1]) + GN_H / 2;
+      const path = document.createElementNS(SVG_NS, 'path');
+      path.setAttribute('d', elbow(sx, sy, tx, ty));
+      const bothUsed = !!(s.used && inp?.used);
+      const bothExec = s.executed && !!inp?.executed;
+      path.setAttribute('class', bothUsed ? 'arrow used' : bothExec ? 'arrow' : 'arrow off');
+      svg.appendChild(path);
+    }
+  }
+  graph.appendChild(svg);
+
+  // One-line description per FIT step, appended to the node tooltip so the graph reads truthfully:
+  // the winning path is a hypothesise-and-verify search, NOT a linear pipeline — Fuga shows the
+  // WINNING vanishing point among the multi-VP candidates, and Perp is the SELECTION step that judged
+  // every VP hypothesis (not a score tacked on after Fuga).
+  const NODE_DESC: Record<string, string> = {
+    splitLum: 'linee divise nelle due direzioni',
+    mergeLum: 'duplicati fusi per famiglia (tiene il supporto)',
+    vpLum: 'VP VINCENTE fra i candidati multi-VP',
+    perpLum: 'SELEZIONE per perpendicolarità: giudica ogni ipotesi VP e sceglie la griglia più quadrata',
+    splitMorph: 'linee divise nelle due direzioni',
+    mergeMorph: 'duplicati fusi per famiglia (tiene il supporto)',
+    vpMorph: 'VP VINCENTE fra i candidati multi-VP',
+    perpMorph: 'SELEZIONE per perpendicolarità: giudica ogni ipotesi VP e sceglie la griglia più quadrata',
+  };
+
+  // Nodes.
+  for (const s of steps) {
+    const p = layout[s.id];
+    if (!p) continue;
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.dataset.id = s.id;
+    b.disabled = !s.executed; // a skipped stage is shown (with its arrows) but not clickable
+    b.className =
+      'debug-node' +
+      (s.id === debugStepId ? ' on' : '') +
+      (!s.executed ? ' off' : s.used ? ' used' : '') +
+      (s.image || LIVE_NODES.has(s.id) ? '' : ' no-img'); // live-overlay nodes drawn on the photo
+    b.style.left = gnX(p[0]) + 'px';
+    b.style.top = gnY(p[1]) + 'px';
+    b.textContent = s.label;
+    const desc = NODE_DESC[s.id];
+    const suffix = !s.executed ? ' — non eseguito' : s.used ? '' : ' — non usato';
+    b.title = s.label + (desc ? ' — ' + desc : '') + suffix;
+    b.addEventListener('click', () => {
+      debugStepId = s.id;
+      markSelectedNode(); // update selection in place — do NOT rebuild (keeps scroll)
+      draw();
+    });
+    graph.appendChild(b);
+  }
+
+  scroll.appendChild(graph);
+  debugBar.appendChild(scroll);
+  } // end GRAPH view (!debugLogOpen)
+
+  // LOG view (toggled by the scroll-text button) — TWO tabs sharing one scroll panel:
+  //   • Tempi      — where the pipeline spent its time (per-node timings, grouped + totalled).
+  //   • Confidenza — WHY each candidate got its confidence (the real sub-scores feeding
+  //                  gridConfidence). Needed because a correct grid can still score poorly on one
+  //                  path (e.g. luminance), and the breakdown shows exactly which term dragged it.
+  if (debugLogOpen && !debugCollapsed) {
+    // Tab selector.
+    const tabs = document.createElement('div');
+    tabs.className = 'debug-log-tabs';
+    const mkTab = (id: 'tempi' | 'conf', label: string) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'debug-log-tab' + (debugLogTab === id ? ' on' : '');
+      b.textContent = label;
+      b.addEventListener('click', () => {
+        debugLogTab = id;
+        rebuildDebugBar();
+      });
+      return b;
+    };
+    tabs.appendChild(mkTab('tempi', 'Tempi'));
+    tabs.appendChild(mkTab('conf', 'Confidenza'));
+    debugBar.appendChild(tabs);
+
+    const log = document.createElement('div');
+    log.className = 'debug-log';
+    log.innerHTML = debugLogTab === 'tempi' ? renderTimingLog() : renderConfidenceLog();
+    debugBar.appendChild(log);
+  }
+}
+
+// --- LOG view: Tempi tab ---------------------------------------------------
+// ONE row per pipeline NODE, grouped by pipeline (luminance / colour / morphology) with a per-group
+// subtotal + grand total. Rows flagged `breakdown` decompose the row above them (the morphology's
+// extraction), so they're shown but NOT summed into the totals (they'd double-count).
+function renderTimingLog(): string {
+  const timings = lastResult?.debugTimings;
+  if (!timings) return '<div class="debug-log-row indent"><span class="debug-log-k">Nessun dato di timing</span></div>';
+  const ms = (v: number) => `${Math.round(v)} ms`;
+  type Row = { key: string; label: string; breakdown?: boolean };
+  const groups: { title: string; items: Row[] }[] = [
+    {
+      title: 'Luminanza',
+      items: [
+        { key: 'gray', label: 'Grigio' },
+        { key: 'clahe', label: 'Contrasto' },
+        { key: 'blur', label: 'Sfocatura' },
+        { key: 'canny', label: 'Canny' },
+        { key: 'edges', label: 'Bordi uniti' },
+        { key: 'clean', label: 'Pulizia texture' },
+        { key: 'fft', label: 'Prior FFT' },
+        { key: 'oriented', label: 'Orientati' },
+        { key: 'houghMain', label: 'Hough' },
+      ],
+    },
+    // Colour edges are extracted then OR'd into the luminance edges (no separate Hough).
+    { title: 'Colore', items: [{ key: 'chroma', label: 'Estrazione' }] },
+    {
+      title: 'Morfologia',
+      items: [
+        { key: 'mridgeh', label: 'Cresta H', breakdown: true },
+        { key: 'mridgev', label: 'Cresta V', breakdown: true },
+        { key: 'mbinh', label: 'Linee H', breakdown: true },
+        { key: 'mbinv', label: 'Linee V', breakdown: true },
+        { key: 'morphEnhance', label: 'Estrazione (tot.)' },
+        { key: 'morphHough', label: 'Hough' },
+      ],
+    },
+  ];
+  let html = '';
+  let total = 0;
+  for (const g of groups) {
+    const present = g.items.filter((r) => timings[r.key] != null);
+    const hasAngles = g.title === 'Morfologia' && timings.morphAngles != null;
+    if (!present.length && !hasAngles) continue;
+    // Subtotal / total exclude the breakdown rows (they decompose 'Estrazione (tot.)').
+    const sub = present.reduce((s, r) => s + (r.breakdown ? 0 : timings[r.key] ?? 0), 0);
+    total += sub;
+    html +=
+      `<div class="debug-log-row debug-log-group"><span class="debug-log-k">${g.title}</span>` +
+      `<span class="debug-log-v">${ms(sub)}</span></div>`;
+    for (const r of present) {
+      html +=
+        `<div class="debug-log-row indent${r.breakdown ? ' breakdown' : ''}">` +
+        `<span class="debug-log-k">${r.breakdown ? '· ' : ''}${r.label}</span>` +
+        `<span class="debug-log-v">${ms(timings[r.key])}</span></div>`;
+    }
+    if (hasAngles) {
+      html += `<div class="debug-log-row indent"><span class="debug-log-k">Angoli provati</span><span class="debug-log-v">${timings.morphAngles}</span></div>`;
+    }
+  }
+  html += `<div class="debug-log-row debug-log-total"><span class="debug-log-k">Totale misurato</span><span class="debug-log-v">${ms(total)}</span></div>`;
+  return html;
+}
+
+// --- LOG view: Confidenza tab ----------------------------------------------
+// Explains, in plain Italian, WHY each candidate (Luminanza / Morfologica) got its confidence.
+// It leads with a one-line verdict naming the LIMITING factor — so a good grid that reads low (e.g.
+// one axis found few lines) is understandable at a glance — then shows the multiplication that
+// builds the score (qualità × quadratura = interna, lifted by cross-method agreement into the
+// final), then the per-axis evidence as a drill-down table. All numbers come straight from
+// GridResult.info.confBreakdown (gridConfidence's own inputs) — never re-derived by eye. Pure.
+function renderConfidenceLog(): string {
+  const pipes = lastResult?.debugPipelines ?? [];
+  if (!pipes.length) return '<div class="debug-log-row indent"><span class="debug-log-k">Nessun candidato</span></div>';
+  const pct = (v: number) => (isFinite(v) ? Math.round(v * 100) : 0) + '%';
+  const agree = lastResult?.debugAgreement; // cross-method (main↔morph) agreement, or null
+  const row = (k: string, v: string, cls = '') =>
+    `<div class="debug-log-row indent${cls ? ' ' + cls : ''}"><span class="debug-log-k">${k}</span><span class="debug-log-v">${v}</span></div>`;
+
+  let html = '';
+  for (const p of pipes) {
+    const chosenCls = p.chosen ? ' chosen' : '';
+    html +=
+      `<div class="debug-log-row debug-log-group${chosenCls}"><span class="debug-log-k">${p.label}${p.chosen ? ' ★' : ''}</span>` +
+      `<span class="debug-log-v">${pct(p.confidence)}</span></div>`;
+    const bd = p.breakdown;
+    if (!bd) {
+      html += row('Dettaglio non disponibile', '—');
+      continue;
+    }
+
+    // 1) Headline verdict: the single factor that most limits the score (or, when strong, carries it).
+    const strong = bd.internal >= 0.55;
+    const strongShape = bd.squareness >= 0.85 && bd.perp >= 0.85;
+    const verdict = strong
+      ? '✓ Griglia solida' + (strongShape ? ', celle quadrate e perpendicolari' : '')
+      : '⚠ Punto debole: ' + confWeakness(bd);
+    html += `<div class="debug-log-row indent conf-why${strong ? '' : ' warn'}"><span class="debug-log-k">${verdict}</span></div>`;
+
+    // This fit is the WINNER of a hypothesise-and-verify search: perpendicularity judged N
+    // (VP × rectifica) hypotheses and picked it. Surface it so the log matches the graph — the fit
+    // is NOT a linear pipeline, the perpendicularity is the arbiter that chose the vanishing point.
+    const perpDbg = p.id === 'morph' ? lastResult?.debugPerpMorph : lastResult?.debugPerpLum;
+    if (perpDbg?.hypotheses != null)
+      html += row('Selezione: la perpendicolarità ha scelto fra', `${perpDbg.hypotheses} ipotesi VP`, 'conf-mid');
+
+    // 2) How the internal confidence is built: qualità × proporzioni × perpendicolarità = interna,
+    //    poi + accordo = finale.
+    html += row('Qualità delle direzioni', pct(bd.pair));
+    if (bd.degenerate) {
+      html += row('Penalità «griglia degenere»', '× 0.1');
+      html += row('Confidenza interna', `${pct(bd.pair)} × 0.1 = ${pct(bd.internal)}`, 'conf-mid');
+    } else {
+      html += row('Celle quadrate (proporzioni)', pct(bd.squareness));
+      html += row('Perpendicolarità (giudice · primo piano)', pct(bd.perp));
+      html += row(
+        'Confidenza interna',
+        `${pct(bd.pair)} × ${pct(bd.squareness)} × ${pct(bd.perp)} = ${pct(bd.internal)}`,
+        'conf-mid',
+      );
+    }
+    html += row('Accordo tra i due metodi', agree != null ? pct(agree) : '—');
+    html += row('Confidenza finale', pct(p.confidence), 'conf-final');
+
+    // 3) Drill-down: the per-axis evidence that produced each direction's quality. The weaker axis
+    //    (the one that drives «Qualità delle direzioni» down) is flagged with ⚠.
+    const weakA = bd.qA <= bd.qB;
+    html +=
+      '<table class="conf-table"><tbody>' +
+      '<tr class="conf-h"><td>direzione</td><td>linee</td><td>allineam.</td><td>riempim.</td><td>celle</td><td>qualità</td></tr>' +
+      `<tr><td>Asse 1</td><td>${bd.countA}</td><td>${pct(bd.inlierA)}</td><td>${pct(bd.fillA)}</td><td>${bd.spanA}</td><td>${pct(bd.qA)}${weakA ? ' ⚠' : ''}</td></tr>` +
+      `<tr><td>Asse 2</td><td>${bd.countB}</td><td>${pct(bd.inlierB)}</td><td>${pct(bd.fillB)}</td><td>${bd.spanB}</td><td>${pct(bd.qB)}${weakA ? '' : ' ⚠'}</td></tr>` +
+      '</tbody></table>';
+  }
+  return html;
+}
+
+/** Names, in plain Italian, the single factor most limiting a candidate's internal confidence, so
+ * the "Confidenza" verdict can explain a low score. Mirrors gridConfidenceBreakdown exactly:
+ * internal = pair · squareness · perp · (degenerate ? 0.1). The three multiplicative factors are the
+ * weaker axis's quality (≈pair), squareness (proportions) and perpendicularity (shear); the smallest
+ * limits the score most. `pair` is driven by the WEAKER axis, quality = evidence(#linee) ·
+ * (0.6·allineamento + 0.4·riempimento). */
+function confWeakness(bd: ConfBreakdown): string {
+  if (bd.degenerate) return 'passo dimezzato (linee troppo fitte, griglia «degenere»)';
+  const weakA = bd.qA <= bd.qB;
+  const wq = weakA ? bd.qA : bd.qB;
+  const axisN = weakA ? 1 : 2;
+  const count = weakA ? bd.countA : bd.countB;
+  const inlier = weakA ? bd.inlierA : bd.inlierB;
+  const fill = weakA ? bd.fillA : bd.fillB;
+  // internal = wq(≈pair) · squareness · perp — blame whichever factor is smallest.
+  const minF = Math.min(wq, bd.squareness, bd.perp);
+  if (minF === bd.perp) return `celle sghembe / poco perpendicolari (${Math.round(bd.perp * 100)}%)`;
+  if (minF === bd.squareness) {
+    const ar = isFinite(bd.harmonicAspect) && bd.harmonicAspect > 0 ? `${bd.harmonicAspect.toFixed(1)}:1` : 'estremo';
+    return `celle poco quadrate (aspetto ${ar})`;
+  }
+  // Inside the weaker axis: too few lines (evidence), or lines irregular / grid incomplete (quality)?
+  const evidence = Math.max(0, Math.min(1, (count - 1) / 6));
+  const quality = 0.6 * inlier + 0.4 * fill;
+  if (evidence <= quality) return `asse ${axisN}: poche linee rilevate (${count})`;
+  return inlier <= fill
+    ? `asse ${axisN}: linee poco allineate (${Math.round(inlier * 100)}%)`
+    : `asse ${axisN}: griglia poco riempita (${Math.round(fill * 100)}%)`;
+}
 
 function draw() {
   if (!lastResult || !lastCapture) return;
   const r = lastResult;
+  // Debug: a pipeline-stage preview replaces the photo+overlay entirely.
+  if (debugStepActive()) {
+    drawDebugStep();
+    return;
+  }
   view.width = r.width;
   view.height = r.height;
   const ctx = view.getContext('2d')!;
@@ -432,8 +2029,25 @@ function draw() {
   // other family), so lines don't protrude past the outer rows/columns. Both
   // directions share one colour — a soft white — since we don't distinguish them.
   const gridColor = '#eaf1fb';
-  drawFamily(ctx, r.familyA, r.familyB, r.width, r.height, gridColor, lw);
-  drawFamily(ctx, r.familyB, r.familyA, r.width, r.height, gridColor, lw);
+  // Draw the grid when it's trustworthy, or while the user is adjusting a manual
+  // quad. An unreliable auto fit (or the "draw a cell" step before a cell exists)
+  // shows the photo alone, not a wrong grid.
+  const showManualGrid = manualActive && !manualDrawPending && !!manualQuad;
+  if (gridReliable || showManualGrid) {
+    drawFamily(ctx, r.familyA, r.familyB, r.width, r.height, gridColor, lw);
+    drawFamily(ctx, r.familyB, r.familyA, r.width, r.height, gridColor, lw);
+  }
+
+  if (manualActive) {
+    // Capture the clean loupe source (photo+grid) BEFORE drawing handles/strokes, so
+    // the magnifier can be drawn LAST — on top of every other handle.
+    const lp = loupePoint();
+    const place = lp ? captureLoupe(lp) : null;
+    if (manualDrawPending) drawStrokes(ctx);
+    else drawManualHandles(ctx);
+    if (place) drawLoupe(ctx, place);
+    return; // no tactical layer while editing the grid
+  }
 
   // Tactical layer: overlay → path preview → threat/counters → flanking → tokens
   // → blocked squares → selection + ring.
@@ -1257,16 +2871,11 @@ function setPlaceMode(m: 'ally' | 'enemy' | 'area' | 'none') {
   fabWrap.classList.remove('open'); // a choice closes the speed-dial
   if (placeMode !== 'none') {
     deselectCell();
-    const msg =
-      placeMode === 'area'
-        ? 'Tocca una cella per posizionare l’area'
-        : `Tocca le celle per aggiungere o togliere ${placeMode === 'ally' ? 'alleati' : 'nemici'}`;
-    showToast(msg); // transient bottom popup, not the header status
   } else {
-    hideToast();
     setStatus('');
   }
   updateFabIcon();
+  updateInfo();
 }
 /** The FAB shows ✕ (and its type colour) while a placement mode is active OR while
  * an area is on the map — so the same ✕ that adds an area also REMOVES it — and a
@@ -1277,6 +2886,13 @@ function updateFabIcon() {
   fab.classList.toggle('mode-enemy', placeMode === 'enemy');
   fab.classList.toggle('mode-area', placeMode === 'area' || areaActive);
   fab.textContent = placeMode !== 'none' || areaActive ? '✕' : '＋';
+}
+/** The ＋ FAB is PRESENT whenever a result is shown, but ENABLED only when a grid exists — there's
+ * nothing to place without one. A disabled <button> ignores clicks natively (so the speed-dial can't
+ * open); we also collapse the dial in case it was open. Called wherever the FAB becomes visible. */
+function updateFabEnabled() {
+  fab.disabled = !gridReliable; // native :disabled greys it and blocks clicks (see .fab:disabled)
+  if (!gridReliable) fabWrap.classList.remove('open'); // collapse the speed-dial if it was open
 }
 /** Drop an area at the tapped point (from FAB 'area' mode), then leave placement so
  * the area can be edited/repositioned like before. */
@@ -1385,10 +3001,11 @@ function highlightAreaType() {
   for (const el of areaTypeBox.querySelectorAll('.chip')) {
     el.classList.toggle('on', (el as HTMLElement).dataset.t === currentAreaType);
   }
-  // Line/cone rotate via the on-map ring (tip handle) — no angle readout; just a hint.
-  areaRotHint.hidden = !(currentAreaType === 'linea' || currentAreaType === 'cono');
+  // Line/cone rotate via the on-map ring (tip handle) — the rotation hint lives
+  // behind the (i) button and depends on the type, so refresh it.
   areaCreature.hidden = currentAreaType !== 'emanazione'; // creature size only for emanations
   refreshSizeUI();
+  updateInfo();
 }
 
 // Rebuild the active overlay from the current form values and redraw.
@@ -1475,6 +3092,10 @@ const capturePointer = (id: number) => {
   }
 };
 view.addEventListener('pointerdown', (e) => {
+  if (manualActive) {
+    manualPointerDown(e);
+    return;
+  }
   activePointers.add(e.pointerId);
   if (activePointers.size !== 1) {
     tapCandidate = false; // multi-touch → pinch, not a tap/drag
@@ -1525,6 +3146,10 @@ view.addEventListener('pointerdown', (e) => {
   }
 });
 view.addEventListener('pointermove', (e) => {
+  if (manualActive) {
+    manualPointerMove(e);
+    return;
+  }
   if (ringRotating) {
     e.preventDefault();
     rotateFromPointer(e.clientX, e.clientY);
@@ -1538,6 +3163,10 @@ view.addEventListener('pointermove', (e) => {
   }
 });
 view.addEventListener('pointerup', (e) => {
+  if (manualActive) {
+    manualPointerUp(e);
+    return;
+  }
   activePointers.delete(e.pointerId);
   clearLongPress();
   if (ringRotating) {
@@ -1585,6 +3214,10 @@ view.addEventListener('pointerup', (e) => {
   longPressFired = false;
 });
 view.addEventListener('pointercancel', (e) => {
+  if (manualActive) {
+    manualPointerUp(e);
+    return;
+  }
   activePointers.delete(e.pointerId);
   clearLongPress();
   ringRotating = false;
@@ -1646,6 +3279,11 @@ hudCollapse.addEventListener('click', () => {
   hudCollapsed = !hudCollapsed;
   refreshHud();
 });
+// The single (i) button toggles the contextual-help popover.
+infoBtn.addEventListener('click', () => {
+  infoOpen = !infoOpen;
+  updateInfo();
+});
 hudClose.addEventListener('click', () => {
   if (activeOverlay?.kind === 'area') removeActiveArea();
   else {
@@ -1654,8 +3292,10 @@ hudClose.addEventListener('click', () => {
   }
 });
 
-// Debug has no on-screen switch: triple-tap the logo (within 600ms) toggles it on/off
-// and re-runs detection on the current capture so the diagnostics appear/disappear.
+// Debug has no on-screen switch: triple-tap the logo (within 600ms) toggles it on/off.
+// Debug diagnostics (stage previews, timings, confidence breakdown) are computed ONLY in debug mode
+// to keep normal captures lean, so ENTERING debug re-runs detection on the current photo to produce
+// them (recompute-on-demand, rather than paying the cost on every shot).
 let brandTaps: number[] = [];
 brand.addEventListener('click', () => {
   const now = Date.now();
@@ -1664,8 +3304,16 @@ brand.addEventListener('click', () => {
   if (brandTaps.length >= 3) {
     brandTaps = [];
     debug = !debug;
-    setStatus(debug ? 'Debug attivo' : 'Debug disattivato');
-    if (lastCapture) runDetection();
+    btnLoadImage.hidden = !debug; // the gallery-load button is a debug affordance
+    dbgBadge.hidden = !debug; // DBG chip next to the version replaces the old status text
+    updateFocusBadge(); // focus indicator shows/hides with the DBG chip
+    // Entering debug on a photo whose result lacks the debug data → recompute it once, on demand.
+    if (debug && lastCapture && showingResult && !lastResult?.debugSteps) {
+      runDetection();
+    } else {
+      draw(); // repaint (edge/line overlay appears/disappears with debug)
+      rebuildDebugBar(); // show/hide the pipeline panel
+    }
   }
 });
 
@@ -1704,10 +3352,21 @@ function retake() {
   showingResult = false;
   lastResult = null;
   lastCapture = null;
+  detectGen++; // supersede any in-flight analysis; don't commit its grid after we leave
+  detectPending = false; // nothing to re-analyse once we're back on the camera
   deselectCell();
   zoom.reset();
   view.hidden = true;
+  // Clear any manual-grid / fallback UI from the previous result.
+  manualActive = false;
+  manualQuad = null;
+  gridReliable = false;
+  showManualBar(false);
+  editChooser.hidden = true;
+  fabWrap.hidden = true;
+  btnEditGrid.hidden = true;
   topActions.hidden = true; // leaving result mode → hide Pulisci / Rifai
+  debugBar.hidden = true; // no pipeline to inspect on the live camera
   startCamera().catch(() => {
     setStatus('Fotocamera non disponibile — tocca lo schermo per riprovare');
     hint.hidden = false;
@@ -1716,6 +3375,30 @@ function retake() {
 
 // --- Wiring ------------------------------------------------------------
 btnCapture.addEventListener('click', capture);
+// Debug-only: pick a saved photo from the gallery and analyse it like a capture.
+btnLoadImage.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+  const file = fileInput.files?.[0];
+  fileInput.value = ''; // let the same file be picked again
+  if (!file || !debug) return; // debug-only, even if debug was toggled off mid-pick
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = () => {
+    URL.revokeObjectURL(url);
+    const c = document.createElement('canvas');
+    c.width = img.naturalWidth;
+    c.height = img.naturalHeight;
+    c.getContext('2d')!.drawImage(img, 0, 0);
+    if (camera.isRunning) camera.stop();
+    video.hidden = true;
+    processImage(c);
+  };
+  img.onerror = () => {
+    URL.revokeObjectURL(url);
+    setStatus('Immagine non valida');
+  };
+  img.src = url;
+});
 // Fallback for a denied/failed camera: on the camera screen (no result yet),
 // tapping the stage (re)starts it. There is no dedicated Camera button.
 stage.addEventListener('click', () => {
@@ -1726,6 +3409,63 @@ stage.addEventListener('click', () => {
 btnRetake.addEventListener('click', () => {
   if (showingResult) history.back();
   else retake();
+});
+// Manual-grid chooser (opened by the top-bar edit button): two ways in.
+chooseAdapt.addEventListener('click', () => {
+  editChooser.hidden = true;
+  enterManualMode('adapt');
+});
+chooseDraw.addEventListener('click', () => {
+  editChooser.hidden = true;
+  enterManualMode('draw');
+});
+chooseCancel.addEventListener('click', () => {
+  editChooser.hidden = true;
+});
+
+// Manual-grid bar controls.
+const MANUAL_MIN_CELLS = 1;
+const MANUAL_MAX_CELLS = 60;
+/** Clamp + apply a cell count, syncing the input fields. */
+function setManualCount(which: 'cols' | 'rows', value: number) {
+  const v = Math.max(MANUAL_MIN_CELLS, Math.min(MANUAL_MAX_CELLS, Math.round(value)));
+  if (which === 'cols') manualNa = v;
+  else manualNb = v;
+  updateManualBar();
+  applyManual();
+}
+function bumpManual(which: 'cols' | 'rows', delta: number) {
+  setManualCount(which, (which === 'cols' ? manualNa : manualNb) + delta);
+}
+colsMinus.addEventListener('click', () => bumpManual('cols', -1));
+colsPlus.addEventListener('click', () => bumpManual('cols', +1));
+rowsMinus.addEventListener('click', () => bumpManual('rows', -1));
+rowsPlus.addEventListener('click', () => bumpManual('rows', +1));
+// Direct numeric entry: apply live while a valid number is typed, normalise (clamp +
+// rewrite the field) on commit.
+const liveCount = (which: 'cols' | 'rows', el: HTMLInputElement) => () => {
+  const n = parseInt(el.value, 10);
+  if (Number.isFinite(n) && n >= MANUAL_MIN_CELLS) {
+    const v = Math.min(MANUAL_MAX_CELLS, n);
+    if (which === 'cols') manualNa = v;
+    else manualNb = v;
+    applyManual();
+  }
+};
+colsInput.addEventListener('input', liveCount('cols', colsInput));
+rowsInput.addEventListener('input', liveCount('rows', rowsInput));
+colsInput.addEventListener('change', () => setManualCount('cols', parseInt(colsInput.value, 10) || manualNa));
+rowsInput.addEventListener('change', () => setManualCount('rows', parseInt(rowsInput.value, 10) || manualNb));
+manualCollapse.addEventListener('click', () => {
+  manualCollapsed = !manualCollapsed;
+  manualBar.classList.toggle('collapsed', manualCollapsed);
+});
+manualDone.addEventListener('click', () => exitManualMode(true));
+manualCancel.addEventListener('click', () => exitManualMode(false));
+// Top-bar "edit grid" — open the chooser (adapt a grid / draw one by hand).
+btnEditGrid.addEventListener('click', () => {
+  if (!showingResult) return;
+  editChooser.hidden = false;
 });
 window.addEventListener('popstate', () => {
   if (showingResult) retake();

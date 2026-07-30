@@ -35,6 +35,153 @@ normal, `d = mean(rho·cos(θ − θ̄))` (`src/grid-detector.ts:244`, `mergeDup
 rho collapses it to ~0. Projection is sign-consistent. Unit tests with exact synthetic
 θ do not catch this — only real Hough output does.
 
+### Chromatic edges added to the luminance Canny (`colorEdges: true`)
+**Decision:** besides the grayscale Canny, auto-Canny the Lab **a/b** chroma channels and
+OR them into the edge map before Hough; a near-neutral channel (std < `CHROMA_MIN_STD`)
+contributes nothing (`chromaEdges`, wired in `detectGridFromMat` `src/grid-detector.ts`).
+**Why:** the pipeline works on luminance (`COLOR_RGBA2GRAY`), so a grid separated from its
+background only by **hue** at similar brightness leaves no luminance edge and is missed
+entirely. The Lab a/b channels carry exactly that colour information.
+**Cost/scope:** a couple of extra Canny passes on the chroma channels (a few ms). It is
+**orthogonal** to the noisy-texture fallback: colour recovers hue-contrast grids, the
+morphological path recovers low-contrast texture — neither replaces the other. Verified
+live: an **iso-luminance** grid (magenta lines on a gray of identical Y) is `0×0` with
+`colorEdges:false` and the full grid with it on; clean gray grids and the dirt photo are
+unchanged (near-neutral chroma adds nothing).
+**Removed:** an earlier *separate* chromatic candidate (its own Hough + fusion entry, `houghChroma`)
+never won and was always degenerate, so the colour edges now live **only** inside the luminance
+flow (OR'd in before the main Hough). In the debug graph the colour node is extraction-only
+('Bordi colore' → *Bordi uniti*; the 'Colore' log group is just 'Estrazione').
+
+### Perspective robustness: stable VP, orthogonal split, sub-multiple rejection
+**Decision:** two cheap, pure-geometry fixes make the lattice fit survive strong
+perspective (`buildGrid` / `ransacVP` / `fitFamilyGrid`, `src/grid-detector.ts`):
+- **Orthogonal second axis** — `axisB = axisA + 90`. An earlier attempt made `axisB` an
+  *independent* histogram mode ≥30° from `axisA`, but on the real corpus it bought nothing
+  the guards below weren't already delivering and could latch `axisB` onto a spurious cluster
+  (hand-drawn walls, text, a dominant diagonal), tilting the drawn grid off-square on angled
+  shots — the user saw this as a regression, so it was reverted to the robust orthogonal prior.
+- **Guarded vanishing point** — `ransacVP` trusts a *finite* VP only when the inliers
+  actually fan (`VP_MIN_FAN_DEG`) **and** the VP lands outside the frame (`VP_FRAME_MARGIN`);
+  otherwise it uses the stable at-infinity VP. A near-parallel family's noisy far
+  intersection used to corrupt the rectifying horizon and compress the lattice to a sub-pitch.
+  **Strong-evidence override** (added later): a finite VP *inside* the frame is trusted anyway
+  when many inliers concur over a wide fan (`VP_STRONG_MIN_INLIERS` + `VP_STRONG_FAN_DEG`) —
+  a genuine shallow-angle floor/table VP. Without it, a low-angle floor (VP legitimately
+  in-frame) was rejected → no rectification → collapse to a fronto-parallel **2×2**. A
+  fronto-parallel grid fans ~0° so it never triggers the override (no regression there);
+  `MIN_GRID_CELLS` (5, in `main.ts`) is the backstop that hides any residual 2×2 collapse.
+- **Sub-multiple rejection** — `coarsenPitch` prefers the coarsest integer multiple of the
+  base cell that still holds (almost) all offsets, so the fit can't lock onto a 1/m harmonic
+  (tolerance is absolute, tied to the base cell, so occluded/dropped lines don't over-coarsen).
+**Why:** on real angled photos these compounded into a spurious ~7–8 px pitch → **hundreds**
+of bogus lines (measured 113×65, 202×73). Combined effect on the test corpus: a tiles-in-
+perspective shot went from a 202-line explosion (spacing 7/19) to a sane 12×19 (spacing 117/76);
+no photo explodes any more.
+
+### Degenerate lattices are still guarded (no fill/extend) as a backstop
+**Decision:** after the perspective fixes, `fitFamilyGrid` still rejects a residual degenerate
+fit: the **median** image-space cell across the detected extent (sampled, robust to genuine
+far-cell foreshortening) must be ≥ `image / MAX_CELLS_ACROSS` (50), else fill/extension are
+skipped for that family; extension also stops once cells crowd below `0.5·minCell`. A family
+whose spacing is below the floor drops `confidence` to 0 so the UI warns.
+**Accepted limitation:** extreme perspective on a *fine* grid (the far edge genuinely
+compresses toward invisibility) is still only partially recovered — such cases come back with
+low confidence (warned) rather than a clean grid; a full fix (per-row TLS / node-based fit) is
+a larger task tracked for the corner-node fallback.
+
+### Unreliable auto grid → photo alone + (i) guidance + on-demand manual editor, never a wrong grid
+**Decision:** the app **always draws the grid it found when it is reliable, or the photo alone
+otherwise** — there is **no** automatic fallback card. Reliability is ONE calibrated score, in
+`applyDetectedGrid` (`src/main.ts`) → `isGridReliable` (`src/grid-detector.ts`): the
+`gridConfidence` must clear `DRAW_THRESHOLD` (0.65), plus two HARD guards the score can't
+override (`!degenerate`, `detectedA,detectedB ≥ 2`). Regularity, size and cell-aspect are
+**folded into** `confidence` (`familyQuality` × `squareness`, the latter via `harmonicAspect`),
+so the earlier scattered structural gate (cell-count / inlier / aspect floors) is gone — the
+debug chip, the winner choice and "drawn?" now share the same number. When no grid is drawn, the
+single info **(i)** button (bottom-left)
+carries the guidance ("Nessuna griglia rilevata — usa il tasto griglia / fotocamera"). A top-bar
+**edit-grid** button opens an on-demand chooser (`#editChooser`: **grid to adapt** / **draw by
+hand**) on *any* result, so a well-detected grid can also be tweaked. **Cancelling** the editor
+restores the detected grid (`applyDetectedGrid`), never discards it. The manual editor
+(`src/main.ts`, "Manual grid editor") has two modes, both producing the same `familyA`/`familyB`
+`Line2[]` the detector would — so drawing (`drawFamily`) and every tactical tool (`makeGridMap`,
+tokens, areas, movement) work unchanged:
+- **Adapt** — a **quad** (4 draggable corners) tiled into N×M cells; the quad→unit-square
+  homography (`solveHomography`/`applyH` from `overlays.ts`) gives projective, perspective-correct
+  nodes. Seeded from the current grid when there is one, else a default inset. Cell counts via ±
+  steppers or direct numeric entry; **two-finger pinch** resizes it (image zoom is handed to the
+  editor via `manualActive`); a **magnifier loupe** shows the vertex under the finger.
+- **Draw by hand** — the user TRACES reference lines along columns/rows; each stroke → a `RawLine`
+  fed to `buildGrid` (family split + VP fit + `extend:'frame'`), so a few lines generate the whole
+  lattice. Strokes have draggable endpoints and a × delete badge; the grid regenerates live.
+On **commit** ("Fatto") the grid is EXTENDED past the drawn quad to fill the frame
+(`commitManualGrid`, mirroring `extend:'frame'`). The controls bar sits at the top and is
+collapsible so it never hides a corner handle (the collapse chevron is hidden when there's nothing
+to collapse — draw mode). Grid drawing + the tactical layer are gated on `gridReliable` (or the
+editor being active); the FAB is hidden while a grid is unreliable or being edited.
+**Why:** on genuinely hard shots (strong perspective, noise, or distractors like a tiled floor)
+detection fails in *any* variant of the pipeline — and drawing the resulting degenerate
+micro/macro grid over the photo is what reads as a "drastic loss of precision". Showing the clean
+photo + an honest choice (edit it yourself / retake) is far better than a confident-looking wrong
+grid.
+**Calibration (user-labelled 16-photo corpus).** The user labelled which auto-detections are
+actually correct — **only 3/16** were (auto-detection accuracy is genuinely low on hard photos).
+The calibrated `gridConfidence` now separates most of them: the genuinely-correct grids score
+≥ ~0.86 while the false positives / imprecise fits (a self-consistent but wrong lattice, a texture
+sub-pitch) sit at 0.43–0.53, so `DRAW_THRESHOLD` = **0.65** splits them with ~zero recall cost on
+the real grids and kills the #13-style false positive. Confidence measures lattice self-consistency
++ size + squareness, **not image support yet**, so the bar stays here rather than trusting a low
+score outright. Do NOT re-tune detection against my own guesses — establish ground truth from the
+user first (see the memory note). The remaining gap is detection *accuracy*, not the gate.
+
+### Map-boundary quad auto-rescue was attempted and dropped (unreliable segmentation)
+**Decision:** an auto "map boundary" step (restrict the edges to the detected map quad before
+Hough, to shake off distractors like a tiled floor) was prototyped twice — Canny→contours→
+`approxPolyDP`, then Otsu→`minAreaRect` with both polarities — as a non-regressive *rescue*
+(runs only on a weak fit, kept only if strictly better). On the real corpus it found **no usable
+map quad** (cluttered scenes: mat + floor + objects don't segment into a clean rectangle; results
+were near-frame or nothing, and the target grids in the distractor cases are too faint to detect
+even when isolated). It improved nothing, so it was reverted rather than shipped as inert code.
+The reliable path for these hard cases is the **manual grid** above. A corner/intersection-node
+fallback remains a possible future direction.
+
+### Periodicity-first rework (v2/v3) prototyped and reverted
+**Decision:** the periodicity-first detection rework — a global 2-D periodic model fit from an FFT
+orientation prior + projection/autocorrelation pitch (planned in the former `detection-v2-plan.md`
+/ `detection-v3-plan.md`) — was implemented (`periodicPitch` / `periodicExtract`, ~535 lines) and
+then **removed in full**; the pipeline is back to the bottom-up chain (Canny → Hough → family split
+→ VP RANSAC → rectify → lattice fit) with the calibrated `gridConfidence` draw gate above.
+**Why:** it did not beat the existing pipeline on the labelled corpus and added a large, interacting
+surface (comb-pitch / rectify-stability / horizon-sweep experiments — `combPitch`, `periodicExtract`,
+`rectifyStability`, etc.). The related tuning flags (`profilePitch`, `cornerVerify`, `lineSupport`,
+`morphCloseFirst`, `ridgeHysteresis`, `ridgeLocalThresh`) were likewise added and reverted — **no
+experimental detector flags remain** (the ridge binarisation `ridgeLocalThresh` became the fixed
+local-mean + 1σ threshold in `enhanceGridLines`). The two plan docs were retired to obsolete
+tombstones; this note is the historical record.
+
+### Grid extrapolated to the whole frame by default (`extend: 'frame'`)
+**Decision:** after fitting the regular lattice, continue it `a + b·k` outward past the
+detected extent and tile the **entire image frame** with the inferred grid; extrapolated
+lines are drawn faint (0.5α), flagged `extended`+`filled` (`fitFamilyGrid`, `DEFAULT_PARAMS`
+`src/grid-detector.ts`). Bounded by the frame and a vanishing-point crowding guard;
+`'border'` (a couple of cells) and `'off'` remain as options.
+**Why:** the detector missed the **outer sides** of a grid whose edge is a colour-only
+boundary (similar luminance), and, more broadly, the user wanted a **virtual tactical
+grid** covering the whole photo, not just the drawn map. Extrapolation is exact in the
+rectified plane (pure arithmetic continuation), so it needs no extra detection.
+**Accepted trade-off:** it draws grid over empty areas beyond the physical map and lets
+pieces be placed off the real map; the faint styling flags those cells as inferred. The
+user chose full-frame over the conservative `'border'` mode.
+
+### Fallback strength gates on DETECTED lines only
+**Decision:** the `lineMorph` retry fires on `min(detected(familyA), detected(familyB)) < 3`,
+counting only non-`filled` lines, not `info.aCount/bCount` (`detectGridFromMat`
+`src/grid-detector.ts`).
+**Why:** with `fillGrid` and especially `extend: 'frame'`, the family sizes are inflated by
+rebuilt/extrapolated lines. Gating on the totals would let a weak 2-line detection look
+strong and skip the morphological fallback the noisy-photo path depends on.
+
 ## Tactical engine
 
 ### Unified single grid colour (no H/V distinction)

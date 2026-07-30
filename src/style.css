@@ -137,6 +137,66 @@ body {
   filter: grayscale(0.7) drop-shadow(0 0 8px rgba(239, 68, 68, 0.5));
 }
 
+/* --- Processing overlay (per-photo analysis) ------------------------- */
+/* Covers the map (not the header) while a captured photo is analysed. The die
+   reuses the loader's compositor-driven spin, so it keeps turning even while a
+   synchronous OpenCV stage briefly blocks the main thread; the bar advances in
+   steps between stages. */
+.processing {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+  /* Opaque, so the just-captured (or previous) photo is fully hidden while the
+     grid is being analysed — only the die + progress show, on a black ground. */
+  background: var(--bg);
+}
+.processing[hidden] {
+  display: none;
+}
+.processing .loader-die {
+  width: min(88px, 24vw);
+  margin-bottom: 4px;
+}
+.processing-msg {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--fg);
+}
+.processing-sub {
+  margin: 0;
+  max-width: 34ch;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: #9fb0c0;
+}
+.processing-bar {
+  width: min(280px, 70vw);
+  height: 8px;
+  border-radius: 999px;
+  background: #1c2a38;
+  overflow: hidden;
+}
+.processing-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--tactic-2));
+  transition: width 0.2s ease;
+}
+.processing-pct {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: #9fb0c0;
+}
+
 /* --- Top bar --------------------------------------------------------- */
 .topbar {
   display: flex;
@@ -207,6 +267,11 @@ body {
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s, transform 0.06s;
 }
+/* An .icon-btn sets display, which overrides the [hidden] UA rule — restore it so a
+   standalone hidden icon button (e.g. the debug-only gallery load) actually hides. */
+.icon-btn[hidden] {
+  display: none;
+}
 .icon-btn:hover {
   background: #1e2a3a;
 }
@@ -249,19 +314,59 @@ body {
   object-fit: contain;
 }
 
+/* Tap-to-focus reticle: a Lucide `focus` glyph flashed where the user tapped the live
+   preview. Centred on its (left,top) anchor; pops + fades over ~700ms then hides. */
+.focus-reticle {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%);
+  color: #fbbf24;
+  pointer-events: none;
+  z-index: 6;
+  filter: drop-shadow(0 1px 3px rgba(0, 0, 0, 0.6));
+  opacity: 0;
+}
+.focus-reticle svg {
+  display: block;
+}
+.focus-reticle.show {
+  animation: focus-pop 700ms ease-out both;
+}
+@keyframes focus-pop {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(1.35);
+  }
+  25% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  70% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(1);
+  }
+}
+
 .hint {
   position: absolute;
-  /* Sits BELOW the (raised) Scatta button so it stays readable. */
-  bottom: calc(16px + env(safe-area-inset-bottom));
+  /* Sits BELOW the (raised) Scatta button so it stays readable. Kept short so it
+     stays on ONE line (a two-line pill crowded the Scatta button). */
+  bottom: calc(18px + env(safe-area-inset-bottom));
   left: 50%;
   transform: translateX(-50%);
   max-width: calc(100% - 24px);
+  white-space: nowrap;
   text-align: center;
   background: rgba(0, 0, 0, 0.66);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  padding: 9px 16px;
+  padding: 6px 14px;
   border-radius: 999px;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--fg);
   pointer-events: none;
   backdrop-filter: blur(4px);
@@ -385,13 +490,9 @@ body {
   align-items: center;
   gap: 8px 12px;
 }
-.hud-hint {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.35;
-  color: var(--muted);
-}
-.hud-hint[hidden] {
+/* Movement (and other control-less contexts) have no body — drop the empty padded
+   area and, in JS, the collapse chevron too. */
+.hud.bodyless .hud-body {
   display: none;
 }
 
@@ -425,6 +526,14 @@ body {
   box-shadow: 0 5px 16px rgba(0, 0, 0, 0.5);
   cursor: pointer;
   transition: transform 0.2s ease, background 0.2s ease;
+}
+/* No grid → the FAB stays visible but inert: greyed, flattened, non-interactive. */
+.fab:disabled {
+  background: var(--panel-2);
+  color: var(--muted);
+  box-shadow: none;
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 .fab.mode-ally {
   background: #22c55e;
@@ -477,46 +586,736 @@ body {
   color: #93b4fd;
 }
 
-/* --- Transient toast (placement hints) ------------------------------ */
-.toast {
+/* --- Debug pipeline graph (nodes + arrows, top; debug mode only) ------ */
+.debug-bar {
   position: absolute;
-  left: 14px;
-  bottom: calc(14px + env(safe-area-inset-bottom));
-  z-index: 15;
-  max-width: min(340px, calc(100% - 90px)); /* clear the FAB on the right */
-  padding: 9px 14px;
+  left: 8px;
+  right: 8px;
+  top: calc(8px + env(safe-area-inset-top));
+  z-index: 30; /* above the HUD while inspecting the pipeline */
+  padding: 6px 8px 8px;
   border-radius: 12px;
-  background: rgba(17, 24, 33, 0.94);
+  background: rgba(10, 14, 19, 0.86);
   border: 1px solid var(--line);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
-  color: var(--fg);
-  font-size: 13px;
-  line-height: 1.3;
-  /* Never taller than 2 lines. */
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  opacity: 0;
-  transform: translateY(6px);
-  transition: opacity 0.2s ease, transform 0.2s ease;
-  pointer-events: none;
+  backdrop-filter: blur(8px);
 }
-.toast[hidden] {
+.debug-bar[hidden] {
   display: none;
 }
-.toast.show {
-  opacity: 1;
-  transform: none;
+.debug-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.debug-title {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.debug-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.debug-collapse {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--fg);
+  border-radius: 7px;
+  cursor: pointer;
+}
+.debug-collapse.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.debug-collapse .chev {
+  transition: transform 0.2s ease;
+}
+.debug-bar.collapsed .debug-collapse .chev {
+  transform: rotate(-90deg);
+}
+/* Timing log (scroll-text button) — where the pipeline spent its time. It REPLACES the graph +
+   confidence strip (view selector), so it may be long → cap the height and scroll it vertically. */
+.debug-log {
+  margin-top: 7px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  font-variant-numeric: tabular-nums;
+  max-height: 68dvh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+}
+.debug-log-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 11px;
+  line-height: 1.7;
+}
+.debug-log-k {
+  color: var(--muted);
+}
+.debug-log-v {
+  color: var(--fg);
+  font-weight: 700;
+}
+/* Group header: the pipeline name + its subtotal. */
+.debug-log-group {
+  margin-top: 4px;
+}
+.debug-log-group:first-child {
+  margin-top: 0;
+}
+.debug-log-group .debug-log-k {
+  color: var(--fg);
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+/* Items sit under their group header, indented. */
+.debug-log-row.indent {
+  padding-left: 12px;
+}
+.debug-log-row.indent .debug-log-v {
+  font-weight: 600;
+}
+/* Per-node breakdown of a parent stage (morphology extraction): shown but not summed. */
+.debug-log-row.breakdown {
+  padding-left: 22px;
+  opacity: 0.62;
+}
+.debug-log-row.breakdown .debug-log-v {
+  font-weight: 500;
+}
+/* Grand total. */
+.debug-log-total {
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px solid var(--line);
+}
+.debug-log-total .debug-log-k,
+.debug-log-total .debug-log-v {
+  color: var(--accent);
+  font-weight: 700;
+}
+/* LOG view tabs (Tempi | Confidenza) — sit above the shared .debug-log panel. */
+.debug-log-tabs {
+  display: flex;
+  gap: 4px;
+  margin-top: 7px;
+}
+.debug-log-tab {
+  flex: 0 0 auto;
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+}
+.debug-log-tab.on {
+  color: var(--fg);
+  border-color: var(--accent);
+  background: rgba(34, 211, 238, 0.12);
+}
+.debug-log-tabs + .debug-log {
+  margin-top: 6px;
+}
+/* Confidence tab: the chosen candidate's group header is accented + left-barred. */
+.debug-log-group.chosen {
+  border-left: 2px solid var(--accent);
+  padding-left: 6px;
+}
+.debug-log-group.chosen .debug-log-k,
+.debug-log-group.chosen .debug-log-v {
+  color: var(--accent);
+}
+/* Confidence tab: the fused/final row of each candidate, emphasised. */
+.debug-log-row.conf-final .debug-log-k,
+.debug-log-row.conf-final .debug-log-v {
+  color: var(--fg);
+  font-weight: 700;
+}
+/* Confidence tab: the plain-language verdict — the headline "why", full-width, no value column. */
+.debug-log-row.conf-why {
+  margin: 3px 0 1px;
+}
+.debug-log-row.conf-why .debug-log-k {
+  color: var(--fg);
+  font-weight: 600;
+  font-style: italic;
+}
+.debug-log-row.conf-why.warn .debug-log-k {
+  color: #fbbf24;
+}
+/* Confidence tab: the internal-confidence line (the product), lightly emphasised. */
+.debug-log-row.conf-mid .debug-log-v {
+  color: var(--fg);
+  font-weight: 700;
+}
+/* Per-axis evidence table (count / inlier / fill / span / q). */
+.conf-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 3px 0 5px 12px;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.conf-table td {
+  padding: 2px 6px 2px 0;
+  color: var(--fg);
+  text-align: right;
+  white-space: nowrap;
+}
+.conf-table td:first-child {
+  text-align: left;
+  color: var(--muted);
+}
+.conf-table tr.conf-h td {
+  color: var(--muted);
+  font-weight: 700;
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.debug-scroll {
+  margin-top: 6px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+}
+.debug-bar.collapsed .debug-scroll {
+  display: none;
+}
+/* Collapsing hides the graph, stats and the numeric readouts (the timing log, .debug-log) —
+   only the head + rejection reason stay. */
+.debug-bar.collapsed .debug-log {
+  display: none;
+}
+
+/* "Why wasn't the grid drawn?" — the reliability gate's rejection reason (debug only). Stays
+   visible even when the bar is collapsed, since it's the key diagnostic. */
+.debug-reason {
+  margin-top: 7px;
+  padding: 6px 9px;
+  border: 1px solid rgba(248, 113, 113, 0.55);
+  border-radius: 8px;
+  background: rgba(248, 113, 113, 0.14);
+  color: #fecaca;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+}
+
+/* --- Confidence strip: per-pipeline quality + the final decision --- */
+.debug-stats {
+  display: flex;
+  gap: 6px;
+  margin-top: 7px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
+}
+.debug-bar.collapsed .debug-stats {
+  display: none;
+}
+.pstat {
+  flex: 0 0 auto;
+  min-width: 98px;
+  padding: 5px 8px 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+.pstat-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.pstat-name {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.pstat-val {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--fg);
+  font-variant-numeric: tabular-nums;
+}
+.pstat-bar {
+  display: block;
+  height: 4px;
+  margin-top: 5px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.09);
+  overflow: hidden;
+}
+.pstat-fill {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: #6b7d92;
+  transition: width 0.2s ease;
+}
+/* The fit that won → accent (matches a used graph node). */
+.pstat.chosen {
+  border-color: #2f6d7a;
+  background: rgba(34, 211, 238, 0.1);
+}
+.pstat.chosen .pstat-name {
+  color: var(--accent);
+}
+.pstat.chosen .pstat-fill {
+  background: var(--accent);
+}
+/* Agreement: a cross-check between the two fits, not a fit's own quality — dashed to
+   read as a meta-metric, separated from the candidate chips. */
+.pstat-agree {
+  margin-left: 6px;
+  border-style: dashed;
+}
+.pstat-agree .pstat-fill {
+  background: #a78bfa;
+}
+/* Final decision: separated from the candidates and coloured by the reliability gate. */
+.pstat-final {
+  margin-left: 6px;
+  border-left-width: 3px;
+}
+.pstat-final.ok {
+  border-color: #2f6d7a;
+  background: rgba(34, 211, 238, 0.1);
+}
+.pstat-final.ok .pstat-name {
+  color: var(--accent);
+}
+.pstat-final.ok .pstat-fill {
+  background: var(--accent);
+}
+.pstat-final.bad {
+  border-color: #7a3b2f;
+  background: rgba(248, 113, 113, 0.08);
+}
+.pstat-final.bad .pstat-fill {
+  background: #f8776b;
+}
+.debug-graph {
+  position: relative;
+}
+.debug-arrows {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+}
+.debug-arrows .arrow {
+  fill: none;
+  stroke: #6b7d92;
+  stroke-width: 1.5;
+}
+/* Used = on the winning path (accent). Off = a stage that never ran (faint dashed). */
+.debug-arrows .arrow.used {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+.debug-arrows .arrow.off {
+  opacity: 0.22;
+  stroke-width: 1.2;
+  stroke-dasharray: 3 3;
+}
+.debug-node {
+  position: absolute;
+  width: 62px;
+  height: 32px;
+  padding: 0 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  font-size: 10px;
+  line-height: 1.05;
+  font-weight: 600;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color 0.12s, color 0.12s, background 0.12s;
+}
+.debug-node:hover {
+  background: #1f2b3b;
+}
+/* USED: on the winning path — highlighted. */
+.debug-node.used {
+  color: var(--fg);
+  border-color: #2f6d7a;
+  background: rgba(34, 211, 238, 0.1);
+}
+/* OFF: the stage never ran — deactivated, shown (with arrows) but not clickable. */
+.debug-node.off,
+.debug-node:disabled {
+  opacity: 0.38;
+  border-style: dashed;
+  cursor: default;
+}
+.debug-node:disabled:hover {
+  background: var(--panel-2);
+}
+/* Selected (for the canvas preview) — a strong accent ring, on top of any state. */
+.debug-node.on {
+  color: var(--accent);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent) inset;
+}
+.debug-node.no-img {
+  cursor: default;
+}
+
+/* --- Contextual help: a single (i) button + popover (bottom-left) --- */
+/* Sits just above the version badge; shown only when there's guidance for the
+   current state. Replaces the scattered hints and transient toasts. */
+.info-wrap {
+  position: absolute;
+  left: 10px;
+  bottom: calc(30px + env(safe-area-inset-bottom));
+  z-index: 17; /* above the HUD */
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+.info-wrap[hidden] {
+  display: none;
+}
+.info-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: 1px solid var(--line);
+  background: rgba(17, 24, 33, 0.9);
+  color: var(--muted);
+  border-radius: 50%;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(8px);
+  transition: color 0.15s, border-color 0.15s, background 0.15s, transform 0.06s;
+}
+.info-btn:hover {
+  color: var(--fg);
+  background: #1e2a3a;
+}
+.info-btn:active {
+  transform: scale(0.94);
+}
+.info-wrap.open .info-btn {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.info-btn svg {
+  display: block;
+}
+.info-pop {
+  max-width: min(320px, calc(100vw - 32px));
+  padding: 10px 13px;
+  border-radius: 12px;
+  background: rgba(17, 24, 33, 0.96);
+  border: 1px solid var(--line);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(10px);
+  color: var(--fg);
+  font-size: 12.5px;
+  line-height: 1.45;
+  white-space: pre-line; /* honour \n between the hint lines */
+}
+.info-pop[hidden] {
+  display: none;
+}
+/* Inline copies of the real top-bar icons, shown as little control chips inside the
+   guidance so it points at the actual buttons. */
+.info-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: -0.32em;
+  width: 24px;
+  height: 24px;
+  margin: 0 1px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-2);
+  color: var(--fg);
+}
+.info-ico svg {
+  display: block;
+}
+
+/* --- Grid fallback panel (unreliable auto-detection) ---------------- */
+/* Shown over the captured photo when the auto grid is too unreliable to draw.
+   A bottom scrim keeps the photo visible up top (so the user can judge the shot)
+   while the card offers "retake" or "manual grid". */
+.grid-fail {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 18px;
+  padding-bottom: calc(18px + env(safe-area-inset-bottom));
+  background: linear-gradient(
+    180deg,
+    rgba(10, 14, 19, 0) 0%,
+    rgba(10, 14, 19, 0.35) 45%,
+    rgba(10, 14, 19, 0.78) 100%
+  );
+  pointer-events: none; /* let the scrim show the photo; the card re-enables */
+}
+.grid-fail[hidden] {
+  display: none;
+}
+.grid-fail-card {
+  pointer-events: auto;
+  width: min(420px, 100%);
+  padding: 18px;
+  border-radius: var(--radius);
+  background: rgba(19, 28, 39, 0.94);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+  text-align: center;
+}
+.grid-fail-title {
+  margin: 0 0 6px;
+  font-size: 15.5px;
+  font-weight: 700;
+  color: var(--fg);
+}
+.grid-fail-sub {
+  margin: 0 0 14px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--muted);
+}
+.grid-fail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  justify-content: center;
+}
+.btn {
+  appearance: none;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 11px 20px;
+  font-size: 14.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: transform 0.06s, filter 0.15s, background 0.15s;
+}
+.btn:active {
+  transform: translateY(1px) scale(0.99);
+}
+.btn-primary {
+  color: var(--accent-ink);
+  background: linear-gradient(135deg, var(--accent), #16b8d4);
+  box-shadow: 0 6px 18px rgba(34, 211, 238, 0.28);
+}
+.btn-primary:hover {
+  filter: brightness(1.05);
+}
+.btn-ghost {
+  color: var(--fg);
+  background: var(--panel-2);
+  border-color: var(--line);
+}
+.btn-ghost:hover {
+  background: #1f2b3b;
+}
+.btn-link {
+  appearance: none;
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 6px;
+  margin-top: 4px;
+}
+.btn-link:hover {
+  color: var(--fg);
+}
+
+/* --- Manual grid editor bar (top, collapsible) --------------------- */
+.manual-bar {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  top: calc(10px + env(safe-area-inset-top));
+  z-index: 42;
+  width: min(460px, calc(100% - 20px));
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: var(--radius);
+  background: rgba(19, 28, 39, 0.95);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+}
+.manual-bar[hidden] {
+  display: none;
+}
+.manual-bar-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* Fatto (primary) is pushed to the right, so the head reads: Annulla … Fatto [⌄]. */
+#manualDone {
+  margin-left: auto;
+}
+/* When collapsed, only the head row (with Fatto/Annulla) stays. */
+.manual-bar.collapsed .manual-bar-body {
+  display: none;
+}
+/* In "draw" mode the grid comes from traced lines: no steppers, so the whole body
+   goes away and the bar is just a slim head. */
+.manual-bar.draw-mode .manual-bar-body {
+  display: none;
+}
+.manual-bar.collapsed .manual-bar-head .chev {
+  transform: rotate(-90deg);
+}
+.manual-bar-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.manual-bar-row {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  flex-wrap: nowrap;
+}
+.btn-mini {
+  padding: 7px 14px;
+  font-size: 13px;
+}
+.stepper-input {
+  width: 40px;
+  height: 26px;
+  padding: 0 2px;
+  flex: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg-2);
+  color: var(--fg);
+  font-size: 15px;
+  font-weight: 700;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+.stepper-input::-webkit-outer-spin-button,
+.stepper-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.stepper {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 6px;
+  border-radius: 999px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+}
+.stepper-lbl {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  padding: 0 1px;
+}
+.stepper-btn {
+  appearance: none;
+  border: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: #223247;
+  color: var(--fg);
+  font-size: 17px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+.stepper-btn:active {
+  transform: scale(0.94);
+}
+.stepper-val {
+  min-width: 24px;
+  text-align: center;
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+}
+.manual-bar-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
 }
 
 /* --- Build version badge (overlaid, bottom-left) -------------------- */
-.version-badge {
+.version-row {
   position: absolute;
   left: 10px;
   bottom: calc(7px + env(safe-area-inset-bottom));
-  /* Below the transient toast (z 15) — it may briefly cover the badge. */
   z-index: 14;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  pointer-events: none;
+}
+.version-badge {
   padding: 2px 6px;
   border-radius: 6px;
   font-size: 11px;
@@ -526,10 +1325,41 @@ body {
   color: rgba(226, 236, 247, 0.62);
   background: rgba(10, 14, 19, 0.42);
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
-  pointer-events: none;
   user-select: none;
 }
 .version-badge:empty {
+  display: none;
+}
+/* Debug indicator — a small translucent amber chip next to the version, shown only in debug mode. */
+.dbg-badge {
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  color: #fbbf24;
+  border: 1px solid rgba(251, 191, 36, 0.85);
+  background: rgba(251, 191, 36, 0.14);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+  user-select: none;
+}
+.dbg-badge[hidden] {
+  display: none;
+}
+/* Debug-only focus indicator (Lucide `focus`), next to the DBG chip: GREY by default, BLUE when
+   the last detection ran with a tap-to-focus point. Shown/hidden with the DBG chip. */
+.focus-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6));
+  user-select: none;
+}
+.focus-badge.on {
+  color: #3b82f6;
+}
+.focus-badge[hidden] {
   display: none;
 }
 

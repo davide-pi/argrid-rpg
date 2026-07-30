@@ -136,6 +136,8 @@ export interface GridResult {
   // lines survive raw→angle-split→duplicate-merge→VP-concurrency→regular-lattice. Pinpoints
   // WHERE an obvious grid's lines are being discarded.
   debugFit?: { split: [number, number]; merged: [number, number]; vp: [number, number]; lattice: [number, number] };
+  // Fase C1 diagnostics: the periodicity-fallback's quality on this frame (for calibration).
+  debugPeriodic?: { peakRatio: number; fillRatio: number; pitchA: number; pitchB: number; nA: number; nB: number } | null;
   info: {
     rawCount: number;
     aCount: number;
@@ -769,6 +771,25 @@ export function* detectGridFromMatSteps(
     }
 
     const edges = morphEdges ?? cannyEdges; // whichever mask survived
+
+    // Fase C1 (EXPERIMENTAL, NOT wired into the decision): the periodicity-fallback quality.
+    // Measured on the corpus and found INSUFFICIENT — on texture-buried grids the edge-density
+    // profile is dominated by texture, so `combPitch` locks onto a fine sub-pitch and `peakRatio`
+    // does NOT separate real grids from texture. Kept dormant behind `wantEdges` (debug only, zero
+    // production cost) for future iteration; see periodicExtract's header.
+    if (wantEdges) {
+      const periodic = periodicExtract(edges, orient, scale);
+      result.debugPeriodic = periodic
+        ? {
+            peakRatio: +periodic.peakRatio.toFixed(2),
+            fillRatio: +periodic.fillRatio.toFixed(2),
+            pitchA: Math.round(periodic.pitchA),
+            pitchB: Math.round(periodic.pitchB),
+            nA: periodic.nA,
+            nB: periodic.nB,
+          }
+        : null;
+    }
 
     yield { frac: 0.9, label: 'Ricostruzione della griglia…' };
     result.info.cannyHigh = cannyHigh;
@@ -2177,12 +2198,13 @@ export function gridConfidence(
 }
 
 /** Draw/keep an auto-detected grid when its calibrated confidence clears this bar. SINGLE SOURCE
- * OF TRUTH for the reliability decision (the UI gate imports it). COUPLED to the `evidence` curve
- * in `familyQuality`: at 0.40 a family needs ~4 regularly-spaced detected lines to be drawn, which
- * also refuses the 3-line frame-tiling stumble (≈0.33). Biased low (the user wants recall) —
- * quality is enforced by the hard guards below + the rectify/periodicity fixes, not a high bar.
- * To draw from fewer lines, steepen `evidence`, don't just lower this. */
-export const DRAW_THRESHOLD = 0.4;
+ * OF TRUTH for the reliability decision (the UI gate imports it). Calibrated on the labelled corpus
+ * (Fase A): the genuinely-correct grids all score ≥ ~0.86, while the false positives / imprecise
+ * fits (a self-consistent but wrong lattice, a texture sub-pitch) sit at 0.43–0.53 — so 0.65
+ * separates them with ~zero recall cost on the real grids and kills the #13-style false positive.
+ * Confidence still measures lattice self-consistency + size + squareness, NOT image support yet
+ * (see Fase C), so keep the bar here rather than trusting a low score. */
+export const DRAW_THRESHOLD = 0.65;
 
 /** THE reliability decision — pure and unit-testable: is this fit good enough to DRAW as the auto
  * grid? One calibrated score above threshold, PLUS two HARD guards kept OUT of the score because
@@ -2422,6 +2444,113 @@ export function combPitch(offsets: number[], seed: number): CombFit {
   return { pitch: best.p, anchor, fillRatio: best.fill, peakRatio };
 }
 
+export interface PeriodicResult {
+  raw: RawLine[]; // synthesized grid lines (rho in WORKING coords, theta = family normal), both families
+  peakRatio: number; // min of the two families' autocorrelation peak sharpness (grid ≫ texture)
+  fillRatio: number; // min of the two families' lattice completeness
+  pitchA: number; // ORIGINAL-coord pitch of family A
+  pitchB: number;
+  nA: number; // synthesized line count, family A
+  nB: number;
+}
+
+/**
+ * Fase C1 — periodicity-based extraction FALLBACK. Where the line-based pipeline drowns in texture
+ * (faint / brown-on-earth grids), the AGGREGATE edge-density PROFILE projected onto each dominant
+ * orientation still carries the grid's periodicity even when no individual Hough line survives. For
+ * each of the two FFT orientations we build the 1-D offset histogram of the edge pixels, find its
+ * peaks, and run the (fill-weighted, harmonic-safe) `combPitch` on them to recover pitch + phase;
+ * a SHARP profile peak (`peakRatio`) is the discriminator between a real grid and texture. Then we
+ * synthesize a clean, regular lattice — so the downstream fit gets uniform lines instead of a smear.
+ * Returns null when there's no clear two-family periodicity. `edges` is the WORKING-coord edge mask.
+ */
+function periodicExtract(
+  edges: any,
+  orient: { a: number; b: number } | null,
+  scale: number,
+): PeriodicResult | null {
+  if (!orient) return null;
+  const W = edges.cols;
+  const H = edges.rows;
+  const data = edges.data as Uint8Array;
+
+  const family = (angDeg: number) => {
+    const nx = Math.cos(angDeg / DEG);
+    const ny = Math.sin(angDeg / DEG);
+    let oMin = Infinity;
+    let oMax = -Infinity;
+    for (const [x, y] of [[0, 0], [W, 0], [0, H], [W, H]] as const) {
+      const o = x * nx + y * ny;
+      if (o < oMin) oMin = o;
+      if (o > oMax) oMax = o;
+    }
+    const n = Math.ceil(oMax - oMin) + 1;
+    if (n < 8) return null;
+    const prof = new Float64Array(n);
+    let idx = 0;
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++, idx++) {
+        if (data[idx]) {
+          const b = Math.round(x * nx + y * ny - oMin);
+          if (b >= 0 && b < n) prof[b]++;
+        }
+      }
+    }
+    // Light smoothing (±2 box) so a grid line's few-px-thick edge band reads as one peak.
+    const sm = new Float64Array(n);
+    let mx = 0;
+    for (let i = 0; i < n; i++) {
+      let s = 0;
+      for (let k = -2; k <= 2; k++) { const j = i + k; if (j >= 0 && j < n) s += prof[j]; }
+      sm[i] = s;
+      if (s > mx) mx = s;
+    }
+    if (mx <= 0) return null;
+    // Peaks: local maxima above a fraction of the profile max (a grid line is a strong ridge).
+    const peaks: number[] = [];
+    for (let i = 1; i < n - 1; i++) {
+      if (sm[i] >= 0.22 * mx && sm[i] >= sm[i - 1] && sm[i] > sm[i + 1]) peaks.push(oMin + i);
+    }
+    if (peaks.length < 3) return null;
+    const gaps: number[] = [];
+    for (let i = 1; i < peaks.length; i++) gaps.push(peaks[i] - peaks[i - 1]);
+    const seed = median(gaps);
+    if (!(seed > 0)) return null;
+    const cf = combPitch(peaks, seed);
+    if (!(cf.pitch > 0)) return null;
+    return { nx, ny, angDeg, cf, oMin, oMax };
+  };
+
+  const A = family(orient.a);
+  const B = family(orient.b);
+  if (!A || !B) return null;
+
+  const synth = (F: NonNullable<ReturnType<typeof family>>): RawLine[] => {
+    const p = F.cf.pitch;
+    const a0 = F.cf.anchor;
+    const theta = ((F.angDeg % 180) + 180) % 180;
+    const lines: RawLine[] = [];
+    const kmin = Math.ceil((F.oMin - a0) / p);
+    const kmax = Math.floor((F.oMax - a0) / p);
+    if (kmax - kmin > 200) return lines; // sub-pitch guard: refuse to synthesize a texture comb
+    for (let k = kmin; k <= kmax; k++) lines.push({ rho: a0 + k * p, thetaDeg: theta });
+    return lines;
+  };
+
+  const rawA = synth(A);
+  const rawB = synth(B);
+  if (rawA.length < 3 || rawB.length < 3) return null;
+  return {
+    raw: [...rawA, ...rawB],
+    peakRatio: Math.min(A.cf.peakRatio, B.cf.peakRatio),
+    fillRatio: Math.min(A.cf.fillRatio, B.cf.fillRatio),
+    pitchA: A.cf.pitch / scale,
+    pitchB: B.cf.pitch / scale,
+    nA: rawA.length,
+    nB: rawB.length,
+  };
+}
+
 /** Phase 3c — a comb fit whose lattice is emptier than this is a sub-pitch smear (too many phantom
  * empty slots). Perspective-safe: a real grid stays near-complete (fillRatio≈1) at any perspective. */
 const FILL_DEGENERATE_MIN = 0.4;
@@ -2448,6 +2577,11 @@ export const MIN_FRAME_EVIDENCE = 3;
  * VP/rectify fit locked onto under strong perspective) — reconstruction is then
  * skipped so it can't fill/extend into hundreds of bogus lines. */
 const MAX_CELLS_ACROSS = 50;
+
+/** How close (as a fraction of the cell) a line must sit to a lattice node to count as on-lattice
+ * in the least-squares refit. See Fase A — tightened from 0.4 so parallel texture doesn't inflate
+ * regularity, while staying loose enough for a real grid's slight perspective offset drift. */
+const LATTICE_TOL = 0.3;
 
 /**
  * Fit ONE family's regular lattice in the rectified plane (where its lines are
@@ -2564,7 +2698,10 @@ function fitFamilyGrid(
   // least-squares refit, otherwise an off-lattice line biases the very first
   // fit and gets absorbed instead of rejected.
   let b = cell;
-  const keep = offs.map((o) => Math.abs(o - (a + cell * Math.round((o - a) / cell))) / cell <= 0.4);
+  // Lattice inlier tolerance (Fase A): a line counts as on-lattice within LATTICE_TOL·cell of a
+  // node. Tightened 0.4→0.3 so a parallel TEXTURE line sitting ~0.35·cell off a node no longer
+  // inflates `inlier`/regularity (a real grid's lines sit within ~0.1·cell of their nodes).
+  const keep = offs.map((o) => Math.abs(o - (a + cell * Math.round((o - a) / cell))) / cell <= LATTICE_TOL);
   for (let iter = 0; iter < 6; iter++) {
     let n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
     for (let i = 0; i < offs.length; i++) {
@@ -2585,7 +2722,7 @@ function fitFamilyGrid(
     let changed = false;
     for (let i = 0; i < offs.length; i++) {
       const k = Math.round((offs[i] - na) / nb);
-      const ok = Math.abs(offs[i] - (na + nb * k)) / nb <= 0.4;
+      const ok = Math.abs(offs[i] - (na + nb * k)) / nb <= LATTICE_TOL;
       if (ok !== keep[i]) changed = true;
       keep[i] = ok;
     }

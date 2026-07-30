@@ -67,6 +67,13 @@ export interface DetectorParams {
    * global mean+0.5σ) instead of the single global `mean+K·σ`. A faint grid on a textured surface
    * raises the GLOBAL σ so the global threshold drowns it; a local threshold recovers it. */
   ridgeLocalThresh: boolean;
+  /** Ridge binarisation (`binDir`): apply a safer "small-close → open → large-close" morphology
+   * order instead of the default "open → close". The default opening runs FIRST, so a weak line
+   * broken into pieces shorter than the L2 open-length is ERASED before the close can re-stitch it —
+   * losing faint/broken grids. When ON, a small (~L2) close first re-joins collinear fragments, THEN
+   * the open drops the still-short specks, THEN the large (LC) close bridges the wide gaps; the small
+   * initial close keeps the added-noise cost contained. Default off — to be measured on the corpus. */
+  morphCloseFirst: boolean;
   /** Metodo #1 — estimate the pitch from a DENSE projection profile of the edge pixels built in the
    * RECTIFIED plane (autocorrelation) instead of from the sparse line offsets. Integrating the edge
    * signal ALONG each line rescues faint/perspective grids where the sparse fit smears to a sub-pitch.
@@ -93,6 +100,7 @@ export const DEFAULT_PARAMS: DetectorParams = {
   edgeClean: true,
   periodicPitch: false,
   ridgeLocalThresh: false,
+  morphCloseFirst: false,
   profilePitch: false,
   cornerVerify: false,
 };
@@ -702,14 +710,14 @@ export function* detectGridFromMatSteps(
       const primary = Math.abs(off) > 12 ? -off : 0;
       let bestDeskew = primary;
       let morphAngles = 1;
-      morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, primary, timed, params.ridgeLocalThresh));
+      morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, primary, timed, params.ridgeLocalThresh, params.morphCloseFirst));
       morphRan = true;
       let alt = timed('morphHough', () => houghToGrid(cv, morphEdges, work, scale, W0, H0, params, orient));
       if (gridStrength(alt) < MORPH_STRONG) {
         for (const a of deskewSweepAngles(off, orient != null)) {
           if (Math.abs(a - primary) < MORPH_SWEEP_STEP / 2) continue; // ~already tried
           morphAngles++;
-          const m = timed('morphEnhance', () => enhanceGridLines(cv, gray, undefined, a, undefined, params.ridgeLocalThresh));
+          const m = timed('morphEnhance', () => enhanceGridLines(cv, gray, undefined, a, undefined, params.ridgeLocalThresh, params.morphCloseFirst));
           const f = timed('morphHough', () => houghToGrid(cv, m, work, scale, W0, H0, params, orient));
           if (gridStrength(f) > gridStrength(alt)) {
             morphEdges.delete();
@@ -724,7 +732,7 @@ export function* detectGridFromMatSteps(
         // Re-run the winning angle WITH snap so the graph shows its (deskewed) stages.
         if (bestDeskew !== primary) {
           morphEdges.delete();
-          morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, bestDeskew, timed, params.ridgeLocalThresh));
+          morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, bestDeskew, timed, params.ridgeLocalThresh, params.morphCloseFirst));
         }
       }
       timings.morphAngles = morphAngles;
@@ -1340,6 +1348,7 @@ function enhanceGridLines(
   deskewDeg = 0,
   time?: <X>(key: string, fn: () => X) => X,
   localThresh = false,
+  closeFirst = false,
 ): any {
   // Optional per-sub-node timing (debug): wraps the ridge / line-binarisation phases so the
   // graph's morph nodes (Cresta/Linee H·V) each get a measured time. Identity when absent.
@@ -1427,8 +1436,17 @@ function enhanceGridLines(
     } else {
       cv.threshold(r, b, gMean + K * gSig, 255, cv.THRESH_BINARY);
     }
-    cv.morphologyEx(b, b, cv.MORPH_OPEN, seOpen);
-    cv.morphologyEx(b, b, cv.MORPH_CLOSE, seClose);
+    if (closeFirst) {
+      // Safer order: re-stitch collinear fragments (small close ~L2) BEFORE discarding short
+      // runs, so a weak line broken into sub-L2 pieces survives the open; then the large close
+      // bridges the wide gaps. The small initial close avoids sucking in far-off texture.
+      cv.morphologyEx(b, b, cv.MORPH_CLOSE, seOpen);
+      cv.morphologyEx(b, b, cv.MORPH_OPEN, seOpen);
+      cv.morphologyEx(b, b, cv.MORPH_CLOSE, seClose);
+    } else {
+      cv.morphologyEx(b, b, cv.MORPH_OPEN, seOpen);
+      cv.morphologyEx(b, b, cv.MORPH_CLOSE, seClose);
+    }
     return b;
   };
   const bH = T('mbinh', () => binDir(rH, hSE2, hSEc));

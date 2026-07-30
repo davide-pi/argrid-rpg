@@ -713,9 +713,12 @@ export function* detectGridFromMatSteps(
     let winnerIdx = fused.index;
     // Noise safety net: on a texture-flooded frame a luminance fit that DISAGREES with a solid
     // morphology fit is probably texture — prefer the (texture-robust) morphology. This is a
-    // TIE-BREAK, not a bypass: it may only swap in morphology when its fused confidence is within
-    // CONF_TIE of the leader's, so the invariant "winner = argmax of the same score" holds and the
-    // draw gate can't be handed a candidate below threshold while a stronger one existed.
+    // TIE-BREAK, not a bypass, kept honest by TWO bounds: (1) morph's fused confidence stays within
+    // CONF_TIE of the leader's (it can't be wildly weaker), and (2) we only swap when morph is ITSELF
+    // drawable (≥ DRAW_THRESHOLD) OR the main we'd demote wasn't drawable anyway (< DRAW_THRESHOLD).
+    // So a DRAWABLE luminance fit is never demoted to a below-threshold morph — the invariant "the
+    // draw gate is never handed a candidate below threshold while a stronger (drawable) one existed"
+    // actually holds. (fused.confidences[winnerIdx] is main's, guaranteed by the id === 'main' check.)
     const morphCandIdx = candidates.findIndex((c) => c.id === 'morph');
     if (
       noisy &&
@@ -725,7 +728,9 @@ export function* detectGridFromMatSteps(
       !morphFit.info.degenerate &&
       Math.min(morphFit.info.detectedA, morphFit.info.detectedB) >= NOISE_MORPH_MIN &&
       (gridsAgree(mainFit, morphFit) ?? 0) < NOISE_AGREE_MAX &&
-      fused.confidences[morphCandIdx] >= fused.confidences[winnerIdx] - CONF_TIE
+      fused.confidences[morphCandIdx] >= fused.confidences[winnerIdx] - CONF_TIE &&
+      (fused.confidences[morphCandIdx] >= DRAW_THRESHOLD ||
+        fused.confidences[winnerIdx] < DRAW_THRESHOLD)
     ) {
       winnerIdx = morphCandIdx;
     }

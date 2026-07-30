@@ -84,6 +84,16 @@ export interface DetectorParams {
    * predicted crossings that land on a detected X-corner (intersectionConsensus) modulates the
    * confidence — corroborating a faint grid, penalising periodic texture with no real crossings. */
   cornerVerify: boolean;
+  /** P1 (image-support / line coverage) — fold an INDEPENDENT signal into the per-candidate confidence:
+   * the fraction of each PREDICTED line's length that actually has an edge under it in the image
+   * (lineCoverage over the working-res edge map, via buildEdgeNear). Today's confidence only measures
+   * the lattice's SELF-coherence (count/inlier/fill/span), so a periodic texture reads coherent (high)
+   * while a real-but-faint/perspective grid whose lines DON'T land on a regular lattice reads low even
+   * though the image clearly supports them. This multiplies the candidate's confidence by
+   * `min(supA,supB)^γ` BEFORE fusion (a coverage-per-family AND, like the pair term), so a fit with no
+   * image support is damped and a well-supported one is (nearly) untouched. Diagnostic value surfaced
+   * in `info.lineSupport`. Default off — to be calibrated on the corpus. */
+  lineSupport: boolean;
 }
 
 export const DEFAULT_PARAMS: DetectorParams = {
@@ -103,6 +113,7 @@ export const DEFAULT_PARAMS: DetectorParams = {
   morphCloseFirst: false,
   profilePitch: false,
   cornerVerify: false,
+  lineSupport: false,
 };
 
 /** A line as normal form: nx*x + ny*y = d, with (nx,ny) a unit vector. */
@@ -201,6 +212,10 @@ export interface GridResult {
     /** Metodo #2 (cornerVerify) — fraction of predicted crossings that landed on a detected corner,
      * when the corner channel ran (undefined otherwise). Diagnostic; already folded into confidence. */
     cornerScore?: number;
+    /** P1 (lineSupport) — robust per-family image-support score (median predicted-line edge coverage),
+     * when the line-coverage channel ran (undefined otherwise). Diagnostic; already folded into
+     * confidence (min of the two families, ^γ). See lineCoverage / buildEdgeNear. */
+    lineSupport?: number;
   };
 }
 
@@ -1036,6 +1051,52 @@ function buildProfileSampler(
   };
 }
 
+/** P1 (lineSupport) — a predicate `(x,y)⇒is there an edge pixel near this FULL-RES point?`, closed over
+ * the working-res binary edge map. Convention is the SAME as buildProfileSampler / detectCorners:
+ * `edges` lives at working resolution, so a full-res point (x,y) maps to working (x·scale, y·scale);
+ * `edges.data` is a working-res Uint8Array. We cache cols/rows/data once and, per query, scan a small
+ * box of radius `r = round(tolPx·scale)` working px around the mapped point — true on the first non-zero
+ * edge pixel. Cheap (an O(r²) window, r≈1–3), OpenCV-free per call. `tolPx` is a small ABSOLUTE full-res
+ * radius: the closure is built PRE-fit (like profileSampler), so the cell pitch isn't known yet to size
+ * it relative to spacing. Returns a closure that's always safe to call (empty map ⇒ always false). */
+type EdgeNear = (x: number, y: number) => boolean;
+function buildEdgeNear(cv: any, edges: any, scale: number, tolPx: number): EdgeNear {
+  void cv; // (kept for signature symmetry with the other CV samplers; no cv.* call needed)
+  const cols = edges.cols;
+  const rows = edges.rows;
+  const data: Uint8Array = edges.data;
+  const s = scale || 1;
+  const r = Math.max(1, Math.round(tolPx * s)); // working-px search radius (≥1 → tolerant to sub-px lines)
+  return (x: number, y: number): boolean => {
+    const xw = x * s;
+    const yw = y * s;
+    let x0 = Math.floor(xw) - r;
+    let x1 = Math.floor(xw) + r;
+    let y0 = Math.floor(yw) - r;
+    let y1 = Math.floor(yw) + r;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > cols - 1) x1 = cols - 1;
+    if (y1 > rows - 1) y1 = rows - 1;
+    for (let yy = y0; yy <= y1; yy++) {
+      const row = yy * cols;
+      for (let xx = x0; xx <= x1; xx++) {
+        if (data[row + xx] !== 0) return true;
+      }
+    }
+    return false;
+  };
+}
+
+/** P1 (lineSupport) tuning.
+ *  • LINE_SUPPORT_TOL_PX — box radius (full-res px) around a predicted line that still counts as
+ *    "an edge is under the line". Small absolute value: chosen pre-fit (pitch unknown) and generous
+ *    enough for line thickness / mild perspective / sub-px placement without catching a neighbour line.
+ *  • LINE_SUPPORT_GAMMA — the exponent on min(supA,supB): γ<1 softens the penalty (support 0.5 → ×0.71,
+ *    0.25 → ×0.5), so a partially-supported grid isn't crushed while a totally-unsupported one is. */
+const LINE_SUPPORT_TOL_PX = 3;
+const LINE_SUPPORT_GAMMA = 0.5;
+
 /** Metodo #2 — corner-channel tuning. `TOL_FRAC`·cell is the match radius a predicted crossing must
  * fall within of a detected corner; below `MIN_CROSSINGS` tested crossings the score is too noisy to
  * trust, so the modulation is skipped. */
@@ -1126,7 +1187,11 @@ function houghToGrid(
     // Metodo #1: profile sampler over THIS edge mask (rectified-plane pitch), reused across the
     // main fit and every degenerate re-fit. Built only when the flag is on; undefined otherwise.
     const profileSampler = params.profilePitch ? buildProfileSampler(cv, edges, scale, W0, H0) : undefined;
-    let result = buildGrid(raw, scale, W0, H0, params, orientPrior, profileSampler);
+    // P1 (lineSupport): edge-support predicate over THIS edge mask, reused across the main fit and every
+    // degenerate re-fit (same as profileSampler). Built only when the flag is on; undefined otherwise —
+    // so buildGrid skips the coverage block entirely and the flag-off path is byte-for-byte unchanged.
+    const edgeNear = params.lineSupport ? buildEdgeNear(cv, edges, scale, LINE_SUPPORT_TOL_PX) : undefined;
+    let result = buildGrid(raw, scale, W0, H0, params, orientPrior, profileSampler, edgeNear);
     // Degenerate fit = a phantom SUB-PITCH: thick / wavy lines (a physical mat, a
     // morphological mask) produce many close Hough responses that the default merge
     // distance doesn't collapse, so the lattice locks onto half/third the real pitch.
@@ -1135,7 +1200,7 @@ function houghToGrid(
     // (never degenerate) keep the tight default merge — no risk of merging real lines.
     if (result.info.degenerate) {
       for (let m = 2; m <= 4; m++) {
-        const alt = buildGrid(raw, scale, W0, H0, { ...params, mergeFrac: params.mergeFrac * m }, orientPrior, profileSampler);
+        const alt = buildGrid(raw, scale, W0, H0, { ...params, mergeFrac: params.mergeFrac * m }, orientPrior, profileSampler, edgeNear);
         if (!alt.info.degenerate) {
           result = alt;
           break;
@@ -1892,6 +1957,7 @@ export function buildGrid(
   params: DetectorParams,
   orientPrior: { a: number; b: number } | null = null,
   profileSampler?: ProfileSampler,
+  edgeNear?: EdgeNear,
 ): GridResult {
   const rawLines: Line2[] = raw.map((l) => toLine2(l.rho, l.thetaDeg, scale));
 
@@ -2075,6 +2141,29 @@ export function buildGrid(
   const familyA = A.lines.map(fromCentered);
   const familyB = B.lines.map(fromCentered);
 
+  // P1 (lineSupport, flag-gated) — fold the INDEPENDENT image-support signal into the per-candidate
+  // confidence, PRE-fusion. Sample each PREDICTED (detected) line for a real edge underneath in the
+  // image (lineCoverage over the working-res edge map, via the injected `edgeNear`) and multiply the
+  // confidence by min(supA,supB)^γ: a per-family AND (a grid needs BOTH axes supported), matching how
+  // the pair term leans on the weaker axis. `stepPx` scales with the pitch (~⅛ cell → scale-invariant,
+  // cheap). With the flag OFF `edgeNear` is undefined ⇒ this whole block is skipped and both
+  // `confidence` and `info.lineSupport` are byte-for-byte unchanged. Applied here (before the result is
+  // returned to houghToGrid → fuseGrids) so it modulates the candidate's OWN confidence, not a late nudge.
+  let finalConfidence = confidence;
+  let lineSupportScore: number | undefined;
+  if (edgeNear) {
+    const minSpacing = Math.min(
+      A.spacing > 0 ? A.spacing : Infinity,
+      B.spacing > 0 ? B.spacing : Infinity,
+    );
+    const stepPx = Number.isFinite(minSpacing) ? Math.max(2, 0.125 * minSpacing) : 2;
+    const supA = lineCoverage(familyA, W0, H0, edgeNear, stepPx).score;
+    const supB = lineCoverage(familyB, W0, H0, edgeNear, stepPx).score;
+    const support = Math.min(supA, supB);
+    lineSupportScore = +support.toFixed(3);
+    finalConfidence = clamp01(confidence * Math.pow(support, LINE_SUPPORT_GAMMA));
+  }
+
   const result: GridResult = {
     width: W0,
     height: H0,
@@ -2103,7 +2192,8 @@ export function buildGrid(
       // Calibrated grid confidence: both axes must look like a grid (geometric mean of the
       // two families' calibrated qualities) AND be a plausible size, 0 if degenerate. NOT a
       // raw line count. This is the per-candidate INTERNAL confidence; consensus lifts it.
-      confidence,
+      // (P1: already scaled by the image-support factor when lineSupport ran; identical otherwise.)
+      confidence: finalConfidence,
       cellsA,
       cellsB,
       inlierA: A.metrics.inlier,
@@ -2113,6 +2203,10 @@ export function buildGrid(
       spanB: B.metrics.span,
     },
   };
+
+  // P1: surface the diagnostic support score (only when the channel ran; undefined leaves it absent,
+  // exactly as cornerScore does — so the flag-off result object is byte-for-byte unchanged).
+  if (lineSupportScore !== undefined) result.info.lineSupport = lineSupportScore;
 
   return result;
 }
@@ -3291,4 +3385,51 @@ export function intersectionConsensus(
     }
   }
   return { score: total > 0 ? matched / total : 0, matched, total };
+}
+
+/** P1 (lineSupport) — image-support / line coverage of a grid hypothesis (the INDEPENDENT signal the
+ * self-coherence confidence lacks). For every DETECTED line (filled/extended carry no evidence and are
+ * skipped, like intersectionConsensus) we clip it to the frame [0,W]×[0,H] with `clipLineToRect`, walk
+ * the segment at `stepPx` steps, and count the samples that have an edge under them (`isEdgeNear`). A
+ * real grid line runs edge-to-edge, so its coverage is high even when faint/perspective; a Hough line
+ * fired by a local texture patch is only supported over part of its length.
+ *
+ * Aggregation is ROBUST: `score` is the MEDIAN of the per-line coverage fractions — a few unsupported
+ * predicted lines (occlusion, one bad Hough hit) don't tank an otherwise well-supported grid, and a
+ * couple of over-supported outliers don't inflate a texture. `covered`/`total` are the GLOBAL sample
+ * tallies (diagnostics). Returns all-zero when fewer than 2 detected lines carry evidence. Pure — no
+ * OpenCV: `isEdgeNear` is injected (a real buildEdgeNear closure in production, a fake in tests). */
+export function lineCoverage(
+  lines: Line2[],
+  W: number,
+  H: number,
+  isEdgeNear: (x: number, y: number) => boolean,
+  stepPx: number,
+): { covered: number; total: number; score: number } {
+  const detected = lines.filter((l) => !l.filled && !l.extended);
+  if (detected.length < 2 || !(stepPx > 0)) return { covered: 0, total: 0, score: 0 };
+  const fracs: number[] = [];
+  let coveredG = 0;
+  let totalG = 0;
+  for (const l of detected) {
+    const seg = clipLineToRect(l, W, H);
+    if (!seg) continue; // line doesn't cross the frame → no evidence to sample
+    const [[x0, y0], [x1, y1]] = seg;
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    const steps = Math.max(1, Math.floor(len / stepPx));
+    let cov = 0;
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      if (isEdgeNear(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)) cov++;
+    }
+    const n = steps + 1;
+    coveredG += cov;
+    totalG += n;
+    fracs.push(cov / n);
+  }
+  if (fracs.length < 2) return { covered: coveredG, total: totalG, score: 0 };
+  fracs.sort((a, b) => a - b);
+  const mid = fracs.length >> 1;
+  const score = fracs.length % 2 ? fracs[mid] : (fracs[mid - 1] + fracs[mid]) / 2;
+  return { covered: coveredG, total: totalG, score };
 }

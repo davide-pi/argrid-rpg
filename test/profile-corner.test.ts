@@ -10,6 +10,7 @@ import {
   profilePitch,
   PROFILE_MIN_STRENGTH,
   intersectionConsensus,
+  lineCoverage,
   type Line2,
 } from '../src/grid-detector.ts';
 
@@ -151,4 +152,51 @@ test('intersectionConsensus: fewer than 2 lines per family → no score', () => 
   const r = intersectionConsensus(vlines([100]), hlines([100, 200]), [{ x: 100, y: 100 }], 500, 500, 8);
   assert.equal(r.score, 0);
   assert.equal(r.total, 0);
+});
+
+// --- lineCoverage (P1: image-support / line coverage) ------------------------
+
+test('lineCoverage: lines with an edge under their whole length score ~1', () => {
+  const xs = vlines([100, 200, 300]);
+  // Fake edge map: an edge sits exactly under each predicted line offset.
+  const near = (x: number) => xs.some((l) => Math.abs(x - l.d) <= 2);
+  const r = lineCoverage(xs, 1000, 1000, near, 5);
+  assert.ok(r.total > 0, 'samples were taken');
+  assert.ok(r.score > 0.95, `score ${r.score} ≈ 1 when the image supports every line`);
+});
+
+test('lineCoverage: predicted lines with NO edge under them score ~0', () => {
+  const r = lineCoverage(vlines([100, 200, 300]), 1000, 1000, () => false, 5);
+  assert.equal(r.score, 0);
+  assert.equal(r.covered, 0);
+  assert.ok(r.total > 0, 'lines were still sampled');
+});
+
+test('lineCoverage: filled/extended lines carry no evidence (ignored)', () => {
+  const xs = vlines([100, 200, 300, 400]);
+  xs[1].filled = true; // interpolated interior line
+  xs[3].extended = true; // extrapolated border line
+  // Edges exist ONLY under the two DETECTED lines (100, 300). If the filled/extended lines were
+  // (wrongly) sampled they'd contribute frac 0 and drag the median to 0.5 — so score 1 proves they're excluded.
+  const near = (x: number) => Math.abs(x - 100) <= 2 || Math.abs(x - 300) <= 2;
+  const r = lineCoverage(xs, 1000, 1000, near, 5);
+  assert.equal(r.score, 1, `only detected lines counted → score ${r.score}`);
+});
+
+test('lineCoverage: fewer than 2 detected lines → zero', () => {
+  const xs = vlines([100, 200, 300]);
+  xs[0].filled = true;
+  xs[2].extended = true; // only one detected line remains
+  const r = lineCoverage(xs, 1000, 1000, () => true, 5);
+  assert.equal(r.score, 0);
+  assert.equal(r.total, 0);
+});
+
+test('lineCoverage: the median is robust to a single unsupported line', () => {
+  // 5 detected lines; the one at x=500 has no edge under it, the other four are fully supported.
+  const xs = vlines([100, 200, 300, 400, 500]);
+  const near = (x: number) => x < 450;
+  const r = lineCoverage(xs, 1000, 1000, near, 5);
+  assert.equal(r.score, 1, `median ignores the one bad line → score ${r.score}`);
+  assert.ok(r.covered < r.total, 'global tally still records the unsupported samples');
 });

@@ -1806,8 +1806,10 @@ export function buildGrid(
     const B = fitFamilyGrid(inB, Hm, params, crossesImage, minCell);
     // A degenerate (sub-pitch) fit has an implausibly small cell — reconstruction
     // was already skipped for it; also drop its confidence to ~0 so the UI warns.
-    const degenerate =
-      (A.spacing > 0 && A.spacing < minCell) || (B.spacing > 0 && B.spacing < minCell);
+    // Read the per-family MAX-based flag (largest/nearest image cell < minCell), NOT the median
+    // `spacing`: under perspective the extended lines near the vanishing point drag the median
+    // below minCell and would falsely flag a genuine steep grid as degenerate.
+    const degenerate = A.degenerate || B.degenerate;
     const cellsA = cellsAcross(A.angleDeg, A.spacing);
     const cellsB = cellsAcross(B.angleDeg, B.spacing);
     // Cell squareness (ratio of the two families' pitches) feeds the confidence's soft
@@ -1996,6 +1998,11 @@ interface FamilyGrid {
   lines: Line2[];
   angleDeg: number;
   spacing: number;
+  // true when the fitted lattice is a confirmed SUB-PITCH — even the LARGEST (nearest) image-space
+  // cell is < minCell. Max-based, NOT derived from `spacing`: under perspective the median gap is
+  // dragged below minCell by the compressed extended lines near the vanishing point, which would
+  // falsely flag a genuine steep grid. Mirrors the internal fill/extend guard.
+  degenerate: boolean;
   metrics: FamilyMetrics; // rectified-plane evidence; `familyQuality(metrics)` is the score
 }
 
@@ -2304,13 +2311,17 @@ function fitFamilyGrid(
   const HT = transpose3(H);
   const backToImage = (offset: number, nx: number, ny: number, filled: boolean): Line2 =>
     ({ ...homToLine(mulM3V(HT, [nx, ny, -offset])), filled });
-  const finalize = (lines: Line2[], metrics: FamilyMetrics = EMPTY_METRICS): FamilyGrid => {
-    if (lines.length === 0) return { lines, angleDeg: 0, spacing: 0, metrics };
+  const finalize = (
+    lines: Line2[],
+    metrics: FamilyMetrics = EMPTY_METRICS,
+    degenerate = false,
+  ): FamilyGrid => {
+    if (lines.length === 0) return { lines, angleDeg: 0, spacing: 0, metrics, degenerate };
     const mid = lines[Math.floor(lines.length / 2)];
     const ds = lines.map((l) => l.d).sort((a, b) => a - b);
     const g: number[] = [];
     for (let i = 1; i < ds.length; i++) g.push(ds[i] - ds[i - 1]);
-    return { lines, angleDeg: angleOfDeg(mid.nx, mid.ny), spacing: median(g), metrics };
+    return { lines, angleDeg: angleOfDeg(mid.nx, mid.ny), spacing: median(g), metrics, degenerate };
   };
 
   // Rectify each line: rectified line = H^{-T} · line.
@@ -2497,7 +2508,7 @@ function fitFamilyGrid(
     extendFrom(kmin, -1, lo);
     lo.reverse(); // back to ascending-k order
   }
-  return finalize([...lo, ...core, ...hi], degenerate ? EMPTY_METRICS : metrics);
+  return finalize([...lo, ...core, ...hi], degenerate ? EMPTY_METRICS : metrics, degenerate);
 }
 
 function median(xs: number[]): number {

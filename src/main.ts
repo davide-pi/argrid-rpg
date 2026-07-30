@@ -1445,7 +1445,7 @@ function stageLineData(r: GridResult, id: string): { groups: { lines: Line2[]; c
   const stage = m[1] as 'split' | 'merge' | 'vp';
   const st = m[2] === 'Morph' ? r.debugStagesMorph : r.debugStagesLum;
   const [a, b] = stageAB(st, stage);
-  const name = { split: 'Split famiglie', merge: 'Merge duplicati', vp: 'Punto di fuga' }[stage];
+  const name = { split: 'Split famiglie', merge: 'Merge duplicati', vp: 'Punto di fuga (VP vincente)' }[stage];
   const pipe = m[2] === 'Morph' ? 'Morfologica' : 'Luminanza';
   return { groups: [{ lines: a, color: colA }, { lines: b, color: colB }], base: `${name} — ${pipe}` };
 }
@@ -1483,9 +1483,10 @@ function drawDebugStep() {
     : null;
   const lineData = LINE_NODES.has(step.id) ? stageLineData(r, step.id) : null;
   if (perp) {
-    // Grid crossings coloured by perpendicularity AFTER rectification (green = right angle,
-    // red = sheared) and sized by their foreground weight (bigger = nearer the viewer, more
-    // trusted). Visualises the foreground-weighted squareness that scores the fit.
+    // The SELECTION step (not a post-fit score): perpendicularity is computed for EVERY VP hypothesis
+    // and PICKS the winner. Here we draw the winning grid's crossings coloured by perpendicularity
+    // AFTER rectification (green = right angle, red = sheared), sized by foreground weight (bigger =
+    // nearer the viewer, more trusted). The label reports how many VP hypotheses it judged.
     ctx.drawImage(lastCapture!, 0, 0, r.width, r.height);
     const wMax = perp.crossings.reduce((m, c) => Math.max(m, c.weight), 0) || 1;
     const rBase = Math.max(3, r.width / 160);
@@ -1499,8 +1500,8 @@ function drawDebugStep() {
       ctx.fill();
     }
     const pipe = step.id === 'perpMorph' ? 'Morfologica' : 'Luminanza';
-    const hyp = perp.hypotheses != null ? ` · ${perp.hypotheses} ipotesi VP` : '';
-    labelText = `Perpendicolarità — ${pipe} — ${Math.round(perp.score * 100)}% (${perp.crossings.length} incroci${hyp})`;
+    const hyp = perp.hypotheses != null ? ` · ha scelto tra ${perp.hypotheses} ipotesi VP` : '';
+    labelText = `Perpendicolarità · SELEZIONE — ${pipe} — ${Math.round(perp.score * 100)}% (${perp.crossings.length} incroci${hyp})`;
   } else if (lineData) {
     // Live line overlay over the photo — raw Hough, or a fit stage (split → merge → vanishing-point),
     // each family in its own colour so you can watch the lines get whittled down stage by stage.
@@ -1749,6 +1750,21 @@ function rebuildDebugBar() {
   }
   graph.appendChild(svg);
 
+  // One-line description per FIT step, appended to the node tooltip so the graph reads truthfully:
+  // the winning path is a hypothesise-and-verify search, NOT a linear pipeline — Fuga shows the
+  // WINNING vanishing point among the multi-VP candidates, and Perp is the SELECTION step that judged
+  // every VP hypothesis (not a score tacked on after Fuga).
+  const NODE_DESC: Record<string, string> = {
+    splitLum: 'linee divise nelle due direzioni',
+    mergeLum: 'duplicati fusi per famiglia (tiene il supporto)',
+    vpLum: 'VP VINCENTE fra i candidati multi-VP',
+    perpLum: 'SELEZIONE per perpendicolarità: giudica ogni ipotesi VP e sceglie la griglia più quadrata',
+    splitMorph: 'linee divise nelle due direzioni',
+    mergeMorph: 'duplicati fusi per famiglia (tiene il supporto)',
+    vpMorph: 'VP VINCENTE fra i candidati multi-VP',
+    perpMorph: 'SELEZIONE per perpendicolarità: giudica ogni ipotesi VP e sceglie la griglia più quadrata',
+  };
+
   // Nodes.
   for (const s of steps) {
     const p = layout[s.id];
@@ -1765,7 +1781,9 @@ function rebuildDebugBar() {
     b.style.left = gnX(p[0]) + 'px';
     b.style.top = gnY(p[1]) + 'px';
     b.textContent = s.label;
-    b.title = !s.executed ? s.label + ' — non eseguito' : s.used ? s.label : s.label + ' — non usato';
+    const desc = NODE_DESC[s.id];
+    const suffix = !s.executed ? ' — non eseguito' : s.used ? '' : ' — non usato';
+    b.title = s.label + (desc ? ' — ' + desc : '') + suffix;
     b.addEventListener('click', () => {
       debugStepId = s.id;
       markSelectedNode(); // update selection in place — do NOT rebuild (keeps scroll)
@@ -1908,6 +1926,13 @@ function renderConfidenceLog(): string {
       : '⚠ Punto debole: ' + confWeakness(bd);
     html += `<div class="debug-log-row indent conf-why${strong ? '' : ' warn'}"><span class="debug-log-k">${verdict}</span></div>`;
 
+    // This fit is the WINNER of a hypothesise-and-verify search: perpendicularity judged N
+    // (VP × rectifica) hypotheses and picked it. Surface it so the log matches the graph — the fit
+    // is NOT a linear pipeline, the perpendicularity is the arbiter that chose the vanishing point.
+    const perpDbg = p.id === 'morph' ? lastResult?.debugPerpMorph : lastResult?.debugPerpLum;
+    if (perpDbg?.hypotheses != null)
+      html += row('Selezione: la perpendicolarità ha scelto fra', `${perpDbg.hypotheses} ipotesi VP`, 'conf-mid');
+
     // 2) How the internal confidence is built: qualità × proporzioni × perpendicolarità = interna,
     //    poi + accordo = finale.
     html += row('Qualità delle direzioni', pct(bd.pair));
@@ -1916,7 +1941,7 @@ function renderConfidenceLog(): string {
       html += row('Confidenza interna', `${pct(bd.pair)} × 0.1 = ${pct(bd.internal)}`, 'conf-mid');
     } else {
       html += row('Celle quadrate (proporzioni)', pct(bd.squareness));
-      html += row('Perpendicolarità (primo piano)', pct(bd.perp));
+      html += row('Perpendicolarità (giudice · primo piano)', pct(bd.perp));
       html += row(
         'Confidenza interna',
         `${pct(bd.pair)} × ${pct(bd.squareness)} × ${pct(bd.perp)} = ${pct(bd.internal)}`,

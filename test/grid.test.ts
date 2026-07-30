@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import {
   buildGrid,
   clipLineToRect,
+  foregroundPerp,
   DEFAULT_PARAMS,
   type RawLine,
   type Line2,
@@ -57,6 +58,48 @@ function syntheticGrid(opts: {
   addFamily((rotDeg + 90) % 180, []); // family B normals (perpendicular)
   return lines;
 }
+
+// --- foregroundPerp (the metric-squareness judge of the multi-VP fit) ---------
+// Identity rectification + vanishing points at infinity = a fronto-parallel view (no perspective),
+// so the rectified crossing angle equals the raw one and the geometry is easy to reason about.
+const ID3: [number, number, number, number, number, number, number, number, number] =
+  [1, 0, 0, 0, 1, 0, 0, 0, 1];
+const VP_X: [number, number, number] = [1, 0, 0];
+const VP_Y: [number, number, number] = [0, 1, 0];
+const nLine = (normalDeg: number, d: number): Line2 => ({
+  nx: Math.cos(normalDeg / DEG),
+  ny: Math.sin(normalDeg / DEG),
+  d,
+});
+
+test('foregroundPerp: perpendicular families score ~1, sheared families score lower', () => {
+  const A = [nLine(0, -100), nLine(0, 0), nLine(0, 100)]; // vertical lines (normal 0°)
+  const perpB = [nLine(90, -100), nLine(90, 0), nLine(90, 100)]; // horizontal (normal 90°) ⟂ A
+  const square = foregroundPerp(A, perpB, ID3, VP_X, VP_Y, 400, 400);
+  assert.ok(square.score > 0.98, `perpendicular cells → ~1, got ${square.score}`);
+
+  const shearB = [nLine(45, -100), nLine(45, 0), nLine(45, 100)]; // 45° off ⟂ → rhombus cells
+  const sheared = foregroundPerp(A, shearB, ID3, VP_X, VP_Y, 400, 400);
+  assert.ok(sheared.score < 0.8, `sheared (rhombus) cells → low, got ${sheared.score}`);
+  assert.ok(sheared.score < square.score, 'shear scores below a square grid');
+});
+
+test('foregroundPerp: empty / no in-frame crossings is a neutral 1 (never NaN)', () => {
+  const r = foregroundPerp([], [], ID3, VP_X, VP_Y, 400, 400);
+  assert.equal(r.score, 1);
+  assert.equal(r.crossings.length, 0);
+});
+
+test('a competing off-axis cluster does not derail the pitch (multi-VP + perpendicularity)', () => {
+  // A clean 8×8 square grid, s=80, plus a small foreign structure at a different orientation: under
+  // the OLD single-VP fit that cluster could forge a spurious VP; multi-VP + the perpendicularity
+  // judge must keep the real square grid.
+  const raw = syntheticGrid({ W: 1000, H: 1000, s: 80, n: 8, rotDeg: 0 });
+  for (const d of [180, 210, 240]) raw.push({ rho: d, thetaDeg: 20 });
+  const r = buildGrid(raw, 1, 1000, 1000, NO_EXTEND);
+  assert.ok(!r.info.degenerate, 'not a degenerate/sub-pitch collapse');
+  assert.ok(Math.abs(r.info.spacingA - 80) < 3, `real pitch ~80 recovered, got ${r.info.spacingA}`);
+});
 
 test('recovers a straight (unrotated) full grid', () => {
   const raw = syntheticGrid({ W: 1000, H: 1000, s: 80, n: 8, rotDeg: 0 });

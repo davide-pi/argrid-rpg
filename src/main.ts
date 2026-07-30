@@ -617,12 +617,10 @@ async function runDetection() {
     // completion so the generator's own `finally` frees its OpenCV Mats.
     const params = currentParams();
     lastFocusPoint = params.focusPoint; // remember what this run used (debug focus indicator)
-    // Always compute the debug data (stage previews, timings, confidence breakdown) — `wantEdges`
-    // is unconditionally true, NOT gated on `debug`. This keeps toggling debug on/off INSTANT (the
-    // cached result already has everything, so the triple-tap handler never re-runs detection).
-    // Trade-off: every capture pays the debug-preview cost (more memory/time per shot) even when
-    // debug is off — an intentional choice favouring an instant toggle over a lean capture.
-    const gen = detectGridSteps(cv, lastCapture, params, true);
+    // Compute the debug data (stage previews, timings, confidence breakdown) ONLY in debug mode —
+    // `wantEdges` is gated on `debug`, so a normal capture stays lean (no preview snapshots/extra
+    // allocations). Entering debug recomputes on demand (see the triple-tap handler).
+    const gen = detectGridSteps(cv, lastCapture, params, debug);
     let step = gen.next();
     while (!step.done) {
       setProcessing(step.value.label, step.value.frac);
@@ -2893,9 +2891,8 @@ function updateFabIcon() {
  * nothing to place without one. A disabled <button> ignores clicks natively (so the speed-dial can't
  * open); we also collapse the dial in case it was open. Called wherever the FAB becomes visible. */
 function updateFabEnabled() {
-  fab.disabled = !gridReliable;
-  fabWrap.classList.toggle('disabled', !gridReliable);
-  if (!gridReliable) fabWrap.classList.remove('open');
+  fab.disabled = !gridReliable; // native :disabled greys it and blocks clicks (see .fab:disabled)
+  if (!gridReliable) fabWrap.classList.remove('open'); // collapse the speed-dial if it was open
 }
 /** Drop an area at the tapped point (from FAB 'area' mode), then leave placement so
  * the area can be edited/repositioned like before. */
@@ -3296,9 +3293,9 @@ hudClose.addEventListener('click', () => {
 });
 
 // Debug has no on-screen switch: triple-tap the logo (within 600ms) toggles it on/off.
-// The debug diagnostics (stage previews, timings, confidence breakdown) are now computed on EVERY
-// capture (runDetection passes wantEdges=true), so the cached result ALWAYS has them — toggling
-// debug never re-runs the pipeline. We just repaint and show/hide the debug chrome.
+// Debug diagnostics (stage previews, timings, confidence breakdown) are computed ONLY in debug mode
+// to keep normal captures lean, so ENTERING debug re-runs detection on the current photo to produce
+// them (recompute-on-demand, rather than paying the cost on every shot).
 let brandTaps: number[] = [];
 brand.addEventListener('click', () => {
   const now = Date.now();
@@ -3310,8 +3307,13 @@ brand.addEventListener('click', () => {
     btnLoadImage.hidden = !debug; // the gallery-load button is a debug affordance
     dbgBadge.hidden = !debug; // DBG chip next to the version replaces the old status text
     updateFocusBadge(); // focus indicator shows/hides with the DBG chip
-    draw(); // repaint (edge/line overlay appears/disappears with debug)
-    rebuildDebugBar(); // show/hide the pipeline panel
+    // Entering debug on a photo whose result lacks the debug data → recompute it once, on demand.
+    if (debug && lastCapture && showingResult && !lastResult?.debugSteps) {
+      runDetection();
+    } else {
+      draw(); // repaint (edge/line overlay appears/disappears with debug)
+      rebuildDebugBar(); // show/hide the pipeline panel
+    }
   }
 });
 

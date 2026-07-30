@@ -1852,7 +1852,10 @@ export function buildGrid(
     const pitchB = B.spacing;
     const aspect =
       pitchA > 0 && pitchB > 0 ? Math.max(pitchA / pitchB, pitchB / pitchA) : Infinity;
-    const perp = foregroundPerp(A.lines, B.lines, Hm, vpAv, vpBv, W0, H0);
+    // Judge perpendicularity on the DETECTED inlier lines (they genuinely FAN), NOT the fitted lattice
+    // (parallel-by-construction → it would read ~90° for any H, hiding a wrong rectification). This is
+    // what makes a fake VP actually lose: its real lines don't rectify to a square grid.
+    const perp = foregroundPerp(inAms.map((m) => m.line), inBms.map((m) => m.line), Hm, vpAv, vpBv, W0, H0);
     const confidence = gridConfidence(A.metrics, B.metrics, degenerate, aspect, perp.score);
     return { A, B, degenerate, cellsA, cellsB, aspect, confidence, perp, inA: inAms, inB: inBms, minCount: Math.min(A.metrics.count, B.metrics.count) };
   };
@@ -1862,9 +1865,7 @@ export function buildGrid(
   // perpendicularity-weighted confidence scores highest (betterPair). A spurious/fake vanishing point
   // yields a sheared, irregular grid and LOSES; the true VP wins. Robust BY CONSTRUCTION to a fake VP —
   // no single VP can "derail everything" because they all compete and the bad ones are beaten.
-  const firstA = vpAs[0];
-  const firstB = vpBs[0];
-  let chosen = fitPairFor(firstA.lines, firstB.lines, buildRectify(firstA.vp, firstB.vp), firstA.vp, firstB.vp);
+  let chosen: ReturnType<typeof fitPairFor> | null = null;
   let hypotheses = 0;
   for (const ca of vpAs) {
     for (const cb of vpBs) {
@@ -1873,10 +1874,13 @@ export function buildGrid(
       for (const Hm of rects) {
         hypotheses++;
         const cand = fitPairFor(ca.lines, cb.lines, Hm, ca.vp, cb.vp);
-        if (betterPair(cand, chosen)) chosen = cand;
+        if (!chosen || betterPair(cand, chosen)) chosen = cand;
       }
     }
   }
+  // multiVP guarantees ≥1 model per family, so the loop always ran; the fallback is a TS-satisfying
+  // belt-and-braces that never executes at runtime.
+  if (!chosen) chosen = fitPairFor(vpAs[0].lines, vpBs[0].lines, IDENTITY3, vpAs[0].vp, vpBs[0].vp);
   const { A, B, degenerate, cellsA, cellsB, aspect, confidence, perp } = chosen;
   const inA = chosen.inA; // the WINNING VP's concurrent lines — what the "Fuga" node now shows
   const inB = chosen.inB;
@@ -2108,7 +2112,7 @@ function buildRectify(vpA: V3, vpB: V3): M3 {
  * toward the FOREGROUND — crossings far from the horizon (near the viewer), whose large cells are
  * least distorted and most reliable (world error ∝ 1/dist²). Returns the aggregate score + the
  * per-crossing data (image space) for the debug node. Lines & VPs are in CENTRED coords. Pure. */
-function foregroundPerp(aLines: Line2[], bLines: Line2[], H: M3, vpA: V3, vpB: V3, W0: number, H0: number): PerpDebug {
+export function foregroundPerp(aLines: Line2[], bLines: Line2[], H: M3, vpA: V3, vpB: V3, W0: number, H0: number): PerpDebug {
   const horizon = cross3(vpA, vpB); // centred coords; ≈[·,·,0] when both VPs are at infinity
   const hn = Math.hypot(horizon[0], horizon[1]);
   const eps = 0.01 * Math.min(W0, H0);
@@ -2117,9 +2121,7 @@ function foregroundPerp(aLines: Line2[], bLines: Line2[], H: M3, vpA: V3, vpB: V
     if (Math.abs(v[2]) < 1e-12) return null;
     return { x: v[0] / v[2], y: v[1] / v[2] };
   };
-  const crossings: PerpCross[] = [];
-  let sw = 0;
-  let swp = 0;
+  const all: { x: number; y: number; perp: number; dist: number }[] = [];
   for (const a of aLines) {
     for (const b of bLines) {
       const p = intersect(a, b); // centred
@@ -2134,17 +2136,23 @@ function foregroundPerp(aLines: Line2[], bLines: Line2[], H: M3, vpA: V3, vpB: V
       if (na < 1e-9 || nb < 1e-9) continue;
       const cos = (ax * bx + ay * by) / (na * nb);
       const perp = Math.sqrt(Math.max(0, 1 - cos * cos)); // |sin θ|
-      let weight = 1;
-      if (hn >= 1e-9) {
-        const dist = Math.abs(horizon[0] * p.x + horizon[1] * p.y + horizon[2]) / hn;
-        weight = dist * dist; // foreground (far from horizon) weighted quadratically
-      }
-      sw += weight;
-      swp += weight * perp;
-      crossings.push({ x: p.x + W0 / 2, y: p.y + H0 / 2, perp, weight });
+      // Foreground = FAR from the horizon (nearest the viewer). No perspective → all equal.
+      const dist = hn >= 1e-9 ? Math.abs(horizon[0] * p.x + horizon[1] * p.y + horizon[2]) / hn : 0;
+      all.push({ x: p.x + W0 / 2, y: p.y + H0 / 2, perp, dist });
     }
   }
-  return { crossings, score: sw > 0 ? swp / sw : 1 };
+  if (all.length === 0) return { crossings: [], score: 1 };
+  // FOREGROUND-FIRST: judge on the crossings NEAREST THE VIEWER (largest dist from the horizon) —
+  // start from the very front and take only the near band, moving outward just enough for a stable
+  // read (a single crossing is noisy). The near cells are the largest / least perspective-distorted,
+  // so a wrong rectification's shear shows up cleanest here. Remaining crossings are kept for the
+  // debug view but DIMMED (weight 0.15) so it's visible which ones actually decided the score.
+  all.sort((c1, c2) => c2.dist - c1.dist); // nearest-viewer first
+  const k = Math.min(all.length, Math.max(3, Math.round(all.length * 0.2)));
+  let s = 0;
+  for (let i = 0; i < k; i++) s += all[i].perp;
+  const crossings: PerpCross[] = all.map((c, i) => ({ x: c.x, y: c.y, perp: c.perp, weight: i < k ? 1 : 0.15 }));
+  return { crossings, score: s / k };
 }
 
 interface FamilyGrid {

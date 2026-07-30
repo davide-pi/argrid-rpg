@@ -114,11 +114,7 @@ let debugLogOpen = false; // the timing log panel (scroll-text button) is showin
 // measure a flag on real captures without a rebuild. Empty ⇒ pure DEFAULT_PARAMS.
 const flagOverrides: Partial<DetectorParams> = {};
 const DEBUG_FLAGS: { key: keyof DetectorParams; label: string }[] = [
-  { key: 'morphCloseFirst', label: 'Close1°' },
-  { key: 'ridgeLocalThresh', label: 'CrestaLoc' },
-  { key: 'profilePitch', label: 'Profilo' },
-  { key: 'cornerVerify', label: 'Corner' },
-  { key: 'lineSupport', label: 'Supporto' },
+  { key: 'ridgeHysteresis', label: 'Isteresi' },
 ];
 // Floating "add" speed-dial.
 const fabWrap = $<HTMLDivElement>('fabWrap');

@@ -63,37 +63,11 @@ export interface DetectorParams {
    * combPitch) that replaces robustCell+coarsenPitch and climbs out of a sub-pitch seed; and
    * (3c) a perspective-safe degeneracy test (comb fillRatio) + rectified-pitch squareness. */
   periodicPitch: boolean;
-  /** Ridge extractor: use a LOCAL adaptive threshold (per-pixel: local mean + σ, floored at the
-   * global mean+0.5σ) instead of the single global `mean+K·σ`. A faint grid on a textured surface
-   * raises the GLOBAL σ so the global threshold drowns it; a local threshold recovers it. */
-  ridgeLocalThresh: boolean;
-  /** Ridge binarisation (`binDir`): apply a safer "small-close → open → large-close" morphology
-   * order instead of the default "open → close". The default opening runs FIRST, so a weak line
-   * broken into pieces shorter than the L2 open-length is ERASED before the close can re-stitch it —
-   * losing faint/broken grids. When ON, a small (~L2) close first re-joins collinear fragments, THEN
-   * the open drops the still-short specks, THEN the large (LC) close bridges the wide gaps; the small
-   * initial close keeps the added-noise cost contained. Default off — to be measured on the corpus. */
-  morphCloseFirst: boolean;
-  /** Metodo #1 — estimate the pitch from a DENSE projection profile of the edge pixels built in the
-   * RECTIFIED plane (autocorrelation) instead of from the sparse line offsets. Integrating the edge
-   * signal ALONG each line rescues faint/perspective grids where the sparse fit smears to a sub-pitch.
-   * Only overrides `robustCell`/`coarsenPitch` when the profile is convincingly periodic
-   * (strength ≥ PROFILE_MIN_STRENGTH); otherwise the sparse estimate stands. See profilePitch. */
-  profilePitch: boolean;
-  /** Metodo #2 — verify the line-based grid against an INDEPENDENT corner channel: the fraction of
-   * predicted crossings that land on a detected X-corner (intersectionConsensus) modulates the
-   * confidence — corroborating a faint grid, penalising periodic texture with no real crossings. */
-  cornerVerify: boolean;
-  /** P1 (image-support / line coverage) — fold an INDEPENDENT signal into the per-candidate confidence:
-   * the fraction of each PREDICTED line's length that actually has an edge under it in the image
-   * (lineCoverage over the working-res edge map, via buildEdgeNear). Today's confidence only measures
-   * the lattice's SELF-coherence (count/inlier/fill/span), so a periodic texture reads coherent (high)
-   * while a real-but-faint/perspective grid whose lines DON'T land on a regular lattice reads low even
-   * though the image clearly supports them. This multiplies the candidate's confidence by
-   * `min(supA,supB)^γ` BEFORE fusion (a coverage-per-family AND, like the pair term), so a fit with no
-   * image support is damped and a well-supported one is (nearly) untouched. Diagnostic value surfaced
-   * in `info.lineSupport`. Default off — to be calibrated on the corpus. */
-  lineSupport: boolean;
+  /** Ridge binarisation (`binDir`): evaluate a DOUBLE-threshold HYSTERESIS on the ridge instead of the
+   * (now baked-in) single local threshold. Keeps the STRONG ridge pixels (> local mean + K_HI·σ) plus
+   * the WEAK ones (> local mean + K_LO·σ) that are CONNECTED to a strong pixel — recovering faint-but-
+   * continuous grid lines while still rejecting isolated texture. Default off — evaluation flag. */
+  ridgeHysteresis: boolean;
 }
 
 export const DEFAULT_PARAMS: DetectorParams = {
@@ -109,11 +83,7 @@ export const DEFAULT_PARAMS: DetectorParams = {
   orientGate: true,
   edgeClean: true,
   periodicPitch: false,
-  ridgeLocalThresh: false,
-  morphCloseFirst: false,
-  profilePitch: false,
-  cornerVerify: false,
-  lineSupport: false,
+  ridgeHysteresis: false,
 };
 
 /** A line as normal form: nx*x + ny*y = d, with (nx,ny) a unit vector. */
@@ -209,13 +179,6 @@ export interface GridResult {
     // (cellsA/B), which over-counts by the image margin.
     spanA: number;
     spanB: number;
-    /** Metodo #2 (cornerVerify) — fraction of predicted crossings that landed on a detected corner,
-     * when the corner channel ran (undefined otherwise). Diagnostic; already folded into confidence. */
-    cornerScore?: number;
-    /** P1 (lineSupport) — robust per-family image-support score (median predicted-line edge coverage),
-     * when the line-coverage channel ran (undefined otherwise). Diagnostic; already folded into
-     * confidence (min of the two families, ^γ). See lineCoverage / buildEdgeNear. */
-    lineSupport?: number;
   };
 }
 
@@ -725,14 +688,14 @@ export function* detectGridFromMatSteps(
       const primary = Math.abs(off) > 12 ? -off : 0;
       let bestDeskew = primary;
       let morphAngles = 1;
-      morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, primary, timed, params.ridgeLocalThresh, params.morphCloseFirst));
+      morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, primary, timed, params.ridgeHysteresis));
       morphRan = true;
       let alt = timed('morphHough', () => houghToGrid(cv, morphEdges, work, scale, W0, H0, params, orient));
       if (gridStrength(alt) < MORPH_STRONG) {
         for (const a of deskewSweepAngles(off, orient != null)) {
           if (Math.abs(a - primary) < MORPH_SWEEP_STEP / 2) continue; // ~already tried
           morphAngles++;
-          const m = timed('morphEnhance', () => enhanceGridLines(cv, gray, undefined, a, undefined, params.ridgeLocalThresh, params.morphCloseFirst));
+          const m = timed('morphEnhance', () => enhanceGridLines(cv, gray, undefined, a, undefined, params.ridgeHysteresis));
           const f = timed('morphHough', () => houghToGrid(cv, m, work, scale, W0, H0, params, orient));
           if (gridStrength(f) > gridStrength(alt)) {
             morphEdges.delete();
@@ -747,7 +710,7 @@ export function* detectGridFromMatSteps(
         // Re-run the winning angle WITH snap so the graph shows its (deskewed) stages.
         if (bestDeskew !== primary) {
           morphEdges.delete();
-          morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, bestDeskew, timed, params.ridgeLocalThresh, params.morphCloseFirst));
+          morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, bestDeskew, timed, params.ridgeHysteresis));
         }
       }
       timings.morphAngles = morphAngles;
@@ -791,35 +754,8 @@ export function* detectGridFromMatSteps(
     morphChosen = candidates[winnerIdx].id === 'morph';
     // The winner's fused confidence becomes the reported confidence (stamped after the debug
     // panel captures each candidate's RAW internal confidence, below).
-    let fusedConfidence = fused.confidences[winnerIdx] ?? result.info.confidence;
+    const fusedConfidence = fused.confidences[winnerIdx] ?? result.info.confidence;
 
-    // Metodo #2 (cornerVerify): corroborate/penalise the winner with an INDEPENDENT corner channel.
-    // Predicted crossings that land on real X-corners raise confidence; a periodic texture whose
-    // "crossings" hit nothing lowers it. Projective-robust (corner positions are stable under
-    // perspective). Only nudges an already-plausible, non-degenerate fit — never resurrects a
-    // sub-pitch fit nor invents a grid. Skipped when too few corners / crossings to trust the score.
-    if (params.cornerVerify && !result.info.degenerate && fusedConfidence > 0) {
-      try {
-        const corners = timed('corner', () => detectCorners(cv, gray, scale));
-        const cell = Math.min(result.info.spacingA || 0, result.info.spacingB || 0);
-        if (corners.length >= 4 && cell > 0) {
-          const cons = intersectionConsensus(
-            result.familyA,
-            result.familyB,
-            corners,
-            W0,
-            H0,
-            CORNER_TOL_FRAC * cell,
-          );
-          if (cons.total >= CORNER_MIN_CROSSINGS) {
-            result.info.cornerScore = +cons.score.toFixed(3);
-            fusedConfidence = clamp01(fusedConfidence * cornerConfFactor(cons.score));
-          }
-        }
-      } catch (err) {
-        console.warn('corner verify skipped:', err);
-      }
-    }
     // Free the mask that lost (keep only the winner's, for the edge preview / edgePixels).
     if (morphEdges) {
       if (morphChosen) {
@@ -962,8 +898,8 @@ export function* detectGridFromMatSteps(
         id: c.id,
         label: c.label,
         strength: gridStrength(c.r),
-        // The chosen candidate shows the FINAL fused confidence (incl. any cornerVerify nudge) so its
-        // chip equals the "Finale" chip; the others show their own fused value.
+        // The chosen candidate shows the FINAL fused confidence so its chip equals the "Finale" chip;
+        // the others show their own fused value.
         confidence: i === winnerIdx ? fusedConfidence : (fused.confidences[i] ?? c.r.info.confidence),
         cells: [Math.max(0, c.r.info.aCount - 1), Math.max(0, c.r.info.bCount - 1)],
         degenerate: c.r.info.degenerate,
@@ -992,140 +928,6 @@ export function* detectGridFromMatSteps(
 /** Adaptive Hough on an edge mask + grid fit. The accumulator threshold is a
  * fraction of the shorter side and self-tunes: too few lines -> relax; far too
  * many -> tighten. Shared by the Canny path and the morphological fallback. */
-/** Metodo #1 — build a ProfileSampler closed over the edge pixels of `edges` (a working-res binary
- * mask). It caches those pixels' CENTRED FULL-RES coordinates once (subsampled to a cap), then each
- * call rectifies them by `H` and bins their offset along the family normal `(meanNx,meanNy)` — an
- * O(#pixels) pass with no per-call OpenCV. Returns undefined when there are too few edge pixels. */
-function buildProfileSampler(
-  cv: any,
-  edges: any,
-  scale: number,
-  W0: number,
-  H0: number,
-): ProfileSampler | undefined {
-  const cols = edges.cols;
-  const rows = edges.rows;
-  const data: Uint8Array = edges.data;
-  const nnz = cv.countNonZero(edges);
-  if (nnz < 8) return undefined;
-  const N_MAX = 20000;
-  const step = Math.max(1, Math.ceil(nnz / N_MAX));
-  const cx = W0 / 2;
-  const cy = H0 / 2;
-  const s = scale || 1;
-  const Xc: number[] = [];
-  const Yc: number[] = [];
-  let seen = 0;
-  for (let y = 0; y < rows; y++) {
-    const row = y * cols;
-    for (let x = 0; x < cols; x++) {
-      if (data[row + x] === 0) continue;
-      if (seen++ % step !== 0) continue;
-      Xc.push(x / s - cx);
-      Yc.push(y / s - cy);
-    }
-  }
-  if (Xc.length < 8) return undefined;
-  return (H, meanNx, meanNy, oLo, binSize, nBins) => {
-    const prof = new Float64Array(nBins);
-    const h0 = H[0], h1 = H[1], h2 = H[2];
-    const h3 = H[3], h4 = H[4], h5 = H[5];
-    const h6 = H[6], h7 = H[7], h8 = H[8];
-    const ib = 1 / binSize;
-    let any = false;
-    for (let i = 0; i < Xc.length; i++) {
-      const X = Xc[i];
-      const Y = Yc[i];
-      const w = h6 * X + h7 * Y + h8;
-      if (Math.abs(w) < 1e-9) continue;
-      const px = (h0 * X + h1 * Y + h2) / w;
-      const py = (h3 * X + h4 * Y + h5) / w;
-      const off = px * meanNx + py * meanNy;
-      const bin = Math.floor((off - oLo) * ib);
-      if (bin >= 0 && bin < nBins) {
-        prof[bin] += 1;
-        any = true;
-      }
-    }
-    return any ? prof : null;
-  };
-}
-
-/** P1 (lineSupport) — a predicate `(x,y)⇒is there an edge pixel near this FULL-RES point?`, closed over
- * the working-res binary edge map. Convention is the SAME as buildProfileSampler / detectCorners:
- * `edges` lives at working resolution, so a full-res point (x,y) maps to working (x·scale, y·scale);
- * `edges.data` is a working-res Uint8Array. We cache cols/rows/data once and, per query, scan a small
- * box of radius `r = round(tolPx·scale)` working px around the mapped point — true on the first non-zero
- * edge pixel. Cheap (an O(r²) window, r≈1–3), OpenCV-free per call. `tolPx` is a small ABSOLUTE full-res
- * radius: the closure is built PRE-fit (like profileSampler), so the cell pitch isn't known yet to size
- * it relative to spacing. Returns a closure that's always safe to call (empty map ⇒ always false). */
-type EdgeNear = (x: number, y: number) => boolean;
-function buildEdgeNear(cv: any, edges: any, scale: number, tolPx: number): EdgeNear {
-  void cv; // (kept for signature symmetry with the other CV samplers; no cv.* call needed)
-  const cols = edges.cols;
-  const rows = edges.rows;
-  const data: Uint8Array = edges.data;
-  const s = scale || 1;
-  const r = Math.max(1, Math.round(tolPx * s)); // working-px search radius (≥1 → tolerant to sub-px lines)
-  return (x: number, y: number): boolean => {
-    const xw = x * s;
-    const yw = y * s;
-    let x0 = Math.floor(xw) - r;
-    let x1 = Math.floor(xw) + r;
-    let y0 = Math.floor(yw) - r;
-    let y1 = Math.floor(yw) + r;
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (x1 > cols - 1) x1 = cols - 1;
-    if (y1 > rows - 1) y1 = rows - 1;
-    for (let yy = y0; yy <= y1; yy++) {
-      const row = yy * cols;
-      for (let xx = x0; xx <= x1; xx++) {
-        if (data[row + xx] !== 0) return true;
-      }
-    }
-    return false;
-  };
-}
-
-/** P1 (lineSupport) tuning.
- *  • LINE_SUPPORT_TOL_PX — box radius (full-res px) around a predicted line that still counts as
- *    "an edge is under the line". Small absolute value: chosen pre-fit (pitch unknown) and generous
- *    enough for line thickness / mild perspective / sub-px placement without catching a neighbour line.
- *  • LINE_SUPPORT_GAMMA — the exponent on min(supA,supB): γ<1 softens the penalty (support 0.5 → ×0.71,
- *    0.25 → ×0.5), so a partially-supported grid isn't crushed while a totally-unsupported one is. */
-const LINE_SUPPORT_TOL_PX = 3;
-const LINE_SUPPORT_GAMMA = 0.5;
-
-/** Metodo #2 — corner-channel tuning. `TOL_FRAC`·cell is the match radius a predicted crossing must
- * fall within of a detected corner; below `MIN_CROSSINGS` tested crossings the score is too noisy to
- * trust, so the modulation is skipped. */
-const CORNER_TOL_FRAC = 0.33;
-const CORNER_MIN_CROSSINGS = 6;
-
-/** Metodo #2 — map an intersection-consensus score to a confidence multiplier: a texture whose
- * "crossings" land on nothing (score→0) is damped to 0.6×; a well-corroborated grid (score≥0.75) is
- * lifted to 1.2×; neutral (~1.0) around 0.55. Monotonic and gentle — it only nudges an already-
- * plausible fit, never resurrecting or killing one outright. */
-const cornerConfFactor = (score: number): number => 0.6 + 0.6 * clamp01((score - 0.15) / 0.6);
-
-/** Metodo #2 — detect candidate grid-intersection corners on the working-res gray image (Shi-Tomasi),
- * returned in FULL-RES image coordinates (÷scale) so they align with the family lines. */
-function detectCorners(cv: any, gray: any, scale: number): { x: number; y: number }[] {
-  const corners = new cv.Mat();
-  const out: { x: number; y: number }[] = [];
-  try {
-    const minDist = Math.max(4, Math.round(Math.min(gray.cols, gray.rows) / 60));
-    cv.goodFeaturesToTrack(gray, corners, 600, 0.02, minDist);
-    const s = scale || 1;
-    const d = corners.data32F as Float32Array;
-    for (let i = 0; i < corners.rows; i++) out.push({ x: d[i * 2] / s, y: d[i * 2 + 1] / s });
-  } finally {
-    corners.delete();
-  }
-  return out;
-}
-
 function houghToGrid(
   cv: any,
   edges: any,
@@ -1184,14 +986,7 @@ function houghToGrid(
       );
       if (gated.length >= 4 && gated.length >= raw.length * 0.3) raw = gated;
     }
-    // Metodo #1: profile sampler over THIS edge mask (rectified-plane pitch), reused across the
-    // main fit and every degenerate re-fit. Built only when the flag is on; undefined otherwise.
-    const profileSampler = params.profilePitch ? buildProfileSampler(cv, edges, scale, W0, H0) : undefined;
-    // P1 (lineSupport): edge-support predicate over THIS edge mask, reused across the main fit and every
-    // degenerate re-fit (same as profileSampler). Built only when the flag is on; undefined otherwise —
-    // so buildGrid skips the coverage block entirely and the flag-off path is byte-for-byte unchanged.
-    const edgeNear = params.lineSupport ? buildEdgeNear(cv, edges, scale, LINE_SUPPORT_TOL_PX) : undefined;
-    let result = buildGrid(raw, scale, W0, H0, params, orientPrior, profileSampler, edgeNear);
+    let result = buildGrid(raw, scale, W0, H0, params, orientPrior);
     // Degenerate fit = a phantom SUB-PITCH: thick / wavy lines (a physical mat, a
     // morphological mask) produce many close Hough responses that the default merge
     // distance doesn't collapse, so the lattice locks onto half/third the real pitch.
@@ -1200,7 +995,7 @@ function houghToGrid(
     // (never degenerate) keep the tight default merge — no risk of merging real lines.
     if (result.info.degenerate) {
       for (let m = 2; m <= 4; m++) {
-        const alt = buildGrid(raw, scale, W0, H0, { ...params, mergeFrac: params.mergeFrac * m }, orientPrior, profileSampler, edgeNear);
+        const alt = buildGrid(raw, scale, W0, H0, { ...params, mergeFrac: params.mergeFrac * m }, orientPrior);
         if (!alt.info.degenerate) {
           result = alt;
           break;
@@ -1398,6 +1193,11 @@ function deskewSweepAngles(off: number, hasPrior: boolean): number[] {
  * to oblique-but-flat shots. (Strong perspective, where lines converge, still can't be
  * straightened by a single angle.) `snap` (optional) exposes the intermediate H/V
  * stages to the debug graph. */
+/** Ridge hysteresis (`binDir`, ridgeHysteresis) bracket around the fixed local threshold's 1σ:
+ * a pixel is STRONG above local mean + RIDGE_HYST_HI·σ and WEAK (kept only if connected to a strong
+ * one) above local mean + RIDGE_HYST_LO·σ. The 1σ single-threshold sits between the two. */
+const RIDGE_HYST_HI = 1.5;
+const RIDGE_HYST_LO = 0.5;
 function rotateMat(cv: any, src: any, deg: number, interp: number, border: number): any {
   const center = new cv.Point(src.cols / 2, src.rows / 2);
   const M = cv.getRotationMatrix2D(center, deg, 1);
@@ -1412,8 +1212,7 @@ function enhanceGridLines(
   snap?: (id: string, mat: any) => void,
   deskewDeg = 0,
   time?: <X>(key: string, fn: () => X) => X,
-  localThresh = false,
-  closeFirst = false,
+  hysteresis = false,
 ): any {
   // Optional per-sub-node timing (debug): wraps the ridge / line-binarisation phases so the
   // graph's morph nodes (Cresta/Linee H·V) each get a measured time. Identity when absent.
@@ -1439,7 +1238,6 @@ function enhanceGridLines(
   // that isolated texture blobs pass — that flooded the ridge with noise.
   const L2 = Math.max(10, Math.round(minDim / 20));
   const LC = Math.max(24, Math.round(minDim / 7)); // bridge collinear fragments
-  const K = 2.0; // threshold = mean + K·σ of the line response (higher → less noise)
 
   const blur = new cv.Mat();
   cv.GaussianBlur(g, blur, new cv.Size(3, 3), 0);
@@ -1479,39 +1277,62 @@ function enhanceGridLines(
     const me = new cv.Mat();
     const st = new cv.Mat();
     cv.meanStdDev(r, me, st);
-    const gMean = me.data64F[0];
     const gSig = st.data64F[0];
     me.delete();
     st.delete();
     const b = new cv.Mat();
-    if (localThresh) {
-      // Per-pixel adaptive threshold: keep a pixel when its ridge response exceeds the LOCAL mean
-      // (over an LC window) by ~1σ. On a textured surface the GLOBAL σ is inflated by texture so the
-      // global mean+K·σ drowns a faint grid; the local mean tracks the background, so the faint ridge
-      // still stands out. `convertTo(dst,-1,1,β)` adds the σ margin per-element (avoids the
-      // Scalar-as-Mat binding this OpenCV.js build rejects); a flat gridless region has r≈local mean,
-      // so nothing passes there.
-      const lm = new cv.Mat();
-      cv.boxFilter(r, lm, -1, new cv.Size(LC, LC)); // -1 = keep r's depth (the ridge is 8-bit)
+    // Local adaptive threshold on the ridge: compare each pixel to its LOCAL mean (over an LC window)
+    // rather than to a single global level. On a textured surface the GLOBAL σ is inflated by texture
+    // so a global mean+K·σ would drown a faint grid; the local mean tracks the background, so the faint
+    // ridge still stands out. `convertTo(dst,-1,1,β)` adds the σ margin per-element (avoids the
+    // Scalar-as-Mat binding this OpenCV.js build rejects) and keeps r's 8-bit depth.
+    const lm = new cv.Mat();
+    cv.boxFilter(r, lm, -1, new cv.Size(LC, LC)); // local mean (ridge is 8-bit → ddepth -1)
+    if (hysteresis) {
+      // Hysteresis (Canny-style) on the ridge (ridgeHysteresis, evaluation): keep the STRONG pixels
+      // (> local mean + K_HI·σ) PLUS the WEAK pixels (> local mean + K_LO·σ) that are CONNECTED to a
+      // strong one — recovering a faint-but-continuous ridge without passing isolated texture (weak
+      // and connected to nothing strong). `hi` is the strong mask; `b` is the weak (LOW) mask; a
+      // connected component of `b` is kept only if it contains a strong pixel, else it's zeroed.
+      const thrHi = new cv.Mat();
+      lm.convertTo(thrHi, -1, 1, RIDGE_HYST_HI * gSig); // local mean + K_HI·σ
+      const hi = new cv.Mat();
+      cv.compare(r, thrHi, hi, cv.CMP_GT); // hi = STRONG mask
+      const thrLo = new cv.Mat();
+      lm.convertTo(thrLo, -1, 1, RIDGE_HYST_LO * gSig); // local mean + K_LO·σ
+      cv.compare(r, thrLo, b, cv.CMP_GT); // b = LOW (weak) mask
+      // Same connectedComponents flavour/ltype as dropShortComponents (proven in this OpenCV.js
+      // build); stats/centroids are unused here but required by the signature.
+      const labels = new cv.Mat();
+      const stats = new cv.Mat();
+      const centroids = new cv.Mat();
+      const ncc = cv.connectedComponentsWithStats(b, labels, stats, centroids, 8, cv.CV_32S);
+      const lab = labels.data32S as Int32Array;
+      const hd = hi.data as Uint8Array;
+      const keep = new Uint8Array(ncc);
+      for (let i = 0; i < lab.length; i++) if (hd[i]) keep[lab[i]] = 1; // label touches a strong pixel
+      const bd = b.data as Uint8Array;
+      for (let i = 0; i < bd.length; i++) bd[i] = keep[lab[i]] ? 255 : 0;
+      thrHi.delete();
+      hi.delete();
+      thrLo.delete();
+      labels.delete();
+      stats.delete();
+      centroids.delete();
+    } else {
+      // Fixed single-level local threshold (ex ridgeLocalThresh, now the baked-in default): keep a
+      // pixel when its ridge response exceeds the LOCAL mean by ~1σ. A flat gridless region has
+      // r≈local mean, so nothing passes there.
       const thr = new cv.Mat();
       lm.convertTo(thr, -1, 1, gSig); // thr = local mean + 1σ (same type as r → compare is valid)
       cv.compare(r, thr, b, cv.CMP_GT); // b = 255 where r > thr, else 0
-      lm.delete();
       thr.delete();
-    } else {
-      cv.threshold(r, b, gMean + K * gSig, 255, cv.THRESH_BINARY);
     }
-    if (closeFirst) {
-      // Safer order: re-stitch collinear fragments (small close ~L2) BEFORE discarding short
-      // runs, so a weak line broken into sub-L2 pieces survives the open; then the large close
-      // bridges the wide gaps. The small initial close avoids sucking in far-off texture.
-      cv.morphologyEx(b, b, cv.MORPH_CLOSE, seOpen);
-      cv.morphologyEx(b, b, cv.MORPH_OPEN, seOpen);
-      cv.morphologyEx(b, b, cv.MORPH_CLOSE, seClose);
-    } else {
-      cv.morphologyEx(b, b, cv.MORPH_OPEN, seOpen);
-      cv.morphologyEx(b, b, cv.MORPH_CLOSE, seClose);
-    }
+    lm.delete();
+    // Open ALONG the line to drop residual blobs, then close ALONG the line to bridge the gaps the
+    // speckle left — turning broken faint lines into continuous ones so Hough forms one strong peak.
+    cv.morphologyEx(b, b, cv.MORPH_OPEN, seOpen);
+    cv.morphologyEx(b, b, cv.MORPH_CLOSE, seClose);
     return b;
   };
   const bH = T('mbinh', () => binDir(rH, hSE2, hSEc));
@@ -1933,22 +1754,6 @@ function dropShortComponents(cv: any, mask: any, minLen: number): void {
   }
 }
 
-/**
- * Metodo #1 — builds a DENSE 1-D projection profile of the edge pixels in the RECTIFIED plane.
- * Given the rectifying homography `H`, the family's rectified mean normal `(meanNx,meanNy)`, and a
- * binning (`oLo`, `binSize`, `nBins`), it returns the per-bin edge energy along the family's offset
- * axis (or null if it can't). Closed over the edge pixels by the caller (houghToGrid); undefined on
- * the pure test path, so buildGrid/fitFamilyGrid stay unit-testable without OpenCV.
- */
-type ProfileSampler = (
-  H: M3,
-  meanNx: number,
-  meanNy: number,
-  oLo: number,
-  binSize: number,
-  nBins: number,
-) => Float64Array | null;
-
 export function buildGrid(
   raw: RawLine[],
   scale: number,
@@ -1956,8 +1761,6 @@ export function buildGrid(
   H0: number,
   params: DetectorParams,
   orientPrior: { a: number; b: number } | null = null,
-  profileSampler?: ProfileSampler,
-  edgeNear?: EdgeNear,
 ): GridResult {
   const rawLines: Line2[] = raw.map((l) => toLine2(l.rho, l.thetaDeg, scale));
 
@@ -2071,8 +1874,8 @@ export function buildGrid(
   // image space but assume they came from a SINGLE coherent plane — so the rectification is
   // chosen per-PAIR, never mixed between families (a mixed H would be geometrically incoherent).
   const fitPair = (Hm: M3) => {
-    const A = fitFamilyGrid(inA, Hm, params, crossesImage, minCell, profileSampler);
-    const B = fitFamilyGrid(inB, Hm, params, crossesImage, minCell, profileSampler);
+    const A = fitFamilyGrid(inA, Hm, params, crossesImage, minCell);
+    const B = fitFamilyGrid(inB, Hm, params, crossesImage, minCell);
     // A degenerate (sub-pitch) fit has an implausibly small cell — reconstruction
     // was already skipped for it; also drop its confidence to ~0 so the UI warns.
     const degenerate =
@@ -2141,29 +1944,6 @@ export function buildGrid(
   const familyA = A.lines.map(fromCentered);
   const familyB = B.lines.map(fromCentered);
 
-  // P1 (lineSupport, flag-gated) — fold the INDEPENDENT image-support signal into the per-candidate
-  // confidence, PRE-fusion. Sample each PREDICTED (detected) line for a real edge underneath in the
-  // image (lineCoverage over the working-res edge map, via the injected `edgeNear`) and multiply the
-  // confidence by min(supA,supB)^γ: a per-family AND (a grid needs BOTH axes supported), matching how
-  // the pair term leans on the weaker axis. `stepPx` scales with the pitch (~⅛ cell → scale-invariant,
-  // cheap). With the flag OFF `edgeNear` is undefined ⇒ this whole block is skipped and both
-  // `confidence` and `info.lineSupport` are byte-for-byte unchanged. Applied here (before the result is
-  // returned to houghToGrid → fuseGrids) so it modulates the candidate's OWN confidence, not a late nudge.
-  let finalConfidence = confidence;
-  let lineSupportScore: number | undefined;
-  if (edgeNear) {
-    const minSpacing = Math.min(
-      A.spacing > 0 ? A.spacing : Infinity,
-      B.spacing > 0 ? B.spacing : Infinity,
-    );
-    const stepPx = Number.isFinite(minSpacing) ? Math.max(2, 0.125 * minSpacing) : 2;
-    const supA = lineCoverage(familyA, W0, H0, edgeNear, stepPx).score;
-    const supB = lineCoverage(familyB, W0, H0, edgeNear, stepPx).score;
-    const support = Math.min(supA, supB);
-    lineSupportScore = +support.toFixed(3);
-    finalConfidence = clamp01(confidence * Math.pow(support, LINE_SUPPORT_GAMMA));
-  }
-
   const result: GridResult = {
     width: W0,
     height: H0,
@@ -2192,8 +1972,7 @@ export function buildGrid(
       // Calibrated grid confidence: both axes must look like a grid (geometric mean of the
       // two families' calibrated qualities) AND be a plausible size, 0 if degenerate. NOT a
       // raw line count. This is the per-candidate INTERNAL confidence; consensus lifts it.
-      // (P1: already scaled by the image-support factor when lineSupport ran; identical otherwise.)
-      confidence: finalConfidence,
+      confidence,
       cellsA,
       cellsB,
       inlierA: A.metrics.inlier,
@@ -2203,10 +1982,6 @@ export function buildGrid(
       spanB: B.metrics.span,
     },
   };
-
-  // P1: surface the diagnostic support score (only when the channel ran; undefined leaves it absent,
-  // exactly as cornerScore does — so the flag-off result object is byte-for-byte unchanged).
-  if (lineSupportScore !== undefined) result.info.lineSupport = lineSupportScore;
 
   return result;
 }
@@ -2735,139 +2510,6 @@ export function combPitch(offsets: number[], seed: number): CombFit {
   return { pitch: best.p, anchor, fillRatio: best.fill, peakRatio };
 }
 
-/** Result of the rectified-plane projection-profile pitch estimate (Metodo #1). */
-export interface ProfilePitch {
-  /** Fundamental cell in rectified-offset units (px), or 0 if no clear periodicity. */
-  pitch: number;
-  /** Lattice phase (anchor) in [0, pitch): rectified nodes sit near `anchor + pitch·k`. */
-  anchor: number;
-  /** Peak autocorrelation / zero-lag energy — how periodic the profile is (grid ≫ texture). */
-  strength: number;
-}
-
-/** Min normalized-autocorrelation peak for a profile to be accepted as periodic (Metodo #1).
- * Below this the projection profile is treated as texture and the caller keeps its own estimate. */
-export const PROFILE_MIN_STRENGTH = 0.3;
-
-/**
- * Metodo #1 — pitch + phase from a DENSE projection profile (edge energy summed per rectified-offset
- * bin) via AUTOCORRELATION. Unlike `combPitch` (which sees only the SPARSE offsets of the already-
- * extracted lines), the profile integrates the edge signal ALONG each line — a faint-but-long grid
- * line still forms a bin peak — which is exactly what rescues the faint/perspective cases where the
- * sparse fit smears. Autocorrelation is the correct tool for a dense profile: a real grid has NO line
- * at half the pitch, so the profile is NOT periodic at pitch/2 → autocorr peaks at k·pitch and never
- * at pitch/2, avoiding the sub-pitch lock by construction (no fill-weighting needed). `seed` (from
- * `robustCell`) narrows the lag window so a genuine 2·pitch harmonic can't win. MUST be fed a profile
- * built in the RECTIFIED plane — in image space the pitch is foreshortened (chirped) and non-periodic.
- *
- * `profile[i]` = summed edge energy at rectified offset `minOffset + (i+0.5)·binSize`. Pure & exported
- * for direct unit testing on synthetic profiles.
- */
-export function profilePitch(
-  profile: number[],
-  binSize: number,
-  minOffset: number,
-  seed: number,
-): ProfilePitch {
-  const n = profile.length;
-  const none: ProfilePitch = { pitch: 0, anchor: 0, strength: 0 };
-  if (n < 4 || !(binSize > 0) || !(seed > 0)) return none;
-  // Detrend: subtract the mean so a DC pedestal (uniform texture / edge-density floor) doesn't
-  // dominate the autocorrelation and drown the periodic component.
-  let mean = 0;
-  for (const v of profile) mean += v;
-  mean /= n;
-  const x = profile.map((v) => v - mean);
-  let e0 = 0;
-  for (const v of x) e0 += v * v;
-  if (!(e0 > 0)) return none;
-  // Lag search window (in bins), centred on the seed cell so neither pitch/2 nor 2·pitch can win.
-  const seedLag = seed / binSize;
-  const lagMin = Math.max(2, Math.floor(0.5 * seedLag));
-  const lagMax = Math.min(n - 2, Math.ceil(2.3 * seedLag));
-  if (lagMax <= lagMin) return none;
-  const ac = (lag: number): number => {
-    let s = 0;
-    for (let i = 0; i + lag < n; i++) s += x[i] * x[i + lag];
-    return s / e0;
-  };
-  let bestLag = lagMin;
-  let bestV = -Infinity;
-  const acVals: number[] = [];
-  for (let lag = lagMin; lag <= lagMax; lag++) {
-    const v = ac(lag);
-    acVals.push(v);
-    if (v > bestV) {
-      bestV = v;
-      bestLag = lag;
-    }
-  }
-  if (!(bestV > 0)) return none;
-  // Parabolic sub-bin refinement around the discrete peak for a precise pitch.
-  let pitchBins = bestLag;
-  if (bestLag > lagMin && bestLag < lagMax) {
-    const ym1 = acVals[bestLag - 1 - lagMin];
-    const y0 = acVals[bestLag - lagMin];
-    const yp1 = acVals[bestLag + 1 - lagMin];
-    const denom = ym1 - 2 * y0 + yp1;
-    if (Math.abs(denom) > 1e-9) pitchBins = bestLag + (0.5 * (ym1 - yp1)) / denom;
-  }
-  const pitch = pitchBins * binSize;
-  if (!(pitch > 0)) return none;
-  // Phase = the profile's Fourier component at the fundamental frequency (weighted by the profile),
-  // mirroring combPitch: anchor = (arg Σ w·e^{i2πo/p} / 2π)·p, in [0, pitch).
-  const TWO_PI = 2 * Math.PI;
-  let re = 0;
-  let im = 0;
-  for (let i = 0; i < n; i++) {
-    const off = minOffset + (i + 0.5) * binSize;
-    const a = (TWO_PI * off) / pitch;
-    re += x[i] * Math.cos(a);
-    im += x[i] * Math.sin(a);
-  }
-  const phi = Math.atan2(im, re);
-  let anchor = (phi / TWO_PI) * pitch;
-  anchor = ((anchor % pitch) + pitch) % pitch;
-  return { pitch, anchor, strength: bestV };
-}
-
-/** Bins the rectified projection profile around a family's detected offset band and runs profilePitch
- * on it. Chooses the range (detected extent + a pad of ~1.5 cells so a just-missed outer line is
- * covered) and a bin size (~seed/8), capping the bin count to bound cost. Returns null when the
- * sampler yields nothing or the profile isn't convincingly periodic. Pure given the sampler. */
-function sampleProfilePitch(
-  sampler: ProfileSampler,
-  H: M3,
-  meanNx: number,
-  meanNy: number,
-  offs: number[],
-  seed: number,
-): ProfilePitch | null {
-  if (offs.length < 2 || !(seed > 0)) return null;
-  let lo = Infinity;
-  let hi = -Infinity;
-  for (const o of offs) {
-    if (o < lo) lo = o;
-    if (o > hi) hi = o;
-  }
-  if (!(hi > lo)) return null;
-  const pad = 1.5 * seed + 0.3 * (hi - lo);
-  const oLo = lo - pad;
-  const oHi = hi + pad;
-  let binSize = Math.max(0.5, seed / 8);
-  let nBins = Math.ceil((oHi - oLo) / binSize);
-  if (nBins < 8) return null;
-  if (nBins > 4000) {
-    nBins = 4000; // cost cap; grids span ≤ MAX_CELLS_ACROSS cells so this is never hit in practice
-    binSize = (oHi - oLo) / nBins;
-  }
-  const prof = sampler(H, meanNx, meanNy, oLo, binSize, nBins);
-  if (!prof) return null;
-  const pp = profilePitch(Array.from(prof), binSize, oLo, seed);
-  if (!(pp.pitch > 0) || pp.strength < PROFILE_MIN_STRENGTH) return null;
-  return pp;
-}
-
 export interface PeriodicResult {
   raw: RawLine[]; // synthesized grid lines (rho in WORKING coords, theta = family normal), both families
   peakRatio: number; // min of the two families' autocorrelation peak sharpness (grid ≫ texture)
@@ -3021,7 +2663,6 @@ function fitFamilyGrid(
   params: DetectorParams,
   crossesImage: (l: Line2) => boolean,
   minCell: number,
-  profileSampler?: ProfileSampler,
 ): FamilyGrid {
   const HinvT = transpose3(inv3(H) ?? IDENTITY3);
   const HT = transpose3(H);
@@ -3058,23 +2699,11 @@ function fitFamilyGrid(
     return finalize(pts.map((p) => backToImage(p.off, meanNx, meanNy, false)));
   }
 
-  // Metodo #1 (profilePitch): estimate pitch+phase from a DENSE projection profile built in THIS
-  // rectified plane — integrating the edge signal ALONG each line — which rescues faint/perspective
-  // families whose sparse offsets smear to a sub-pitch. It's global (independent of the dedup below),
-  // so it's computed once and, when convincingly periodic, OVERRIDES robustCell/coarsenPitch/comb at
-  // both steps and supplies the lattice anchor. Falls through to the sparse estimate when weak/absent.
-  let profileFit: ProfilePitch | null = null;
-  if (params.profilePitch && profileSampler && pts.length >= 2) {
-    profileFit = sampleProfilePitch(profileSampler, H, meanNx, meanNy, pts.map((p) => p.off), cell);
-  }
-
   // Phase 3b (periodicPitch): the fill-weighted comb replaces coarsenPitch as the sub-pitch guard —
   // it climbs from a sub-pitch seed to the fundamental even under smear, where coarsenPitch's
   // absolute-tolerance test fails. `robustCell` still seeds the search window. Flag OFF: unchanged.
   let combFit: CombFit | null = null;
-  if (profileFit) {
-    cell = profileFit.pitch;
-  } else if (params.periodicPitch) {
+  if (params.periodicPitch) {
     combFit = combPitch(pts.map((p) => p.off), cell);
     if (combFit.pitch > 0) cell = combFit.pitch;
   } else {
@@ -3093,14 +2722,12 @@ function fitFamilyGrid(
     }
   }
   pts = dedup;
-  if (!profileFit) {
-    const seed = robustCell(pts.map((p) => p.off)) || cell;
-    if (params.periodicPitch) {
-      combFit = combPitch(pts.map((p) => p.off), seed);
-      if (combFit.pitch > 0) cell = combFit.pitch;
-    } else {
-      cell = coarsenPitch(pts.map((p) => p.off), seed);
-    }
+  const seed = robustCell(pts.map((p) => p.off)) || cell;
+  if (params.periodicPitch) {
+    combFit = combPitch(pts.map((p) => p.off), seed);
+    if (combFit.pitch > 0) cell = combFit.pitch;
+  } else {
+    cell = coarsenPitch(pts.map((p) => p.off), seed);
   }
 
   const offs = pts.map((p) => p.off);
@@ -3112,9 +2739,7 @@ function fitFamilyGrid(
   // lattice phase; the LS refit below uses GLOBAL indices, so any representative anchor is fine.
   // Flag OFF: the original search for the offset whose lattice captures the most other lines.
   let a: number;
-  if (profileFit) {
-    a = profileFit.anchor; // Metodo #1: the profile's global lattice phase (LS refit re-anchors below)
-  } else if (params.periodicPitch && combFit) {
+  if (params.periodicPitch && combFit) {
     a = combFit.anchor;
   } else {
     a = offs[0];
@@ -3327,109 +2952,4 @@ export function intersect(a: Line2, b: Line2): { x: number; y: number } | null {
     x: (a.d * b.ny - b.d * a.ny) / det,
     y: (a.nx * b.d - b.nx * a.d) / det,
   };
-}
-
-/** Corner-channel consensus of a grid hypothesis against detected image corners (Metodo #2). */
-export interface ConsensusResult {
-  /** matched / total — fraction of predicted grid crossings that coincide with a real corner. */
-  score: number;
-  /** predicted crossings (of DETECTED lines, inside the frame) that had a corner within `tol`. */
-  matched: number;
-  /** predicted crossings inside the frame that were tested. */
-  total: number;
-}
-
-/**
- * Metodo #2 — verify a line-based grid against an INDEPENDENT corner channel. A genuine grid's line
- * crossings sit on real X-corners/saddle points; a periodic TEXTURE (two line families but no true
- * lattice of crossings) does not. For every pair of DETECTED lines (one per family) we take their
- * intersection, and — if it falls inside the image — check whether a detected corner lies within
- * `tol`. `score = matched/total` is a projective-robust confirmation (corner POSITIONS are stable
- * under perspective, since a homography maps lines→lines and their meet→meet), so it holds for
- * perspective grids too. Filled/extended lines are excluded: they carry no independent evidence.
- *
- * Pure & exported: `familyA/B` are image-space Line2 (full-res), `corners` image-space points (mapped
- * to full-res by the caller), `tol` a pixel radius (~⅓ cell). Unit-testable without OpenCV.
- */
-export function intersectionConsensus(
-  familyA: Line2[],
-  familyB: Line2[],
-  corners: { x: number; y: number }[],
-  W: number,
-  H: number,
-  tol: number,
-): ConsensusResult {
-  const detected = (fam: Line2[]): Line2[] => fam.filter((l) => !l.filled && !l.extended);
-  const A = detected(familyA);
-  const B = detected(familyB);
-  if (A.length < 2 || B.length < 2 || corners.length === 0 || !(tol > 0)) {
-    return { score: 0, matched: 0, total: 0 };
-  }
-  const tol2 = tol * tol;
-  const near = (x: number, y: number): boolean => {
-    for (const c of corners) {
-      const dx = c.x - x;
-      const dy = c.y - y;
-      if (dx * dx + dy * dy <= tol2) return true;
-    }
-    return false;
-  };
-  let matched = 0;
-  let total = 0;
-  for (const a of A) {
-    for (const b of B) {
-      const p = intersect(a, b);
-      if (!p || p.x < 0 || p.x > W || p.y < 0 || p.y > H) continue;
-      total++;
-      if (near(p.x, p.y)) matched++;
-    }
-  }
-  return { score: total > 0 ? matched / total : 0, matched, total };
-}
-
-/** P1 (lineSupport) — image-support / line coverage of a grid hypothesis (the INDEPENDENT signal the
- * self-coherence confidence lacks). For every DETECTED line (filled/extended carry no evidence and are
- * skipped, like intersectionConsensus) we clip it to the frame [0,W]×[0,H] with `clipLineToRect`, walk
- * the segment at `stepPx` steps, and count the samples that have an edge under them (`isEdgeNear`). A
- * real grid line runs edge-to-edge, so its coverage is high even when faint/perspective; a Hough line
- * fired by a local texture patch is only supported over part of its length.
- *
- * Aggregation is ROBUST: `score` is the MEDIAN of the per-line coverage fractions — a few unsupported
- * predicted lines (occlusion, one bad Hough hit) don't tank an otherwise well-supported grid, and a
- * couple of over-supported outliers don't inflate a texture. `covered`/`total` are the GLOBAL sample
- * tallies (diagnostics). Returns all-zero when fewer than 2 detected lines carry evidence. Pure — no
- * OpenCV: `isEdgeNear` is injected (a real buildEdgeNear closure in production, a fake in tests). */
-export function lineCoverage(
-  lines: Line2[],
-  W: number,
-  H: number,
-  isEdgeNear: (x: number, y: number) => boolean,
-  stepPx: number,
-): { covered: number; total: number; score: number } {
-  const detected = lines.filter((l) => !l.filled && !l.extended);
-  if (detected.length < 2 || !(stepPx > 0)) return { covered: 0, total: 0, score: 0 };
-  const fracs: number[] = [];
-  let coveredG = 0;
-  let totalG = 0;
-  for (const l of detected) {
-    const seg = clipLineToRect(l, W, H);
-    if (!seg) continue; // line doesn't cross the frame → no evidence to sample
-    const [[x0, y0], [x1, y1]] = seg;
-    const len = Math.hypot(x1 - x0, y1 - y0);
-    const steps = Math.max(1, Math.floor(len / stepPx));
-    let cov = 0;
-    for (let i = 0; i <= steps; i++) {
-      const t = i / steps;
-      if (isEdgeNear(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)) cov++;
-    }
-    const n = steps + 1;
-    coveredG += cov;
-    totalG += n;
-    fracs.push(cov / n);
-  }
-  if (fracs.length < 2) return { covered: coveredG, total: totalG, score: 0 };
-  fracs.sort((a, b) => a - b);
-  const mid = fracs.length >> 1;
-  const score = fracs.length % 2 ? fracs[mid] : (fracs[mid - 1] + fracs[mid]) / 2;
-  return { covered: coveredG, total: totalG, score };
 }

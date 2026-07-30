@@ -56,6 +56,13 @@ export interface DetectorParams {
    * map (a high-frequency sand/dirt texture leaves many tiny fragments; grid lines are
    * long). Orientation-agnostic length filter — see dropShortComponents. */
   edgeClean: boolean;
+  /** A/B flag for the "Phase 3" periodic-pitch cure (OFF by default → behaviour is byte-for-byte
+   * the pre-Phase-3 path). When ON it swaps in three surgical, jointly-inseparable changes, all
+   * in the RECTIFIED plane: (3a) a κ = wmax/wmin horizon-stability gate + 1-parameter horizon
+   * sweep that rejects a smearing rectification; (3b) a fill-weighted sparse-DFT comb (see
+   * combPitch) that replaces robustCell+coarsenPitch and climbs out of a sub-pitch seed; and
+   * (3c) a perspective-safe degeneracy test (comb fillRatio) + rectified-pitch squareness. */
+  periodicPitch: boolean;
 }
 
 export const DEFAULT_PARAMS: DetectorParams = {
@@ -70,6 +77,7 @@ export const DEFAULT_PARAMS: DetectorParams = {
   fftPrior: true,
   orientGate: true,
   edgeClean: true,
+  periodicPitch: false,
 };
 
 /** A line as normal form: nx*x + ny*y = d, with (nx,ny) a unit vector. */
@@ -121,6 +129,13 @@ export interface GridResult {
   debugPipelines?: PipelineStat[]; // per-candidate confidence (only when wantEdges/debug)
   debugAgreement?: number | null; // 0..1 main↔morph agreement, or null (debug only)
   debugTimings?: Record<string, number>; // ms per phase + counts, for the debug log (debug only)
+  debugRawLum?: Line2[]; // raw Hough lines of the luminance fit (debug only)
+  debugRawChroma?: Line2[]; // raw Hough lines of the chromatic fit (debug only)
+  debugRawMorph?: Line2[]; // raw Hough lines of the morphology fit (debug only)
+  // Line attrition through the fit stages, per family [A,B] (debug/diagnostic only): how many
+  // lines survive raw→angle-split→duplicate-merge→VP-concurrency→regular-lattice. Pinpoints
+  // WHERE an obvious grid's lines are being discarded.
+  debugFit?: { split: [number, number]; merged: [number, number]; vp: [number, number]; lattice: [number, number] };
   info: {
     rawCount: number;
     aCount: number;
@@ -135,10 +150,27 @@ export interface GridResult {
     detectedA: number; // real DETECTED (non-filled) lines per family …
     detectedB: number;
     confidence: number; // …feeding a 0..1 heuristic detection-quality score
+    // Estimated grid SIZE = how many cells of each family span the image at the detected
+    // pitch (rotation-robust: image extent along the family normal / pitch). A plausible
+    // tactical grid is a handful to a couple dozen cells; far outside that is a false fit.
+    cellsA: number;
+    cellsB: number;
+    // Per-family lattice REGULARITY = fraction of the family's (merged, VP-concurrent) raw
+    // lines that land on the fitted lattice — high for a real grid, low for a texture stumble
+    // whose lines don't sit on a regular pitch. Surfaced (not just folded into `confidence`)
+    // so the UI reliability gate can reject a low-regularity fit per family. 0 when the family
+    // took a degenerate / early-out fit path.
+    inlierA: number;
+    inlierB: number;
     // true when the fit collapsed to an implausible SUB-PITCH (micro-cells) — a
     // degenerate/garbage grid. This (not a confidence threshold) is what the UI gates
     // on to decide whether to draw the auto grid or offer the manual fallback.
     degenerate: boolean;
+    // Detected lattice EXTENT per family (kmax−kmin+1, rectified plane) — the size of the grid
+    // ACTUALLY SEEN. Used by the fusion size tie-break instead of the frame-relative cell count
+    // (cellsA/B), which over-counts by the image margin.
+    spanA: number;
+    spanB: number;
   };
 }
 
@@ -178,56 +210,130 @@ const detectedCount = (fam: Line2[]): number => fam.reduce((n, l) => n + (l.fill
 const gridStrength = (r: GridResult): number =>
   Math.min(detectedCount(r.familyA), detectedCount(r.familyB));
 
-/** 0..1 continuous detection-quality heuristic for ONE fit. Blends three
- * perspective-safe signals (a grid still scores well when foreshortened):
- *   • recall   — detected lines in the WEAKER family (2→0, 8→1);
- *   • realness — fraction of lines actually detected vs interpolated/extended;
- *   • balance  — the two families are similarly populated (a grid has both).
- * Deliberately NO spacing-uniformity term: perspective makes the image-space cell
- * pitch vary smoothly, which is not a defect, so penalising it would be wrong. The
- * strong cross-check (do the two independent pipelines agree?) is applied separately
- * — see fitsAgree / the confidence panel. */
-function gridConfidence(familyA: Line2[], familyB: Line2[]): number {
-  const dA = detectedCount(familyA);
-  const dB = detectedCount(familyB);
-  const m = Math.min(dA, dB);
-  if (m < 2) return 0;
-  const sCount = Math.min(1, (m - 2) / 6); // 2→0, 8→1 (smooth ramp)
-  const sReal = Math.min(familyA.length ? dA / familyA.length : 0, familyB.length ? dB / familyB.length : 0);
-  const sBalance = Math.max(dA, dB) ? Math.min(dA, dB) / Math.max(dA, dB) : 0;
-  return Math.max(0, Math.min(1, 0.5 * sCount + 0.3 * sReal + 0.2 * sBalance));
+/** Compact description of a fit, for cross-method agreement (image-space; adequate for
+ * the LIGHT perspective we target). Families are ordered [A,B]. */
+interface GridDescriptor {
+  ang: [number, number]; // family normal angles (deg)
+  pitch: [number, number]; // family median pitch (px)
+  strength: number; // min detected lines across the two families
 }
 
-/** Do two independent fits describe the SAME grid? Returns 0..1 (1 = same angle & cell
- * pitch on both families), or null when they're not comparable (a fit is missing,
- * degenerate, or too weak). Families are matched by nearest angle; pitch is compared as
- * a ratio so it's scale-tolerant. This is the OPTION-B second opinion: two independent
- * methods agreeing is strong evidence, even when each alone found only a few lines. */
-function fitsAgree(a: GridResult | null, b: GridResult | null): number | null {
-  if (!a || !b || a.info.degenerate || b.info.degenerate) return null;
-  if (Math.min(a.info.detectedA, a.info.detectedB) < 2) return null;
-  if (Math.min(b.info.detectedA, b.info.detectedB) < 2) return null;
-  const aAng = [a.info.angleADeg, a.info.angleBDeg];
-  const aPit = [a.info.spacingA, a.info.spacingB];
-  const bAng = [b.info.angleADeg, b.info.angleBDeg];
-  const bPit = [b.info.spacingA, b.info.spacingB];
-  const bi = angDist180(aAng[0], bAng[1]) < angDist180(aAng[0], bAng[0]) ? [1, 0] : [0, 1];
-  let sum = 0;
+const describeGrid = (r: GridResult): GridDescriptor | null => {
+  if (r.info.degenerate) return null;
+  const strength = Math.min(r.info.detectedA, r.info.detectedB);
+  if (strength < 2 || r.info.spacingA <= 0 || r.info.spacingB <= 0) return null;
+  return { ang: [r.info.angleADeg, r.info.angleBDeg], pitch: [r.info.spacingA, r.info.spacingB], strength };
+};
+
+/** Largest integer m (1..MAX) whose multiple of the finer pitch matches the coarser pitch,
+ * scored 0..1 by how close the ratio is to that integer. A ratio near an integer means one
+ * fit is a SUB-SAMPLING (every m-th line) of the other — they still describe the SAME grid,
+ * just at a coarser pitch. Non-integer ratios (a genuinely different grid) score ~0. */
+function harmonicPitchScore(pa: number, pb: number): number {
+  if (pa <= 0 || pb <= 0) return 0;
+  const ratio = Math.max(pa, pb) / Math.min(pa, pb); // ≥ 1
+  const m = Math.max(1, Math.round(ratio));
+  if (m > 4) return 0; // beyond a 4× sub-sampling we no longer trust the correspondence
+  const err = Math.abs(ratio - m) / m; // relative distance to the nearest harmonic
+  return clamp01(1 - err / 0.15); // within 15% of an integer multiple
+}
+
+/**
+ * Do two fits describe the SAME grid? Returns 0..1 (1 = identical orientation and a clean
+ * harmonic pitch relationship on BOTH families), or null when a fit isn't comparable
+ * (degenerate / too weak). Orientation is matched by pairing each family to its nearest;
+ * pitch agreement is HARMONIC-aware, so a coarse sub-sampling (a method that missed the
+ * faint intermediate lines) still counts as agreeing with the fine grid — which is exactly
+ * how an independent second opinion resolves a wrong pitch. Two independent methods agreeing
+ * is strong evidence even when each alone found only a few lines. Pure — unit-tested. */
+function gridsAgree(a: GridResult | null, b: GridResult | null): number | null {
+  const da = a && describeGrid(a);
+  const db = b && describeGrid(b);
+  if (!da || !db) return null;
+  // Pair family A of `a` with whichever family of `b` is closer in angle.
+  const swap = angDist180(da.ang[0], db.ang[1]) < angDist180(da.ang[0], db.ang[0]);
+  const bIdx = swap ? [1, 0] : [0, 1];
+  let prod = 1;
   for (let k = 0; k < 2; k++) {
-    const sAng = 1 - Math.min(1, angDist180(aAng[k], bAng[bi[k]]) / 15); // within 15°
-    const pa = aPit[k];
-    const pb = bPit[bi[k]];
-    const ratio = pa > 0 && pb > 0 ? Math.max(pa, pb) / Math.min(pa, pb) : 99;
-    const sPit = 1 - Math.min(1, Math.log(ratio) / Math.log(1.5)); // within 1.5×
-    sum += sAng + sPit;
+    const angScore = clamp01(1 - angDist180(da.ang[k], db.ang[bIdx[k]]) / 12); // within 12°
+    const pitchScore = harmonicPitchScore(da.pitch[k], db.pitch[bIdx[k]]);
+    prod *= angScore * pitchScore;
   }
-  return Math.max(0, Math.min(1, sum / 4));
+  return clamp01(Math.sqrt(prod)); // geometric mean of the two families' agreement
 }
 
-/** Fold the two-method agreement into a single fit's confidence: agreement (>0.5) lifts
- * it, disagreement (<0.5) cuts it, 0.5 is neutral. Bounded to [0,1]. */
-function withAgreement(base: number, agree: number): number {
-  return Math.max(0, Math.min(1, base * (0.5 + 0.5 * agree) + agree * (1 - base) * 0.5));
+/** How much an independent second opinion lifts a corroborated fit's confidence. A fit that
+ * a second method agrees with is pushed toward certainty; a lone fit keeps its raw quality. */
+const CONSENSUS_BOOST = 0.8;
+
+/** Fused-confidence band within which two candidates count as "tied" — the winner is then
+ * decided by grid shape, not the noisy confidence delta. Also bounds the noise override
+ * (it may only swap in morphology when its confidence is within this band of the leader). */
+const CONF_TIE = 0.06;
+
+export interface FusionResult {
+  index: number; // winning candidate (index into the input array)
+  confidence: number; // fused confidence of the winner: internal quality lifted by consensus
+  agreement: number | null; // best agreement the winner has, as the FINER representative
+  confidences: number[]; // fused confidence of EACH candidate (for tie-break overrides / panel)
+}
+
+/**
+ * Fuse several independent candidate grids (luminance / chroma / morphology) into one
+ * decision — the heart of "put the approaches together to work out which is the grid".
+ * Each candidate carries its own calibrated internal confidence. Where two candidates
+ * AGREE (same orientation, harmonic pitch), that's strong corroboration: the FINER of the
+ * pair is the representative (it recovered lines the other missed) and its confidence is
+ * lifted toward 1; the coarser sub-sampling is NOT lifted, so the complete grid wins over a
+ * skip-sampled one. A lone candidate keeps its internal confidence. The winner is the
+ * candidate with the highest fused confidence (ties broken by more detected lines). Pure. */
+export function fuseGrids(cands: GridResult[]): FusionResult {
+  if (cands.length === 0) return { index: 0, confidence: 0, agreement: null, confidences: [] };
+  const strengthOf = (r: GridResult): number =>
+    r.info.degenerate ? 0 : Math.min(r.info.detectedA, r.info.detectedB);
+  const confidences: number[] = [];
+  const agreements: number[] = [];
+  for (let i = 0; i < cands.length; i++) {
+    const internal = cands[i].info.confidence;
+    const si = strengthOf(cands[i]);
+    // Only agreement where THIS candidate is the finer (≥-strength) representative lifts it,
+    // so a coarse sub-sampling can't ride the fine grid's corroboration to the top.
+    let agree = 0;
+    for (let j = 0; j < cands.length; j++) {
+      if (j === i) continue;
+      if (si < strengthOf(cands[j])) continue; // the other is finer → it's the representative
+      const g = gridsAgree(cands[i], cands[j]);
+      if (g != null && g > agree) agree = g;
+    }
+    confidences.push(clamp01(internal + (1 - internal) * agree * CONSENSUS_BOOST));
+    agreements.push(agree);
+  }
+  // Shape sanity in [0,1]: is this candidate a plausibly-SIZED grid? Measured on the DETECTED
+  // extent (`span` = lattice positions actually seen), NOT `cellsAcross` (which counts cells the
+  // pitch would tile across the whole FRAME and is inflated by the margin / doubled by a
+  // sub-pitch). Independent of raw line count, so it breaks ties when several candidates share a
+  // near-zero confidence — a plausible 13×8 must beat garbage like 1×9 / 43×3 / 50×1.
+  const shapeOf = (r: GridResult): number =>
+    r.info.degenerate ? 0 : cellCountPlausibility(r.info.spanA) * cellCountPlausibility(r.info.spanB);
+  // Winner ranking: clearly-higher fused confidence wins; within a small confidence band
+  // (both weak / tied) prefer the more grid-SHAPED candidate, then the one with more lines.
+  let best = 0;
+  for (let i = 1; i < cands.length; i++) {
+    const dc = confidences[i] - confidences[best];
+    let better: boolean;
+    if (Math.abs(dc) > CONF_TIE) better = dc > 0;
+    else {
+      const ds = shapeOf(cands[i]) - shapeOf(cands[best]);
+      better = Math.abs(ds) > 1e-6 ? ds > 0 : strengthOf(cands[i]) > strengthOf(cands[best]);
+    }
+    if (better) best = i;
+  }
+  return {
+    index: best,
+    confidence: confidences[best],
+    agreement: agreements[best] > 0 ? agreements[best] : null,
+    confidences,
+  };
 }
 
 /** A coarse progress tick emitted between the heavy detection stages, so the UI
@@ -376,6 +482,7 @@ export function* detectGridFromMatSteps(
   let blurred: any = null;
   let cannyEdges: any = null;
   let morphEdges: any = null;
+  let chromaMask: any = null; // chroma-only edges, kept alive for the independent chroma fit
   // Debug-only pipeline-graph previews (populated when wantEdges). Each stage's Mat is
   // snapped while still live (they're freed before we return); the graph is assembled
   // at the end from these previews + the applied/discarded flags below.
@@ -466,8 +573,11 @@ export function* detectGridFromMatSteps(
       snap('chroma', chroma); // the colour-only edges (what chroma actually found)
       chromaExecuted = true;
       chromaContributed = cv.countNonZero(chroma) > 0; // empty on a tonal (non-hue) grid
-      cv.bitwise_or(cannyEdges, chroma, cannyEdges);
-      chroma.delete();
+      // OR into the luminance edges (recall: a faint grid split between tone and hue) AND
+      // keep the chroma-only mask alive for an INDEPENDENT chroma candidate fit below.
+      timed('edges', () => cv.bitwise_or(cannyEdges, chroma, cannyEdges));
+      if (chromaContributed) chromaMask = chroma;
+      else chroma.delete();
     }
 
     // Focus gating (off by default): the grid sits in the focal plane, so it is
@@ -545,8 +655,21 @@ export function* detectGridFromMatSteps(
     }
 
     const mainFit = result; // luminance path result (incl. oriented recovery), for the panel
+
+    // --- Chromatic candidate ------------------------------------------------
+    // An INDEPENDENT fit on the colour-only (Lab a/b) edges. A grid that differs from its
+    // background in hue but not brightness is invisible to the luminance Canny yet obvious
+    // here, so this is a genuine third opinion for the consensus — not just OR'd in for
+    // recall (that still happens too). Only when chroma actually carried edges.
+    let chromaFit: GridResult | null = null;
+    if (chromaMask) {
+      chromaFit = timed('chromaHough', () => houghToGrid(cv, chromaMask, work, scale, W0, H0, params, orient));
+      chromaMask.delete();
+      chromaMask = null;
+    }
+
     let morphFit: GridResult | null = null;
-    let agreement: number | null = null; // main↔morph agreement, computed once below
+    let agreement: number | null = null; // winner's consensus agreement, set by fuseGrids below
 
     // --- Morphological pass -------------------------------------------------
     // A second, INDEPENDENT line extractor (morphology instead of Canny) — strong where
@@ -566,7 +689,7 @@ export function* detectGridFromMatSteps(
       const primary = Math.abs(off) > 12 ? -off : 0;
       let bestDeskew = primary;
       let morphAngles = 1;
-      morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, primary));
+      morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, primary, timed));
       morphRan = true;
       let alt = timed('morphHough', () => houghToGrid(cv, morphEdges, work, scale, W0, H0, params, orient));
       if (gridStrength(alt) < MORPH_STRONG) {
@@ -588,26 +711,56 @@ export function* detectGridFromMatSteps(
         // Re-run the winning angle WITH snap so the graph shows its (deskewed) stages.
         if (bestDeskew !== primary) {
           morphEdges.delete();
-          morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, bestDeskew));
+          morphEdges = timed('morphEnhance', () => enhanceGridLines(cv, gray, snap, bestDeskew, timed));
         }
       }
       timings.morphAngles = morphAngles;
       snap('morph', morphEdges);
       morphFit = alt;
-      agreement = fitsAgree(mainFit, morphFit);
-      // Adopt the morphology when it's strictly stronger — OR, on a NOISY frame, when the
-      // luminance fit DISAGREES with a solid morph fit: the luminance lines are then likely
-      // texture, and the morphology suppresses isotropic texture, so trust it instead.
-      const distrustMain =
-        noisy &&
-        agreement != null &&
-        agreement < NOISE_AGREE_MAX &&
-        gridStrength(alt) >= NOISE_MORPH_MIN &&
-        !alt.info.degenerate;
-      if (gridStrength(alt) > gridStrength(result) || distrustMain) {
-        result = alt;
-        morphChosen = true;
-        cannyEdges.delete();
+    }
+
+    // --- Consensus fusion ---------------------------------------------------
+    // Put the independent candidates together and let them vote (see fuseGrids): where two
+    // agree they corroborate each other → the finer, complete grid wins with high confidence;
+    // a lone candidate keeps its own calibrated quality. This is the meaning of the reported
+    // confidence — a probability the winner really is a grid, not a raw line count.
+    const candidates: { id: string; label: string; r: GridResult }[] = [
+      { id: 'main', label: 'Luminanza', r: mainFit },
+    ];
+    if (chromaFit) candidates.push({ id: 'chroma', label: 'Cromatica', r: chromaFit });
+    if (morphFit) candidates.push({ id: 'morph', label: 'Morfologica', r: morphFit });
+    const fused = fuseGrids(candidates.map((c) => c.r));
+    let winnerIdx = fused.index;
+    // Noise safety net: on a texture-flooded frame a luminance fit that DISAGREES with a solid
+    // morphology fit is probably texture — prefer the (texture-robust) morphology. This is a
+    // TIE-BREAK, not a bypass: it may only swap in morphology when its fused confidence is within
+    // CONF_TIE of the leader's, so the invariant "winner = argmax of the same score" holds and the
+    // draw gate can't be handed a candidate below threshold while a stronger one existed.
+    const morphCandIdx = candidates.findIndex((c) => c.id === 'morph');
+    if (
+      noisy &&
+      candidates[winnerIdx].id === 'main' &&
+      morphCandIdx >= 0 &&
+      morphFit &&
+      !morphFit.info.degenerate &&
+      Math.min(morphFit.info.detectedA, morphFit.info.detectedB) >= NOISE_MORPH_MIN &&
+      (gridsAgree(mainFit, morphFit) ?? 0) < NOISE_AGREE_MAX &&
+      fused.confidences[morphCandIdx] >= fused.confidences[winnerIdx] - CONF_TIE
+    ) {
+      winnerIdx = morphCandIdx;
+    }
+    // Agreement reported for the ACTUAL winner (the noise override is a tie-break, not a
+    // consensus, so it carries no agreement of its own).
+    agreement = winnerIdx === fused.index ? fused.agreement : null;
+    result = candidates[winnerIdx].r;
+    morphChosen = candidates[winnerIdx].id === 'morph';
+    // The winner's fused confidence becomes the reported confidence (stamped after the debug
+    // panel captures each candidate's RAW internal confidence, below).
+    const fusedConfidence = fused.confidences[winnerIdx] ?? result.info.confidence;
+    // Free the mask that lost (keep only the winner's, for the edge preview / edgePixels).
+    if (morphEdges) {
+      if (morphChosen) {
+        cannyEdges?.delete();
         cannyEdges = null; // morphEdges is now the live mask
       } else {
         morphEdges.delete();
@@ -616,9 +769,6 @@ export function* detectGridFromMatSteps(
     }
 
     const edges = morphEdges ?? cannyEdges; // whichever mask survived
-
-    // `agreement` (main↔morph, option B) was computed in the morph pass above and is folded
-    // into the FINAL confidence below, AFTER the panel captures each fit's RAW value.
 
     yield { frac: 0.9, label: 'Ricostruzione della griglia…' };
     result.info.cannyHigh = cannyHigh;
@@ -644,13 +794,20 @@ export function* detectGridFromMatSteps(
     if (wantEdges) {
       // FIXED structural topology — every stage is drawn (even skipped ones) with its
       // in/out arrows.
+      const chromaFitRan = chromaFit != null;
+      // The Hough node of the pipeline that actually won (so the graph highlights the real path).
+      const winnerHough =
+        result === morphFit ? 'houghMorph' : result === chromaFit ? 'houghChroma' : 'houghLum';
       const topo: Record<string, string[]> = {
         foto: [],
         gray: ['foto'],
         clahe: ['gray'],
         blur: ['clahe'],
         canny: ['blur'],
+        // Chromatic branch: colour-only edges → its OWN Hough (an independent candidate). The
+        // same edges are ALSO OR'd into the luminance 'edges' for recall, hence chroma feeds both.
         chroma: ['foto'],
+        houghChroma: ['chroma'],
         edges: ['canny', 'chroma'],
         clean: ['edges'],
         oriented: ['clean'],
@@ -662,24 +819,32 @@ export function* detectGridFromMatSteps(
         mbinh: ['mridgeh'],
         mbinv: ['mridgev'],
         morph: ['mbinh', 'mbinv'],
-        overlay: ['oriented', 'morph'],
+        // Each pipeline runs its OWN Hough → raw detected lines; the final grid is the fit the
+        // consensus fusion selected.
+        houghLum: ['oriented'],
+        houghMorph: ['morph'],
+        overlay: ['houghLum', 'houghChroma', 'houghMorph'],
       };
       const label: Record<string, string> = {
         foto: 'Foto', gray: 'Grigio', clahe: 'Contrasto', blur: 'Sfocatura', canny: 'Canny',
-        chroma: 'Cromatica', edges: 'Bordi uniti', clean: 'Pulizia texture', oriented: 'Orientati',
-        mridgeh: 'Cresta H', mridgev: 'Cresta V', mbinh: 'Linee H', mbinv: 'Linee V',
-        morph: 'Morfologica', overlay: 'Griglia',
+        chroma: 'Cromatica', houghChroma: 'Hough C', edges: 'Bordi uniti', clean: 'Pulizia texture',
+        oriented: 'Orientati', mridgeh: 'Cresta H', mridgev: 'Cresta V', mbinh: 'Linee H',
+        mbinv: 'Linee V', morph: 'Morfologica', houghLum: 'Hough L', houghMorph: 'Hough M',
+        overlay: 'Griglia',
       };
       const executed: Record<string, boolean> = {
         foto: true, gray: true, clahe: true, blur: true, canny: true,
-        chroma: chromaExecuted, edges: true, clean: cleanApplied, oriented: orientedRan,
-        mridgeh: morphRan, mridgev: morphRan, mbinh: morphRan, mbinv: morphRan,
-        morph: morphRan, overlay: true,
+        chroma: chromaExecuted, houghChroma: chromaFitRan, edges: true, clean: cleanApplied,
+        oriented: orientedRan, mridgeh: morphRan, mridgev: morphRan, mbinh: morphRan, mbinv: morphRan,
+        morph: morphRan, houghLum: true, houghMorph: morphRan, overlay: true,
       };
       // The ACTUAL data path to the final grid (walk back through the input each stage
       // really used — bypassing skipped stages / non-contributing branches).
       const realInput: Record<string, string[]> = {
-        overlay: [morphChosen ? 'morph' : orientedAdopted ? 'oriented' : cleanApplied ? 'clean' : 'edges'],
+        overlay: [winnerHough],
+        houghLum: [orientedAdopted ? 'oriented' : cleanApplied ? 'clean' : 'edges'],
+        houghChroma: ['chroma'],
+        houghMorph: ['morph'],
         oriented: [cleanApplied ? 'clean' : 'edges'],
         clean: ['edges'],
         edges: chromaContributed ? ['canny', 'chroma'] : ['canny'],
@@ -712,26 +877,27 @@ export function* detectGridFromMatSteps(
         used: used.has(id),
       }));
 
-      // Per-candidate confidence (main luminance fit vs the morphological fallback).
-      const statOf = (id: string, lbl: string, r: GridResult, chosen: boolean): PipelineStat => ({
-        id,
-        label: lbl,
-        strength: gridStrength(r),
-        confidence: r.info.confidence,
-        cells: [Math.max(0, r.info.aCount - 1), Math.max(0, r.info.bCount - 1)],
-        degenerate: r.info.degenerate,
-        chosen,
-      });
-      result.debugPipelines = [statOf('main', 'Luminanza', mainFit, !morphChosen)];
-      if (morphFit) result.debugPipelines.push(statOf('morph', 'Morfologica', morphFit, morphChosen));
+      // Per-candidate confidence: each candidate's FUSED confidence (its own calibrated
+      // quality lifted by any consensus), so the panel shows the same probability the final
+      // decision used. The chosen one's chip equals the "Finale" chip.
+      result.debugPipelines = candidates.map((c, i) => ({
+        id: c.id,
+        label: c.label,
+        strength: gridStrength(c.r),
+        confidence: fused.confidences[i] ?? c.r.info.confidence,
+        cells: [Math.max(0, c.r.info.aCount - 1), Math.max(0, c.r.info.bCount - 1)],
+        degenerate: c.r.info.degenerate,
+        chosen: i === winnerIdx,
+      }));
       result.debugAgreement = agreement;
       result.debugTimings = timings;
+      result.debugRawLum = mainFit.rawLines;
+      if (chromaFit) result.debugRawChroma = chromaFit.rawLines;
+      if (morphFit) result.debugRawMorph = morphFit.rawLines;
     }
 
-    // Fold the two-method agreement into the FINAL confidence (after the panel above read
-    // each fit's RAW score). No effect when the fits aren't comparable, and confidence
-    // never gates whether a grid is drawn, so this only changes the reported number.
-    if (agreement != null) result.info.confidence = withAgreement(result.info.confidence, agreement);
+    // Stamp the FUSED confidence (after the panel above captured each candidate's value).
+    result.info.confidence = fusedConfidence;
 
     return result;
   } finally {
@@ -741,6 +907,7 @@ export function* detectGridFromMatSteps(
     if (blurred) blurred.delete();
     if (cannyEdges) cannyEdges.delete();
     if (morphEdges) morphEdges.delete();
+    if (chromaMask) chromaMask.delete();
   }
 }
 
@@ -774,7 +941,7 @@ function houghToGrid(
       }
       break;
     }
-    const raw: RawLine[] = [];
+    let raw: RawLine[] = [];
     for (let i = 0; i < linesMat.rows; i++) {
       const rho = linesMat.data32F[i * 2];
       const theta = linesMat.data32F[i * 2 + 1];
@@ -784,6 +951,26 @@ function houghToGrid(
       let thetaDeg = theta * DEG;
       thetaDeg = ((thetaDeg % 180) + 180) % 180;
       raw.push({ rho, thetaDeg });
+    }
+    // Collapse near-duplicate detections of the SAME physical line: Hough fires several
+    // adjacent (ρ,θ) cells for one thick/anti-aliased line, so the raw output is cluttered
+    // with "collapsible" lines that inflate the count and confuse the fit. HoughLines returns
+    // lines vote-descending, so a greedy non-maximum suppression keeps the strongest of each
+    // cluster and drops the rest. The window is a few working-px / ~2°, far below a grid's
+    // cell pitch, so distinct grid lines are never merged. See dedupeHoughLines.
+    raw = dedupeHoughLines(raw, Math.max(2, minDim * 0.008), HOUGH_DEDUP_DEG);
+    // Orientation gate: we're looking for a GRID, so keep only lines whose angle is near
+    // one of the two dominant orientations (from the FFT prior) — dropping diagonals, text
+    // and off-grid clutter. The tolerance is generous so the perspective fan (each family
+    // spreads as it converges to its vanishing point) survives. Safety: if the gate would
+    // discard most of the lines the prior probably doesn't match this mask, so skip it.
+    if (orientPrior) {
+      const gated = raw.filter(
+        (l) =>
+          angDist180(l.thetaDeg, orientPrior.a) <= HOUGH_ORIENT_TOL ||
+          angDist180(l.thetaDeg, orientPrior.b) <= HOUGH_ORIENT_TOL,
+      );
+      if (gated.length >= 4 && gated.length >= raw.length * 0.3) raw = gated;
     }
     let result = buildGrid(raw, scale, W0, H0, params, orientPrior);
     // Degenerate fit = a phantom SUB-PITCH: thick / wavy lines (a physical mat, a
@@ -808,6 +995,41 @@ function houghToGrid(
   }
 }
 
+/** Max angle (deg) a raw Hough line may deviate from a dominant grid orientation (FFT
+ * prior) to be kept. Generous so the perspective fan — each family spreads as it
+ * converges to its vanishing point — isn't clipped; still drops off-grid diagonals/text. */
+const HOUGH_ORIENT_TOL = 28;
+/** Angular window (deg) within which two Hough lines are treated as the SAME line for the
+ * duplicate-suppression pass. Small: distinct grid lines differ in OFFSET, not angle. */
+const HOUGH_DEDUP_DEG = 3;
+
+/**
+ * Non-maximum suppression of duplicate Hough lines. Hough fires a little cluster of adjacent
+ * (ρ,θ) cells for a single thick / anti-aliased line; those are "collapsible" duplicates that
+ * inflate the line count and can pull the lattice pitch toward the sub-line spacing. `raw`
+ * arrives vote-descending (OpenCV's order), so a greedy sweep keeps the strongest line of
+ * each cluster and drops any later line within (`dRho`, `dThetaDeg`) of one already kept.
+ *
+ * Offsets are compared with SIGN-AWARE alignment: θ∈[0,180) already fixes the normal to the
+ * upper half-plane, but a line seen at θ≈0 and its twin at θ≈180 have opposite normals, so
+ * their ρ flips sign. `cos(Δθ)<0` detects that and negates the candidate's ρ before comparing
+ * — never averaging raw ρ across the 0/180° wrap (that wrap bug shifts lines badly). Pure. */
+export function dedupeHoughLines(raw: RawLine[], dRho: number, dThetaDeg: number): RawLine[] {
+  const kept: RawLine[] = [];
+  for (const c of raw) {
+    let dup = false;
+    for (const k of kept) {
+      if (angDist180(k.thetaDeg, c.thetaDeg) > dThetaDeg) continue;
+      const rc = Math.cos((c.thetaDeg - k.thetaDeg) / DEG) < 0 ? -c.rho : c.rho; // align opposite normals
+      if (Math.abs(k.rho - rc) <= dRho) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup) kept.push(c);
+  }
+  return kept;
+}
 /** Angular half-width (deg) an edge pixel's gradient may deviate from the LOCAL
  * expected grid normal and still be kept. Vanishing-point-aware, so it can stay tight. */
 const ORIENT_TOL_DEG = 15;
@@ -965,7 +1187,16 @@ function rotateMat(cv: any, src: any, deg: number, interp: number, border: numbe
   M.delete();
   return dst;
 }
-function enhanceGridLines(cv: any, gray: any, snap?: (id: string, mat: any) => void, deskewDeg = 0): any {
+function enhanceGridLines(
+  cv: any,
+  gray: any,
+  snap?: (id: string, mat: any) => void,
+  deskewDeg = 0,
+  time?: <X>(key: string, fn: () => X) => X,
+): any {
+  // Optional per-sub-node timing (debug): wraps the ridge / line-binarisation phases so the
+  // graph's morph nodes (Cresta/Linee H·V) each get a measured time. Identity when absent.
+  const T = time ?? (<X>(_k: string, fn: () => X): X => fn());
   // Straighten a tilted grid first (BORDER_REPLICATE, so the rotated-in corners don't
   // become a hard frame edge that looks like a grid line). `src` is the caller's gray
   // when there's no deskew, or a NEW rotated Mat we own and free at the end.
@@ -1000,13 +1231,19 @@ function enhanceGridLines(cv: any, gray: any, snap?: (id: string, mat: any) => v
   const oH = new cv.Mat();
   const oV = new cv.Mat();
   const oS = new cv.Mat();
-  cv.morphologyEx(inv, oH, cv.MORPH_OPEN, hSE);
-  cv.morphologyEx(inv, oV, cv.MORPH_OPEN, vSE);
-  cv.morphologyEx(inv, oS, cv.MORPH_OPEN, sq);
   const rH = new cv.Mat();
   const rV = new cv.Mat();
-  cv.subtract(oH, oS, rH); // horizontal directional opening minus isotropic → H line ridge
-  cv.subtract(oV, oS, rV); // …and the vertical one
+  // H ridge = horizontal directional opening minus the isotropic opening (the shared square
+  // opening oS is computed here, once, and reused by the V ridge). V ridge = vertical minus oS.
+  T('mridgeh', () => {
+    cv.morphologyEx(inv, oH, cv.MORPH_OPEN, hSE);
+    cv.morphologyEx(inv, oS, cv.MORPH_OPEN, sq);
+    cv.subtract(oH, oS, rH);
+  });
+  T('mridgev', () => {
+    cv.morphologyEx(inv, oV, cv.MORPH_OPEN, vSE);
+    cv.subtract(oV, oS, rV);
+  });
   snap?.('mridgeh', rH);
   snap?.('mridgev', rV);
 
@@ -1030,8 +1267,8 @@ function enhanceGridLines(cv: any, gray: any, snap?: (id: string, mat: any) => v
     cv.morphologyEx(b, b, cv.MORPH_CLOSE, seClose);
     return b;
   };
-  const bH = binDir(rH, hSE2, hSEc);
-  const bV = binDir(rV, vSE2, vSEc);
+  const bH = T('mbinh', () => binDir(rH, hSE2, hSEc));
+  const bV = T('mbinv', () => binDir(rV, vSE2, vSEc));
   snap?.('mbinh', bH);
   snap?.('mbinv', bV);
   let mask = new cv.Mat();
@@ -1358,14 +1595,28 @@ function fftOrientations(cv: any, gray: any): { a: number; b: number } | null {
     const cy = N / 2;
     const R0 = 12;
     const Rmax = N / 2 - 4;
-    const CROSS = 3;
+    // Fix 4: earlier code ALSO skipped a ±3px band around the two frequency axes to suppress the
+    // DC / finite-image "cross" streak — but the fundamental peaks of an UNROTATED (axis-aligned)
+    // grid lie EXACTLY on those axes (a grid of vertical lines peaks on the horizontal freq axis,
+    // horizontal lines on the vertical axis), so that blanket band discarded a legitimate grid's
+    // OWN peaks and the prior went blind to axis-aligned grids. The near-DC cross is already
+    // handled without a band: the R0 disk below drops the DC neighbourhood, the Hann window kills
+    // the finite-image edge streak, and the spectral high-pass above removes the low-freq
+    // background — so no axis exclusion is applied here.
+    // RESIDUAL RISK (needs a negative-corpus browser check, not verifiable in Node): with the band
+    // gone, strong axis-aligned CLUTTER (a table/door/window edge) can leave on-axis energy that
+    // biases this orientation prior toward 0°/90° on a non-grid or diagonally-tiled photo. No new
+    // heuristic guard is added here (it would need the same validation and could itself regress);
+    // the bias is mitigated DOWNSTREAM — the reliability gate rejects a non-grid regardless of the
+    // prior (needs ≥ MIN_GRID_CELLS detected lattice lines per family AND inlier ≥ 0.5), and the
+    // prior only overrides the Hough split when it disagrees by > 15°.
     let mx = 0;
     for (let y = 0; y < N; y++) {
       for (let x = 0; x < N; x++) {
         const dx = x - cx;
         const dy = y - cy;
         const r = Math.hypot(dx, dy);
-        if (r < R0 || r > Rmax || Math.abs(dx) < CROSS || Math.abs(dy) < CROSS) continue;
+        if (r < R0 || r > Rmax) continue;
         const v = d[y * N + x];
         if (v > mx) mx = v;
       }
@@ -1378,7 +1629,7 @@ function fftOrientations(cv: any, gray: any): { a: number; b: number } | null {
         const dx = x - cx;
         const dy = y - cy;
         const r = Math.hypot(dx, dy);
-        if (r < R0 || r > Rmax || Math.abs(dx) < CROSS || Math.abs(dy) < CROSS) continue;
+        if (r < R0 || r > Rmax) continue;
         const v = d[y * N + x];
         if (v < thr) continue;
         cand.push({ v, r, ang: (((Math.atan2(dy, dx) * DEG) % 180) + 180) % 180 });
@@ -1465,7 +1716,13 @@ export function buildGrid(
       detectedA: 0,
       detectedB: 0,
       confidence: 0,
+      cellsA: 0,
+      cellsB: 0,
+      inlierA: 0,
+      inlierB: 0,
       degenerate: true, // no grid at all → treat as degenerate (offer the fallback)
+      spanA: 0,
+      spanB: 0,
     },
   };
 
@@ -1534,24 +1791,103 @@ export function buildGrid(
   // is worth extrapolating only while it still crosses the actual image frame.
   const crossesImage = (l: Line2): boolean => !!clipLineToRect(fromCentered(l), W0, H0);
   const minCell = Math.min(W0, H0) / MAX_CELLS_ACROSS;
+
+  // Grid SIZE = cells of each family across the image at the detected pitch. The image's
+  // extent along a family's normal is |cos·W| + |sin·H| (so it's rotation-robust), divided
+  // by the pitch. Feeds both the size-plausibility term of the confidence and the UI gate.
+  const cellsAcross = (angleDeg: number, spacing: number): number => {
+    if (!(spacing > 0)) return 0;
+    const a = angleDeg / DEG;
+    return (Math.abs(Math.cos(a)) * W0 + Math.abs(Math.sin(a)) * H0) / spacing;
+  };
+
+  // Fit BOTH families with ONE rectification and score the resulting pair. `degenerate`,
+  // `cellsAcross`, the sub-pitch guard and each line's backToImage all read the families in
+  // image space but assume they came from a SINGLE coherent plane — so the rectification is
+  // chosen per-PAIR, never mixed between families (a mixed H would be geometrically incoherent).
+  const fitPair = (Hm: M3) => {
+    const A = fitFamilyGrid(inA, Hm, params, crossesImage, minCell);
+    const B = fitFamilyGrid(inB, Hm, params, crossesImage, minCell);
+    // A degenerate (sub-pitch) fit has an implausibly small cell — reconstruction
+    // was already skipped for it; also drop its confidence to ~0 so the UI warns.
+    const degenerate =
+      (A.spacing > 0 && A.spacing < minCell) || (B.spacing > 0 && B.spacing < minCell);
+    const cellsA = cellsAcross(A.angleDeg, A.spacing);
+    const cellsB = cellsAcross(B.angleDeg, B.spacing);
+    // Cell squareness (ratio of the two families' pitches) feeds the confidence's soft
+    // squareness term; cellsA/cellsB stay for `info` and the fusion size tie-break.
+    // Phase 3c: under periodicPitch use the RECTIFIED-plane pitches (a.rectPitch/b.rectPitch) —
+    // image-space pitches diverge under perspective foreshortening and would wrongly penalise a
+    // valid perspective grid. This is only a SOFT, wide-tolerance signal (a projective rectify
+    // leaves a residual affine ambiguity, so the ratio isn't guaranteed ≈1) — never a hard gate.
+    const pitchA = params.periodicPitch && A.rectPitch ? A.rectPitch : A.spacing;
+    const pitchB = params.periodicPitch && B.rectPitch ? B.rectPitch : B.spacing;
+    const aspect =
+      pitchA > 0 && pitchB > 0 ? Math.max(pitchA / pitchB, pitchB / pitchA) : Infinity;
+    const confidence = gridConfidence(A.metrics, B.metrics, degenerate, aspect);
+    return { A, B, degenerate, cellsA, cellsB, confidence, minCount: Math.min(A.metrics.count, B.metrics.count) };
+  };
+
+  // Fix 1 (Symptom A — an obvious grid reads confidence 0): a marginally-wrong vanishing point
+  // makes buildRectify's H smear the rectified offsets, collapsing a family to ~2 lines and
+  // zeroing the geometric-mean confidence. Re-fit the WHOLE pair with the IDENTITY rectification
+  // too and keep the better-scoring pair. Chosen per-PAIR (not per-family) so both families
+  // always share one plane — see fitPair. A correctly-rectified perspective grid TYPICALLY keeps
+  // its H-fit (identity smears it → lower confidence); this improves the collapsed-family case
+  // but is a heuristic, not a formal guarantee — a mildly-off VP could still let a plausible-but-
+  // wrong identity lattice edge ahead, so it wants validation on the label gallery. buildRectify
+  // returns the IDENTITY3 const itself when there's no perspective, so the second fit is
+  // redundant then and skipped.
   const H = buildRectify(vA.vp, vB.vp);
-  const A = fitFamilyGrid(inA, H, params, crossesImage, minCell);
-  const B = fitFamilyGrid(inB, H, params, crossesImage, minCell);
+  let chosen: ReturnType<typeof fitPair>;
+  if (params.periodicPitch && H !== IDENTITY3) {
+    // Phase 3a: κ-gated rectify choice + 1-parameter horizon sweep. Reject a horizon that would
+    // smear the lattice (large near/far compression κ, or a sign flip = horizon inside the band);
+    // otherwise sweep the horizon outward (milder warp) and let evidence pick, with identity as a
+    // graded prior in the marginal κ band. Replaces the plain H-vs-identity choice below.
+    const inlierLines = [...inA, ...inB].map((s) => s.line);
+    const stab = rectifyStability(cross3(vA.vp, vB.vp), inlierLines, cx, cy, W0, H0);
+    const idFit = fitPair(IDENTITY3);
+    if (stab.signFlip || stab.kappa >= KAPPA_REJECT) {
+      chosen = idFit; // untrustworthy horizon → identity (HARD)
+    } else {
+      let bestH = fitPair(H);
+      for (const f of HORIZON_SWEEP) {
+        const cand = fitPair(scaleHorizon(H, f));
+        if (betterPair(cand, bestH)) bestH = cand;
+      }
+      if (stab.kappa <= KAPPA_TRUST) {
+        chosen = betterPair(bestH, idFit) ? bestH : idFit; // full trust: evidence decides
+      } else {
+        chosen = bestH.confidence - idFit.confidence > RECTIFY_MARGIN ? bestH : idFit; // graded
+      }
+    }
+  } else {
+    // Fix 1 (Phase-3 flag OFF — unchanged): fit H, and if it's a real rectification also fit identity
+    // and keep the better pair, rescuing a family a marginally-wrong VP smeared to ~2 lines.
+    chosen = fitPair(H);
+    if (H !== IDENTITY3) {
+      const withIdentity = fitPair(IDENTITY3);
+      if (betterPair(withIdentity, chosen)) chosen = withIdentity;
+    }
+  }
+  const { A, B, degenerate, cellsA, cellsB, confidence } = chosen;
 
   const familyA = A.lines.map(fromCentered);
   const familyB = B.lines.map(fromCentered);
 
-  // A degenerate (sub-pitch) fit has an implausibly small cell — reconstruction
-  // was already skipped for it; also drop its confidence to ~0 so the UI warns.
-  const degenerate =
-    (A.spacing > 0 && A.spacing < minCell) || (B.spacing > 0 && B.spacing < minCell);
-
-  return {
+  const result: GridResult = {
     width: W0,
     height: H0,
     familyA,
     familyB,
     rawLines,
+    debugFit: {
+      split: [famA.length, famB.length],
+      merged: [mA.length, mB.length],
+      vp: [inA.length, inB.length],
+      lattice: [A.metrics.count, B.metrics.count],
+    },
     info: {
       rawCount: raw.length,
       aCount: familyA.length,
@@ -1565,10 +1901,21 @@ export function buildGrid(
       edgePixels: 0,
       detectedA: detectedCount(familyA),
       detectedB: detectedCount(familyB),
-      confidence: degenerate ? 0 : gridConfidence(familyA, familyB),
+      // Calibrated grid confidence: both axes must look like a grid (geometric mean of the
+      // two families' calibrated qualities) AND be a plausible size, 0 if degenerate. NOT a
+      // raw line count. This is the per-candidate INTERNAL confidence; consensus lifts it.
+      confidence,
+      cellsA,
+      cellsB,
+      inlierA: A.metrics.inlier,
+      inlierB: B.metrics.inlier,
       degenerate,
+      spanA: A.metrics.span,
+      spanB: B.metrics.span,
     },
   };
+
+  return result;
 }
 
 /** Angular residual (deg) of a line vs "passes through the vanishing point". */
@@ -1678,10 +2025,195 @@ function buildRectify(vpA: V3, vpB: V3): M3 {
   return [1, 0, 0, 0, 1, 0, l0, l1, l2];
 }
 
+/** Phase 3a — push the rectify's horizon `f×` farther from the image centre (same VP direction,
+ * so a milder warp). `H = [1,0,0, 0,1,0, l0,l1,l2]` with `(l0,l1)` unit ⇒ `|l2|` is exactly the
+ * horizon's distance from centre, so scaling `l2` scales that distance. `f→∞` ⇒ identity. */
+function scaleHorizon(H: M3, f: number): M3 {
+  return [H[0], H[1], H[2], H[3], H[4], H[5], H[6], H[7], H[8] * f];
+}
+
+/** Phase 3a — rectification stability. For the (unit-normalized) horizon `l·P = w`, the projective
+ * weight `w` is the SIGNED distance of a point from the horizon, and the rectified offsets scale as
+ * `1/w`; so `κ = max|w| / min|w|` over the clipped endpoints of BOTH families' inlier lines is the
+ * near/far compression the rectify applies to the grid band, and a SIGN CHANGE in `w` means the
+ * horizon actually crosses the band (worst case — the rectify explodes there). A large κ or a sign
+ * flip ⇒ the horizon estimate is untrustworthy ⇒ prefer identity. Endpoints are clipped in ORIGINAL
+ * image coords (via the passed re-centring), then evaluated in centred coords where `l2` lives. */
+function rectifyStability(
+  horizon: V3,
+  inlierLines: Line2[],
+  cx: number,
+  cy: number,
+  W0: number,
+  H0: number,
+): { kappa: number; signFlip: boolean } {
+  const hn = Math.hypot(horizon[0], horizon[1]);
+  if (hn < 1e-9) return { kappa: 1, signFlip: false }; // both VPs at infinity → no warp
+  const l0 = horizon[0] / hn;
+  const l1 = horizon[1] / hn;
+  const l2 = horizon[2] / hn;
+  let wmin = Infinity;
+  let wmax = 0;
+  let sawPos = false;
+  let sawNeg = false;
+  for (const l of inlierLines) {
+    const seg = clipLineToRect({ nx: l.nx, ny: l.ny, d: l.d + l.nx * cx + l.ny * cy }, W0, H0);
+    if (!seg) continue;
+    for (const [x, y] of seg) {
+      const w = l0 * (x - cx) + l1 * (y - cy) + l2;
+      if (w > 0) sawPos = true;
+      else if (w < 0) sawNeg = true;
+      const aw = Math.abs(w);
+      if (aw < wmin) wmin = aw;
+      if (aw > wmax) wmax = aw;
+    }
+  }
+  const signFlip = sawPos && sawNeg;
+  if (!isFinite(wmin) || wmin <= 1e-9) return { kappa: Infinity, signFlip };
+  return { kappa: wmax / wmin, signFlip };
+}
+
+/** Phase 3a thresholds for the κ-gated rectify choice. κ ≤ TRUST: horizon fully trusted, evidence
+ * (betterPair) decides H-vs-identity. TRUST < κ < REJECT: graded — keep identity UNLESS H beats it
+ * by RECTIFY_MARGIN of confidence. κ ≥ REJECT or a sign flip: reject H outright, use identity. The
+ * sweep tries the estimated horizon and a couple pushed farther out (milder warp). All ratio-based,
+ * so permissive to a legitimately steep grid; the sweep still gets the last word by evidence. */
+const KAPPA_TRUST = 4;
+const KAPPA_REJECT = 12;
+const RECTIFY_MARGIN = 0.1;
+const HORIZON_SWEEP = [1.5, 2];
+
 interface FamilyGrid {
   lines: Line2[];
   angleDeg: number;
   spacing: number;
+  metrics: FamilyMetrics; // rectified-plane evidence; `familyQuality(metrics)` is the score
+  rectPitch?: number; // Phase 3c: the LS-refit pitch in RECTIFIED offset units (for squareness)
+}
+
+/** Raw per-family evidence, measured in the RECTIFIED plane (perspective removed, so a
+ * real grid is evenly spaced). These feed the calibrated `familyQuality`. */
+export interface FamilyMetrics {
+  count: number; // DETECTED (non-filled) distinct lines that sit on the fitted lattice
+  span: number; // lattice positions across the detected extent (kmax−kmin+1), gaps included
+  fill: number; // count / span — how COMPLETE the lattice is (occlusion lowers it)
+  inlier: number; // fraction of the family's raw lines that land on the lattice (regularity)
+}
+
+const EMPTY_METRICS: FamilyMetrics = { count: 0, span: 0, fill: 0, inlier: 0 };
+
+const clamp01 = (x: number): number => Math.max(0, Math.min(1, x));
+
+/**
+ * "How much does this ONE family look like a grid axis", in [0,1] — from interpretable
+ * rectified-plane evidence, NOT a raw line count. Two factors, each with a plain meaning:
+ *   • evidence — enough regularly-spaced lines. A single line is no axis (0); the score
+ *                ramps up with more detected lattice lines and SATURATES to 1 by ~7 lines
+ *                (a clean, many-line axis is unambiguous). Smooth, so an occlusion that
+ *                drops one line doesn't cliff the score.
+ *   • quality  — how good those lines are: inlier (regularity — the fraction of the family's
+ *                lines that actually sit on the lattice; the strongest single signal, texture
+ *                throws lines off-lattice) weighted above fill (completeness across the
+ *                detected extent; occlusion lowers it, so it's weighted gently).
+ * The two MULTIPLY: an axis needs both real evidence AND regular lines. A clean complete
+ * many-line axis reaches 1; a 1-line "family" is 0. Pure — unit-tested directly. */
+export function familyQuality(m: FamilyMetrics): number {
+  const evidence = clamp01((m.count - 1) / 6); // 1→0, 2→0.17, 4→0.5, 7+→1
+  const quality = 0.6 * m.inlier + 0.4 * m.fill; // regularity dominant, completeness gentle
+  return clamp01(evidence * quality);
+}
+
+/** Smallest / largest grid a real tactical map plausibly is, in CELLS per side. A 2×2 is a
+ * strong-perspective collapse; a 60×60 is a fine texture / graph paper the fit locked onto —
+ * neither is a usable battle grid. The confidence ramps to 0 outside these, and the UI gate
+ * refuses to draw outside them. (Kept here so the detector and the UI share one definition.) */
+export const MIN_GRID_CELLS = 5;
+export const MAX_GRID_CELLS = 25;
+
+/** Max ratio between the two families' cell pitches before the cell is "too rectangular" to be
+ * a tactical square-grid cell. A perfect grid has aspect ≈ 1; a mis-estimated pitch on one axis
+ * blows it up. Shared by the confidence's squareness term (soft decay) and the UI draw gate
+ * (hard reject). Kept here so detector and UI share one definition. */
+export const MAX_CELL_ASPECT = 6;
+
+/** Size-plausibility of ONE axis in [0,1]: 1 inside [MIN,MAX] cells, ramping to 0 just below
+ * MIN (a too-coarse 2–3 cell collapse) and above MAX (a too-fine texture lock). Pure. */
+export function cellCountPlausibility(cells: number): number {
+  if (cells <= 0) return 0;
+  if (cells < MIN_GRID_CELLS) return clamp01((cells - (MIN_GRID_CELLS - 2)) / 2); // 3→0, 5→1
+  if (cells > MAX_GRID_CELLS) return clamp01((MAX_GRID_CELLS * 1.4 - cells) / (MAX_GRID_CELLS * 0.4)); // 25→1, 35→0
+  return 1;
+}
+
+/** Calibrated grid confidence in [0,1] BEFORE any cross-method consensus. Interpretable and
+ * CLIFF-FREE — it degrades smoothly instead of snapping to 0, because the winner-selection and
+ * the draw gate depend on it and an obvious grid must never read exactly 0:
+ *   • pair       — a soft-AND of the two axes' qualities: the grid is MOSTLY as good as its
+ *                  WEAKER axis (0.7·min), with partial credit for the stronger (0.3·max). A
+ *                  lone strong axis is just parallel lines (low), but a strong axis + an
+ *                  occluded/foreshortened one still reads as a partial grid — it is NOT zeroed,
+ *                  matching the gate that can still rescue such a fit.
+ *   • squareness — a tactical cell is ~square; an elongated cell (aspect ≫ 1) means a
+ *                  mis-estimated pitch on one axis. Soft decay from 1 (square) to a floor by
+ *                  MAX_CELL_ASPECT — a penalty, never a hard 0.
+ *   • degenerate — a sub-pitch fit is broken geometry: a HEAVY penalty (×0.1), but not a hard
+ *                  0, so a less-broken candidate still outranks a more-broken one during fusion.
+ * NOTE: cell-count plausibility is deliberately NOT a factor here — it was zeroing real grids
+ * and contradicts the draw gate (whose cell-count limit was removed). It survives only as a
+ * fusion tie-break (see `fuseGrids`/`shapeOf`). Pure — unit-tested directly. */
+export function gridConfidence(
+  a: FamilyMetrics,
+  b: FamilyMetrics,
+  degenerate: boolean,
+  aspect = 1,
+): number {
+  const qA = familyQuality(a);
+  const qB = familyQuality(b);
+  const pair = 0.7 * Math.min(qA, qB) + 0.3 * Math.max(qA, qB);
+  const ar = aspect > 0 && isFinite(aspect) ? aspect : MAX_CELL_ASPECT;
+  const squareness = 0.25 + 0.75 * clamp01(1 - (ar - 1) / (MAX_CELL_ASPECT - 1));
+  const geom = degenerate ? 0.1 : squareness;
+  return clamp01(pair * geom);
+}
+
+/** Draw/keep an auto-detected grid when its calibrated confidence clears this bar. SINGLE SOURCE
+ * OF TRUTH for the reliability decision (the UI gate imports it). COUPLED to the `evidence` curve
+ * in `familyQuality`: at 0.40 a family needs ~4 regularly-spaced detected lines to be drawn, which
+ * also refuses the 3-line frame-tiling stumble (≈0.33). Biased low (the user wants recall) —
+ * quality is enforced by the hard guards below + the rectify/periodicity fixes, not a high bar.
+ * To draw from fewer lines, steepen `evidence`, don't just lower this. */
+export const DRAW_THRESHOLD = 0.4;
+
+/** THE reliability decision — pure and unit-testable: is this fit good enough to DRAW as the auto
+ * grid? One calibrated score above threshold, PLUS two HARD guards kept OUT of the score because
+ * no score should override them: a confirmed sub-pitch (`degenerate`) and a single-line "axis"
+ * are never a grid. Everything else (regularity, size, squareness) is already inside `confidence`.
+ * Shared by the detector and the UI gate so the chip, the winner choice and "drawn?" agree. */
+export function isGridReliable(info: GridResult['info'], threshold: number = DRAW_THRESHOLD): boolean {
+  if (info.degenerate) return false;
+  if (info.detectedA < 2 || info.detectedB < 2) return false;
+  return info.confidence >= threshold;
+}
+
+/** The two comparable quality signals of a fitted family PAIR, for the H-vs-identity
+ * rectification choice (Fix 1). `confidence` is the pair's calibrated gridConfidence;
+ * `minCount` is the detected lattice-line count of the WEAKER family. */
+export interface PairScore {
+  confidence: number;
+  minCount: number;
+}
+
+/** Choose between the two candidate rectifications (H vs identity) of a family pair (Fix 1):
+ * the fit with the higher grid confidence wins; on a near-tie the fuller grid (more detected
+ * lattice lines in the weaker family) wins. A correctly-rectified perspective grid TYPICALLY
+ * keeps its H-fit (higher confidence), so swapping to identity mainly rescues the collapsed-
+ * family case — a heuristic improvement, not a formal guarantee (a mildly-off VP could still let
+ * a plausible-but-wrong identity lattice edge ahead). Returns true if `cand` beats `cur`.
+ * Pure — unit-tested. */
+export function betterPair(cand: PairScore, cur: PairScore): boolean {
+  const dc = cand.confidence - cur.confidence;
+  if (Math.abs(dc) > 1e-6) return dc > 0;
+  return cand.minCount > cur.minCount;
 }
 
 interface LineSup {
@@ -1749,9 +2281,22 @@ const robustCell = (xs: number[]): number => {
   if (xs.length < 2) return 0;
   const gaps: number[] = [];
   for (let i = 1; i < xs.length; i++) gaps.push(xs[i] - xs[i - 1]);
-  const gm = median(gaps);
+  // Overlapping / duplicate lines (Hough NMS survivors, thick or lens-distorted lines that
+  // merge only partially) produce near-ZERO offset gaps. A raw median of ALL gaps is dragged
+  // below the true pitch by these — the [0.5·gm,1.5·gm] window then locks onto the small gaps
+  // and returns a spurious SUB-PITCH → degenerate fit → "grid not identified". Drop the
+  // duplicate gaps first, using a floor scaled from a HIGH PERCENTILE of the gaps (robust to a
+  // majority of duplicates AND to a single huge outlier gap) rather than from the pitch itself
+  // (circular). A real grid's gaps are integer multiples of the pitch, so nothing genuine sits
+  // below ~0.15× the typical spacing — the floor can only remove duplicates.
+  const sortedGaps = [...gaps].sort((a, b) => a - b);
+  const hi = sortedGaps[Math.min(sortedGaps.length - 1, Math.floor(sortedGaps.length * 0.9))];
+  const floor = 0.15 * hi;
+  const kept = floor > 0 ? gaps.filter((g) => g >= floor) : gaps;
+  const base = kept.length ? kept : gaps;
+  const gm = median(base);
   if (gm <= 0) return 0;
-  const single = gaps.filter((g) => g >= 0.5 * gm && g <= 1.5 * gm);
+  const single = base.filter((g) => g >= 0.5 * gm && g <= 1.5 * gm);
   return single.length ? median(single) : gm;
 };
 
@@ -1784,6 +2329,103 @@ function coarsenPitch(offs: number[], cell: number): number {
   return best;
 }
 
+/** Result of the Phase-3b comb: the fundamental pitch, the lattice phase, and two diagnostics. */
+export interface CombFit {
+  /** p* — the fundamental cell in rectified-offset units (the COARSEST complete pitch). */
+  pitch: number;
+  /** a* — lattice phase (anchor), in [0, pitch): the offsets sit near `a* + pitch·k`. */
+  anchor: number;
+  /** completeness of the lattice at p* — #distinct occupied slots / span in slots. Low ⇒ smear. */
+  fillRatio: number;
+  /** J(p*) / median(J) — how sharp the periodic peak is (broadband noise ≈ 1, a real grid ≫ 1). */
+  peakRatio: number;
+}
+
+/** Weight of the completeness term in the comb objective `J = |S| · fillRatio^γ`. Kept small
+ * (∈[0.5,1]) so a heavily-occluded grid — where EVERY pitch has low fill — still lets the bare
+ * comb `|S|` (which peaks at the fundamental) win, instead of over-coarsening. */
+const COMB_GAMMA = 0.7;
+
+/**
+ * Phase 3b — robust pitch + phase from a family's 1-D offsets via a fill-weighted SPARSE DFT comb,
+ * evaluated ONLY at candidate frequencies (pure JS; no OpenCV, no idft). Replaces robustCell +
+ * coarsenPitch as the sub-pitch guard.
+ *
+ * The comb `S(p) = |Σ_i exp(i·2π·o_i/p)|` is MAXIMAL at the sub-multiples p/2, p/3 (every lattice of
+ * pitch p is also a lattice of pitch p/2 with alternate slots empty) — so a bare argmax of |S| locks
+ * onto the FINEST pitch: that IS the sub-pitch bug. The cure is to weight by completeness
+ * `fillRatio(p) = (#distinct occupied slots)/((o_max−o_min)/p + 1)`, which is ≈1 at the true pitch
+ * but ≈1/2 at p/2, ≈1/3 at p/3 — so `J(p) = |S(p)|·fillRatio(p)^γ` favours the COARSEST complete
+ * pitch. The search spans [0.5·seed, 2.2·seed] so it can climb UP from a sub-pitch seed to the
+ * fundamental. Phase `φ = arg(Σ exp(i·2π·o/p*))` gives the anchor `a* = (φ/2π)·p* (mod p*)`.
+ *
+ * Pure and exported so it is unit-testable directly on arrays of offsets.
+ */
+export function combPitch(offsets: number[], seed: number): CombFit {
+  const n = offsets.length;
+  if (n < 2 || !(seed > 0)) {
+    return { pitch: seed > 0 ? seed : 0, anchor: n ? offsets[0] : 0, fillRatio: 0, peakRatio: 1 };
+  }
+  let omin = Infinity;
+  let omax = -Infinity;
+  for (const o of offsets) {
+    if (o < omin) omin = o;
+    if (o > omax) omax = o;
+  }
+  const TWO_PI = 2 * Math.PI;
+  // Objective J(p) and its parts. re/im are needed at p* to extract the phase.
+  const evalP = (p: number): { J: number; re: number; im: number; fill: number } => {
+    let re = 0;
+    let im = 0;
+    for (const o of offsets) {
+      const a = (TWO_PI * o) / p;
+      re += Math.cos(a);
+      im += Math.sin(a);
+    }
+    const S = Math.hypot(re, im);
+    const spanSlot = (omax - omin) / p + 1;
+    const slots = new Set<number>();
+    for (const o of offsets) slots.add(Math.round((o - omin) / p));
+    const fill = spanSlot > 0 ? clamp01(slots.size / spanSlot) : 0;
+    return { J: S * Math.pow(fill, COMB_GAMMA), re, im, fill };
+  };
+
+  // Sweep on frequency f = 1/p (uniform pitch RESOLUTION) across [0.5·seed, 2.2·seed].
+  const fMin = 1 / (2.2 * seed);
+  const fMax = 1 / (0.5 * seed);
+  const NF = 480;
+  let best = { J: -1, p: seed, re: 1, im: 0, fill: 0 };
+  const Js: number[] = [];
+  for (let i = 0; i <= NF; i++) {
+    const f = fMin + ((fMax - fMin) * i) / NF;
+    const p = 1 / f;
+    const e = evalP(p);
+    Js.push(e.J);
+    if (e.J > best.J) best = { J: e.J, p, re: e.re, im: e.im, fill: e.fill };
+  }
+  // Local refine: one finer linear pass in ±one coarse step around the best f, for a precise pitch.
+  const df = (fMax - fMin) / NF;
+  const fBest = 1 / best.p;
+  const NR = 40;
+  for (let i = 0; i <= NR; i++) {
+    const f = fBest - df + (2 * df * i) / NR;
+    if (f <= 0) continue;
+    const e = evalP(1 / f);
+    if (e.J > best.J) best = { J: e.J, p: 1 / f, re: e.re, im: e.im, fill: e.fill };
+  }
+
+  const phi = Math.atan2(best.im, best.re);
+  const anchorRaw = (phi / TWO_PI) * best.p;
+  const anchor = ((anchorRaw % best.p) + best.p) % best.p; // always in [0, p*)
+  const medJ = median(Js.filter((x) => x > 0));
+  const peakRatio = medJ > 0 ? best.J / medJ : 1;
+  return { pitch: best.p, anchor, fillRatio: best.fill, peakRatio };
+}
+
+/** Phase 3c — a comb fit whose lattice is emptier than this is a sub-pitch smear (too many phantom
+ * empty slots). Perspective-safe: a real grid stays near-complete (fillRatio≈1) at any perspective. */
+const FILL_DEGENERATE_MIN = 0.4;
+
 /** Conservative extension: how many cells past the detected extent 'border' may
  * add (recovers an undetected outer border; bounded by the image frame). */
 const EXTEND_BORDER_CELLS = 2;
@@ -1793,6 +2435,13 @@ const EXTEND_FRAME_CELLS = 120;
 /** Stop extrapolating when successive lines crowd to within this many px at the
  * image centre — i.e. they are piling up toward a vanishing point. */
 const EXTEND_MIN_GAP_PX = 3;
+/** Minimum DISTINCT detected lattice lines a family needs before 'frame' tiles the WHOLE frame.
+ * Kept deliberately LOW (3 = a confirmed periodic axis, not a spurious pair): the user's rule is
+ * "once a grid is IDENTIFIED it must extend to the whole screen, exactly like a manually-drawn
+ * one." Garbage is filtered upstream by the DRAW gate (isGridReliable: confidence ≥ DRAW_THRESHOLD),
+ * NOT here — a fit with too few/irregular lines never clears that gate, so tiling it is invisible.
+ * So any grid that IS drawn also tiles the frame; only the degenerate sub-pitch is still refused. */
+export const MIN_FRAME_EVIDENCE = 3;
 
 /** A real tactical grid spans at most ~this many cells across the frame. A fitted
  * cell smaller than image/this is a degenerate lattice (a spurious sub-pitch the
@@ -1819,13 +2468,13 @@ function fitFamilyGrid(
   const HT = transpose3(H);
   const backToImage = (offset: number, nx: number, ny: number, filled: boolean): Line2 =>
     ({ ...homToLine(mulM3V(HT, [nx, ny, -offset])), filled });
-  const finalize = (lines: Line2[]): FamilyGrid => {
-    if (lines.length === 0) return { lines, angleDeg: 0, spacing: 0 };
+  const finalize = (lines: Line2[], metrics: FamilyMetrics = EMPTY_METRICS): FamilyGrid => {
+    if (lines.length === 0) return { lines, angleDeg: 0, spacing: 0, metrics };
     const mid = lines[Math.floor(lines.length / 2)];
     const ds = lines.map((l) => l.d).sort((a, b) => a - b);
     const g: number[] = [];
     for (let i = 1; i < ds.length; i++) g.push(ds[i] - ds[i - 1]);
-    return { lines, angleDeg: angleOfDeg(mid.nx, mid.ny), spacing: median(g) };
+    return { lines, angleDeg: angleOfDeg(mid.nx, mid.ny), spacing: median(g), metrics };
   };
 
   // Rectify each line: rectified line = H^{-T} · line.
@@ -1849,7 +2498,16 @@ function fitFamilyGrid(
   if (cell <= 0) {
     return finalize(pts.map((p) => backToImage(p.off, meanNx, meanNy, false)));
   }
-  cell = coarsenPitch(pts.map((p) => p.off), cell);
+  // Phase 3b (periodicPitch): the fill-weighted comb replaces coarsenPitch as the sub-pitch guard —
+  // it climbs from a sub-pitch seed to the fundamental even under smear, where coarsenPitch's
+  // absolute-tolerance test fails. `robustCell` still seeds the search window. Flag OFF: unchanged.
+  let combFit: CombFit | null = null;
+  if (params.periodicPitch) {
+    combFit = combPitch(pts.map((p) => p.off), cell);
+    if (combFit.pitch > 0) cell = combFit.pitch;
+  } else {
+    cell = coarsenPitch(pts.map((p) => p.off), cell);
+  }
 
   // Drop cell-splitting duplicates: a line within half a cell of a neighbour —
   // keep the better-supported one (these are never distinct grid lines).
@@ -1863,26 +2521,40 @@ function fitFamilyGrid(
     }
   }
   pts = dedup;
-  cell = robustCell(pts.map((p) => p.off)) || cell;
-  cell = coarsenPitch(pts.map((p) => p.off), cell);
+  {
+    const seed = robustCell(pts.map((p) => p.off)) || cell;
+    if (params.periodicPitch) {
+      combFit = combPitch(pts.map((p) => p.off), seed);
+      if (combFit.pitch > 0) cell = combFit.pitch;
+    } else {
+      cell = coarsenPitch(pts.map((p) => p.off), seed);
+    }
+  }
 
   const offs = pts.map((p) => p.off);
   if (offs.length < 2 || !params.reconstruct) {
     return finalize(offs.map((o) => backToImage(o, meanNx, meanNy, false)));
   }
 
-  // Anchor phase = the offset whose lattice captures the most other lines.
-  let a = offs[0];
-  let bestC = -1;
-  for (const a0 of offs) {
-    let c = 0;
-    for (const o of offs) {
-      const k = Math.round((o - a0) / cell);
-      if (Math.abs(o - a0 - k * cell) <= 0.4 * cell) c++;
-    }
-    if (c > bestC) {
-      bestC = c;
-      a = a0;
+  // Anchor phase. Phase 3b: seed it from the comb's global phase a* (= arg Σ), already the best-fit
+  // lattice phase; the LS refit below uses GLOBAL indices, so any representative anchor is fine.
+  // Flag OFF: the original search for the offset whose lattice captures the most other lines.
+  let a: number;
+  if (params.periodicPitch && combFit) {
+    a = combFit.anchor;
+  } else {
+    a = offs[0];
+    let bestC = -1;
+    for (const a0 of offs) {
+      let c = 0;
+      for (const o of offs) {
+        const k = Math.round((o - a0) / cell);
+        if (Math.abs(o - a0 - k * cell) <= 0.4 * cell) c++;
+      }
+      if (c > bestC) {
+        bestC = c;
+        a = a0;
+      }
     }
   }
 
@@ -1931,19 +2603,37 @@ function fitFamilyGrid(
   const kmin = Math.min(...detectedIdx);
   const kmax = Math.max(...detectedIdx);
 
-  // Degeneracy guard: the MEDIAN image-space cell across the detected extent (not
-  // just at the anchor — under perspective the far cells legitimately compress, so
-  // sample across the range and take the median). If it is implausibly small
-  // (< image/MAX_CELLS_ACROSS) the fit is a spurious sub-pitch — DON'T fill or
-  // extend it (that is what balloons into hundreds of bogus lines); keep only the
-  // detected lines. The low resulting spacing also drives confidence to ~0.
+  // Raw per-family evidence in the RECTIFIED plane (perspective removed → a real grid IS
+  // evenly spaced). `count`/`span`/`fill`/`inlier` are combined into a calibrated quality
+  // by the pure `familyQuality` (see there for the weighting rationale).
+  const span = kmax - kmin + 1;
+  const keptCount = keep.reduce((n, k) => n + (k ? 1 : 0), 0);
+  const metrics: FamilyMetrics = {
+    count: detectedIdx.size,
+    span,
+    fill: span > 0 ? detectedIdx.size / span : 0,
+    inlier: offs.length ? keptCount / offs.length : 0,
+  };
+
+  // Degeneracy guard: use the LARGEST (nearest) image-space cell across the detected extent, not
+  // the median. Under perspective the FAR cells legitimately compress, so a median dips below
+  // minCell on a genuine steep grid and falsely flags it degenerate. The fit is a real sub-pitch
+  // only if even the biggest cell is implausibly small (< image/MAX_CELLS_ACROSS) — then DON'T
+  // fill/extend it (that balloons into hundreds of bogus lines); keep only the detected lines.
   const imgCellAt = (k: number): number =>
     Math.abs(backToImage(a + b * (k + 1), meanNx, meanNy, false).d - backToImage(a + b * k, meanNx, meanNy, false).d);
   const step = Math.max(1, Math.floor((kmax - kmin) / 12));
   const cellSamples: number[] = [];
   for (let k = kmin; k < kmax; k += step) cellSamples.push(imgCellAt(k));
-  const imgCell = cellSamples.length ? median(cellSamples) : imgCellAt(kmin);
-  const degenerate = imgCell > 0 && imgCell < minCell;
+  const imgCell = cellSamples.length ? Math.max(...cellSamples) : imgCellAt(kmin);
+  // Phase 3c (periodicPitch): a fit is ALSO a sub-pitch smear when the comb lattice is too empty
+  // (fillRatio < FILL_DEGENERATE_MIN) — perspective-safe, whereas the image-cell test alone can't
+  // tell a genuine steep grid from a smear. The numeric backstop (largest/nearest image cell above)
+  // is kept in both modes. Flag OFF: purely the image-cell backstop, unchanged.
+  let degenerate = imgCell > 0 && imgCell < minCell;
+  if (params.periodicPitch && combFit && combFit.fillRatio < FILL_DEGENERATE_MIN) {
+    degenerate = true;
+  }
 
   const canFill = !degenerate && params.fillGrid && kmax - kmin <= 200;
   const core: Line2[] = [];
@@ -1959,9 +2649,17 @@ function fitFamilyGrid(
   // a vanishing point; 'border' adds only a few cells (to recover an undetected
   // outer edge), 'frame' tiles the whole frame. Extended lines are flagged and
   // drawn faint, since they lie beyond any detected evidence.
+  // Once a grid is IDENTIFIED it must extend to the WHOLE screen, exactly like a manually-drawn
+  // one — so 'frame' tiles whenever the family is a confirmed periodic axis (≥ MIN_FRAME_EVIDENCE
+  // distinct detected lattice lines). The garbage filter is NOT here: it's the DRAW gate
+  // (isGridReliable, confidence ≥ DRAW_THRESHOLD) — a fit too weak to be a grid never clears it, so
+  // tiling it is never shown. Only the degenerate sub-pitch is still refused a full-frame tiling.
+  const frameEvidenceOk = detectedIdx.size >= MIN_FRAME_EVIDENCE;
   const cap =
     params.extend === 'frame'
-      ? EXTEND_FRAME_CELLS
+      ? frameEvidenceOk
+        ? EXTEND_FRAME_CELLS
+        : 0
       : params.extend === 'border'
         ? EXTEND_BORDER_CELLS
         : 0;
@@ -1989,7 +2687,9 @@ function fitFamilyGrid(
     extendFrom(kmin, -1, lo);
     lo.reverse(); // back to ascending-k order
   }
-  return finalize([...lo, ...core, ...hi]);
+  const out = finalize([...lo, ...core, ...hi], degenerate ? EMPTY_METRICS : metrics);
+  out.rectPitch = b; // Phase 3c: rectified-plane pitch, for the squareness signal in buildGrid
+  return out;
 }
 
 function median(xs: number[]): number {

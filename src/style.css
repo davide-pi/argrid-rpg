@@ -267,6 +267,11 @@ body {
   cursor: pointer;
   transition: background 0.15s, border-color 0.15s, transform 0.06s;
 }
+/* An .icon-btn sets display, which overrides the [hidden] UA rule — restore it so a
+   standalone hidden icon button (e.g. the debug-only gallery load) actually hides. */
+.icon-btn[hidden] {
+  display: none;
+}
 .icon-btn:hover {
   background: #1e2a3a;
 }
@@ -639,6 +644,14 @@ body {
 .debug-log-row.indent .debug-log-v {
   font-weight: 600;
 }
+/* Per-node breakdown of a parent stage (morphology extraction): shown but not summed. */
+.debug-log-row.breakdown {
+  padding-left: 22px;
+  opacity: 0.62;
+}
+.debug-log-row.breakdown .debug-log-v {
+  font-weight: 500;
+}
 /* Grand total. */
 .debug-log-total {
   margin-top: 5px;
@@ -659,6 +672,25 @@ body {
 }
 .debug-bar.collapsed .debug-scroll {
   display: none;
+}
+/* Collapsing hides the graph, stats and the numeric readouts (the timing log, .debug-log) —
+   only the head + rejection reason stay. */
+.debug-bar.collapsed .debug-log {
+  display: none;
+}
+
+/* "Why wasn't the grid drawn?" — the reliability gate's rejection reason (debug only). Stays
+   visible even when the bar is collapsed, since it's the key diagnostic. */
+.debug-reason {
+  margin-top: 7px;
+  padding: 6px 9px;
+  border: 1px solid rgba(248, 113, 113, 0.55);
+  border-radius: 8px;
+  background: rgba(248, 113, 113, 0.14);
+  color: #fecaca;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
 }
 
 /* --- Confidence strip: per-pipeline quality + the final decision --- */

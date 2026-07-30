@@ -1,5 +1,9 @@
 # Grid detection v2 — improvement plan (research-backed)
 
+> **SUPERSEDED by [`detection-v3-plan.md`](detection-v3-plan.md)** (2026-07-29). Kept as the historical
+> research record; v3 is the single source of truth going forward (it sharpens this: periodicity-emergent
+> ROI instead of ROI-segmentation-first, and autocorrelation-fundamental pitch instead of FFT-pitch).
+
 > Working plan to raise auto-detection accuracy. Synthesised from two web-research passes
 > (2026-07-28) plus a **user-labelled 16-photo benchmark**. The current v1 pipeline
 > (Canny → Hough → family split → VP RANSAC → lattice fit → extend) is correct on only

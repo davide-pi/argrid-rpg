@@ -7,6 +7,8 @@ import {
   clipLineToRect,
   intersect,
   DEFAULT_PARAMS,
+  DRAW_THRESHOLD,
+  isGridReliable,
   type DetectorParams,
   type GridResult,
   type Line2,
@@ -167,6 +169,11 @@ let showingResult = false; // true while a captured photo + overlay is shown
 // or the user placed a manual one. When false we simply show the photo alone — there
 // is NO automatic fallback panel; the user edits or retakes from the top-bar buttons.
 let gridReliable = false;
+// When the detector DID synthesize a grid (families present) but the reliability gate rejected
+// it, this holds a human-readable "scartata: …" reason naming the failing condition(s) and their
+// offending values — surfaced only in debug mode (status header + debug info panel). Null when a
+// grid was drawn, or when nothing was detected at all.
+let gridRejectReason: string | null = null;
 
 // Tactical state.
 let gridMap: GridMap | null = null; // grid<->image mapping for the current grid
@@ -477,14 +484,9 @@ let detecting = false;
 let detectGen = 0;
 let detectPending = false;
 
-// Max ratio between the two families' cell pitches before a fit is treated as "not a
-// grid" (one family collapsed → micro one way / macro the other).
-const MAX_CELL_ASPECT = 6;
-// A real tactical grid is at least this many cells per side. A smaller fit (e.g. the
-// 2×2 a strong-perspective floor collapses to when the vanishing point is rejected and
-// no rectification happens) is treated as unreliable → we don't draw a confidently
-// wrong grid; the (i) guidance steers the user to ✎ / ↺ instead.
-const MIN_GRID_CELLS = 5;
+// The reliability decision lives in `isGridReliable` (grid-detector.ts): confidence ≥ DRAW_THRESHOLD
+// + the hard `degenerate` / ≥2-lines guards. Cell-count, inlier, aspect are all folded into the
+// confidence there — see applyDetectedGrid.
 
 async function runDetection() {
   // One detection at a time — the pipeline is heavy and holds OpenCV Mats.
@@ -563,31 +565,34 @@ function hideProcessing() {
   processing.hidden = true;
 }
 
-// Derive gridReliable + the grid↔image map from the current detector output
-// (lastResult). "Found a grid" = both families really detected (≥ 2 lines each), the
-// drawn grid spans at least MIN_GRID_CELLS per side, and it isn't a broken fit
-// (degenerate sub-pitch, or one family collapsed → extreme cell-aspect). Used after
-// detection AND to RESTORE the auto grid when the user cancels a manual edit (cancel
-// must not lose the detected grid).
+// Derive gridReliable + the grid↔image map from the current detector output (lastResult).
+// ONE decision now: `isGridReliable` — the calibrated confidence must clear DRAW_THRESHOLD, plus
+// two HARD guards the score can't override (a confirmed sub-pitch `degenerate`, and a single-line
+// "axis"). Regularity, size and squareness are already folded into `confidence` (see
+// gridConfidence), so the old scattered gate (inlier / detected-line floors / aspect) is gone —
+// the chip, the winner choice and "drawn?" now share the same score. Used after detection AND to
+// RESTORE the auto grid when the user cancels a manual edit (cancel must not lose the grid).
 function applyDetectedGrid() {
   gridReliable = false;
   if (lastResult) {
     const i = lastResult.info;
-    const aspect =
-      i.spacingA > 0 && i.spacingB > 0
-        ? Math.max(i.spacingA / i.spacingB, i.spacingB / i.spacingA)
-        : Infinity;
-    // Cells drawn per side (lines − 1) — a strong-perspective collapse yields a tiny
-    // 2×2, which this floors out.
-    const naCells = lastResult.familyA.length - 1;
-    const nbCells = lastResult.familyB.length - 1;
-    gridReliable =
-      i.detectedA >= 2 &&
-      i.detectedB >= 2 &&
-      naCells >= MIN_GRID_CELLS &&
-      nbCells >= MIN_GRID_CELLS &&
-      !i.degenerate &&
-      aspect <= MAX_CELL_ASPECT;
+    gridReliable = isGridReliable(i, DRAW_THRESHOLD);
+    // Diagnostic: when the detector DID synthesize a grid (both families non-trivial) but the gate
+    // rejected it, spell out why so the user can SEE why an obviously-detected grid wasn't drawn
+    // (debug-gated; see reportStatus / the debug info panel).
+    gridRejectReason = null;
+    const hasLines = lastResult.familyA.length >= 2 && lastResult.familyB.length >= 2;
+    if (!gridReliable && hasLines) {
+      const reasons: string[] = [];
+      if (i.degenerate) reasons.push('degenerate (sub-pitch)');
+      if (i.detectedA < 2 || i.detectedB < 2)
+        reasons.push(`detected ${i.detectedA}×${i.detectedB}: un asse ha meno di 2 linee`);
+      if (!i.degenerate && i.detectedA >= 2 && i.detectedB >= 2 && i.confidence < DRAW_THRESHOLD)
+        reasons.push(`confidenza ${i.confidence.toFixed(2)} < ${DRAW_THRESHOLD} (soglia di disegno)`);
+      gridRejectReason = reasons.length ? 'scartata: ' + reasons.join('; ') : null;
+    }
+  } else {
+    gridRejectReason = null;
   }
   gridMap = null;
   if (gridReliable && lastResult) {
@@ -802,13 +807,19 @@ function updateManualBar() {
  * no usable grid to seed from. */
 function seedQuadFromCurrentGrid(): boolean {
   if (!lastResult) return false;
-  const A = lastResult.familyA;
-  const B = lastResult.familyB;
-  if (A.length < 2 || B.length < 2) return false;
-  const c00 = intersect(A[0], B[0]);
-  const c10 = intersect(A[A.length - 1], B[0]);
-  const c11 = intersect(A[A.length - 1], B[B.length - 1]);
-  const c01 = intersect(A[0], B[B.length - 1]);
+  const fA = lastResult.familyA;
+  const fB = lastResult.familyB;
+  if (fA.length < 2 || fB.length < 2) return false;
+  // The detector's two families aren't labelled vertical/horizontal, so map them to the
+  // manual grid's COLUMNS (vertical lines) and ROWS (horizontal lines) by orientation —
+  // a vertical line has a ~horizontal normal (|nx| > |ny|). Otherwise the seeded Colonne
+  // and Righe counts (and the quad's u/v axes) come out swapped.
+  const absNx = (f: typeof fA) => f.reduce((s, l) => s + Math.abs(l.nx), 0) / f.length;
+  const [cols, rows] = absNx(fA) >= absNx(fB) ? [fA, fB] : [fB, fA];
+  const c00 = intersect(cols[0], rows[0]);
+  const c10 = intersect(cols[cols.length - 1], rows[0]);
+  const c11 = intersect(cols[cols.length - 1], rows[rows.length - 1]);
+  const c01 = intersect(cols[0], rows[rows.length - 1]);
   if (!c00 || !c10 || !c11 || !c01) return false;
   manualQuad = [
     { x: c00.x, y: c00.y },
@@ -816,8 +827,8 @@ function seedQuadFromCurrentGrid(): boolean {
     { x: c11.x, y: c11.y },
     { x: c01.x, y: c01.y },
   ];
-  manualNa = Math.max(1, A.length - 1);
-  manualNb = Math.max(1, B.length - 1);
+  manualNa = Math.max(1, cols.length - 1); // columns (subdivide the top/bottom edge)
+  manualNb = Math.max(1, rows.length - 1); // rows
   return true;
 }
 
@@ -1277,6 +1288,12 @@ function reportStatus(dt: number) {
     setStatus(`${i.rawCount} linee grezze ma nessuna griglia — inquadra più da vicino`);
     return;
   }
+  // Debug: a grid WAS synthesized but the reliability gate rejected it → show why (the key
+  // "why wasn't it drawn?" diagnostic). Debug-gated so production users never see it.
+  if (debug && !gridReliable && gridRejectReason) {
+    setStatus(gridRejectReason);
+    return;
+  }
   // On success the top-right shows the action buttons; no grid status line in the
   // header (the debug step viewer + on-canvas labels carry the diagnostics instead).
   void dt;
@@ -1297,7 +1314,9 @@ function selectedStep() {
 function debugStepActive(): boolean {
   if (!debug || manualActive) return false;
   const s = selectedStep();
-  return !!(s && s.image && s.id !== 'overlay');
+  // The Hough nodes have no snapshot image — they're drawn live (raw lines over the photo).
+  const houghNode = s?.id === 'houghLum' || s?.id === 'houghChroma' || s?.id === 'houghMorph';
+  return !!(s && (s.image || houghNode) && s.id !== 'overlay');
 }
 
 /** Blit the selected pipeline-stage preview onto the view canvas (scaled up from the
@@ -1305,26 +1324,52 @@ function debugStepActive(): boolean {
 function drawDebugStep() {
   const r = lastResult!;
   const step = selectedStep();
-  if (!step?.image) return;
+  if (!step) return;
   view.width = r.width;
   view.height = r.height;
   const ctx = view.getContext('2d')!;
-  if (!debugStepCanvas) debugStepCanvas = document.createElement('canvas');
-  debugStepCanvas.width = step.image.width;
-  debugStepCanvas.height = step.image.height;
-  debugStepCanvas.getContext('2d')!.putImageData(step.image, 0, 0);
-  ctx.imageSmoothingEnabled = false; // show the pipeline pixels, not a blurred upscale
-  ctx.drawImage(debugStepCanvas, 0, 0, r.width, r.height);
-  ctx.imageSmoothingEnabled = true;
+  let labelText: string;
+  if (step.id === 'houghLum' || step.id === 'houghChroma' || step.id === 'houghMorph') {
+    // Raw Hough lines (before the lattice fit) over the photo — one node per pipeline, so
+    // you can compare what each Hough detected vs the fitted grid (overlay).
+    const src =
+      step.id === 'houghChroma'
+        ? { lines: r.debugRawChroma, color: 'rgba(52, 211, 153, 0.9)', name: 'Cromatica' }
+        : step.id === 'houghMorph'
+          ? { lines: r.debugRawMorph, color: 'rgba(167, 139, 250, 0.9)', name: 'Morfologica' }
+          : { lines: r.debugRawLum, color: 'rgba(34, 211, 238, 0.85)', name: 'Luminanza' };
+    const lines = src.lines ?? [];
+    ctx.drawImage(lastCapture!, 0, 0, r.width, r.height);
+    ctx.strokeStyle = src.color;
+    ctx.lineWidth = Math.max(1, r.width / 480);
+    for (const l of lines) {
+      const seg = clipLineToRect(l, r.width, r.height);
+      if (!seg) continue;
+      ctx.beginPath();
+      ctx.moveTo(seg[0][0], seg[0][1]);
+      ctx.lineTo(seg[1][0], seg[1][1]);
+      ctx.stroke();
+    }
+    labelText = `Hough ${src.name} — ${lines.length} linee`;
+  } else {
+    if (!step.image) return;
+    if (!debugStepCanvas) debugStepCanvas = document.createElement('canvas');
+    debugStepCanvas.width = step.image.width;
+    debugStepCanvas.height = step.image.height;
+    debugStepCanvas.getContext('2d')!.putImageData(step.image, 0, 0);
+    ctx.imageSmoothingEnabled = false; // show the pipeline pixels, not a blurred upscale
+    ctx.drawImage(debugStepCanvas, 0, 0, r.width, r.height);
+    ctx.imageSmoothingEnabled = true;
+    labelText = step.label + (step.used ? '' : ' — non usato');
+  }
   const fs = Math.max(16, Math.round(r.width / 40));
   ctx.font = `700 ${fs}px system-ui, sans-serif`;
-  const label = step.label + (step.used ? '' : ' — non usato');
   const pad = fs * 0.5;
   ctx.fillStyle = 'rgba(10,14,19,0.72)';
-  ctx.fillRect(pad, pad, ctx.measureText(label).width + pad * 2, fs + pad);
+  ctx.fillRect(pad, pad, ctx.measureText(labelText).width + pad * 2, fs + pad);
   ctx.fillStyle = '#eaf1fb';
   ctx.textBaseline = 'top';
-  ctx.fillText(label, pad * 2, pad * 1.5);
+  ctx.fillText(labelText, pad * 2, pad * 1.5);
 }
 
 // --- Debug pipeline graph (nodes + arrows) ------------------------------
@@ -1334,22 +1379,28 @@ function drawDebugStep() {
 // branch; rows 2/3 = the morphological fallback, itself forked into a horizontal
 // (row 2) and vertical (row 3) line extractor that rejoin into 'morph'. All lanes
 // converge back into the luminance lane at 'overlay'.
+// Chromatic branch on top (row 0), the luminance main line in the MIDDLE (row 1), the
+// morphological fork at the bottom (rows 2/3). Each pipeline ends in its own Hough node;
+// both converge into the final grid (overlay), vertically centred on the right.
 const GRAPH_LAYOUT: Record<string, [number, number]> = {
   foto: [0, 1.5],
-  gray: [1, 0],
-  clahe: [2, 0],
-  blur: [3, 0],
-  canny: [4, 0],
-  edges: [5, 0],
-  clean: [6, 0],
-  oriented: [7, 0],
-  overlay: [8, 0],
-  chroma: [1, 1],
+  chroma: [1, 0],
+  houghChroma: [8, 0],
+  gray: [1, 1],
+  clahe: [2, 1],
+  blur: [3, 1],
+  canny: [4, 1],
+  edges: [5, 1],
+  clean: [6, 1],
+  oriented: [7, 1],
+  houghLum: [8, 1],
   mridgeh: [2, 2],
   mbinh: [3, 2],
   mridgev: [2, 3],
   mbinv: [3, 3],
   morph: [4, 2.5],
+  houghMorph: [8, 2.5],
+  overlay: [9, 1.5],
 };
 const GN_W = 62;
 const GN_H = 32;
@@ -1377,11 +1428,12 @@ function rebuildDebugBar() {
   if (!show) return;
   if (!steps.some((s) => s.id === debugStepId)) debugStepId = 'overlay';
   const byId = new Map(steps.map((s) => [s.id, s]));
+  const layout = GRAPH_LAYOUT;
 
   let maxCol = 0;
   let maxRow = 0;
   for (const s of steps) {
-    const p = GRAPH_LAYOUT[s.id];
+    const p = layout[s.id];
     if (!p) continue;
     maxCol = Math.max(maxCol, p[0]);
     maxRow = Math.max(maxRow, p[1]);
@@ -1426,22 +1478,33 @@ function rebuildDebugBar() {
   head.appendChild(actions);
   debugBar.appendChild(head);
 
+  const pct = (c: number) => Math.round(c * 100);
+  const chip = (cls: string, name: string, conf: number) => {
+    const el = document.createElement('div');
+    el.className = 'pstat ' + cls;
+    el.innerHTML =
+      `<span class="pstat-top"><span class="pstat-name">${name}</span>` +
+      `<span class="pstat-val">${pct(conf)}%</span></span>` +
+      `<span class="pstat-bar"><span class="pstat-fill" style="width:${pct(conf)}%"></span></span>`;
+    return el;
+  };
+
+  // "Why wasn't the grid drawn?" — the detector synthesized a grid but the gate rejected it.
+  // Stays visible even when collapsed since it's the key diagnostic. Null when a grid was
+  // drawn / nothing was detected.
+  if (!gridReliable && gridRejectReason) {
+    const banner = document.createElement('div');
+    banner.className = 'debug-reason';
+    banner.textContent = gridRejectReason;
+    debugBar.appendChild(banner);
+  }
+
   // Confidence strip: each independent fit's quality + the final decision. Sits under
   // the head; hidden when the bar is collapsed (like the graph).
   const pipes = lastResult?.debugPipelines ?? [];
   if (pipes.length) {
-    const pct = (c: number) => Math.round(c * 100);
     const stats = document.createElement('div');
     stats.className = 'debug-stats';
-    const chip = (cls: string, name: string, conf: number) => {
-      const el = document.createElement('div');
-      el.className = 'pstat ' + cls;
-      el.innerHTML =
-        `<span class="pstat-top"><span class="pstat-name">${name}</span>` +
-        `<span class="pstat-val">${pct(conf)}%</span></span>` +
-        `<span class="pstat-bar"><span class="pstat-fill" style="width:${pct(conf)}%"></span></span>`;
-      return el;
-    };
     for (const p of pipes) stats.appendChild(chip(p.chosen ? 'chosen' : '', p.label, p.confidence));
     // Option B: how much the two independent fits agree (a cross-check, not a fit's own
     // quality) — shown only when comparable. Styled dashed to read as a meta-metric.
@@ -1483,12 +1546,12 @@ function rebuildDebugBar() {
     );
   };
   for (const s of steps) {
-    const p = GRAPH_LAYOUT[s.id];
+    const p = layout[s.id];
     if (!p) continue;
     const tx = gnX(p[0]);
     const ty = gnY(p[1]) + GN_H / 2;
     for (const inId of s.inputs) {
-      const ip = GRAPH_LAYOUT[inId];
+      const ip = layout[inId];
       if (!ip) continue;
       const inp = byId.get(inId);
       const sx = gnX(ip[0]) + GN_W;
@@ -1505,7 +1568,7 @@ function rebuildDebugBar() {
 
   // Nodes.
   for (const s of steps) {
-    const p = GRAPH_LAYOUT[s.id];
+    const p = layout[s.id];
     if (!p) continue;
     const b = document.createElement('button');
     b.type = 'button';
@@ -1515,7 +1578,9 @@ function rebuildDebugBar() {
       'debug-node' +
       (s.id === debugStepId ? ' on' : '') +
       (!s.executed ? ' off' : s.used ? ' used' : '') +
-      (s.image ? '' : ' no-img');
+      (s.image || s.id === 'houghLum' || s.id === 'houghChroma' || s.id === 'houghMorph'
+        ? ''
+        : ' no-img'); // hough drawn live
     b.style.left = gnX(p[0]) + 'px';
     b.style.top = gnY(p[1]) + 'px';
     b.textContent = s.label;
@@ -1531,43 +1596,63 @@ function rebuildDebugBar() {
   scroll.appendChild(graph);
   debugBar.appendChild(scroll);
 
-  // Timing log (toggled by the scroll-text button): compute time per stage, grouped by
-  // pipeline (shared prep → luminance → morphology) with a per-group subtotal + grand total.
+  // Timing log (toggled by the scroll-text button): ONE row per pipeline NODE, grouped by
+  // pipeline (luminance / chroma / morphology) with a per-group subtotal + grand total. Rows
+  // flagged `breakdown` are a per-node decomposition of the row above them (the morphology's
+  // extraction), so they're shown but NOT summed into the totals (they'd double-count).
   const timings = lastResult?.debugTimings;
   if (debugLogOpen && timings && !debugCollapsed) {
     const ms = (v: number) => `${Math.round(v)} ms`;
-    const groups: { title: string; items: [string, string][] }[] = [
+    type Row = { key: string; label: string; breakdown?: boolean };
+    const groups: { title: string; items: Row[] }[] = [
       {
-        title: 'Preparazione',
+        title: 'Luminanza',
         items: [
-          ['gray', 'Grigio'],
-          ['clahe', 'Contrasto'],
-          ['blur', 'Sfocatura'],
-          ['canny', 'Canny'],
-          ['chroma', 'Cromatica'],
-          ['clean', 'Pulizia texture'],
-          ['fft', 'Prior FFT'],
+          { key: 'gray', label: 'Grigio' },
+          { key: 'clahe', label: 'Contrasto' },
+          { key: 'blur', label: 'Sfocatura' },
+          { key: 'canny', label: 'Canny' },
+          { key: 'edges', label: 'Bordi uniti' },
+          { key: 'clean', label: 'Pulizia texture' },
+          { key: 'fft', label: 'Prior FFT' },
+          { key: 'oriented', label: 'Orientati' },
+          { key: 'houghMain', label: 'Hough' },
         ],
       },
-      { title: 'Luminanza', items: [['houghMain', 'Hough'], ['oriented', 'Orientati']] },
-      { title: 'Morfologia', items: [['morphEnhance', 'Estrazione'], ['morphHough', 'Hough']] },
+      // Chroma is its own independent candidate (edge extraction + its own Hough).
+      { title: 'Cromatica', items: [{ key: 'chroma', label: 'Estrazione' }, { key: 'chromaHough', label: 'Hough' }] },
+      {
+        title: 'Morfologia',
+        items: [
+          { key: 'mridgeh', label: 'Cresta H', breakdown: true },
+          { key: 'mridgev', label: 'Cresta V', breakdown: true },
+          { key: 'mbinh', label: 'Linee H', breakdown: true },
+          { key: 'mbinv', label: 'Linee V', breakdown: true },
+          { key: 'morphEnhance', label: 'Estrazione (tot.)' },
+          { key: 'morphHough', label: 'Hough' },
+        ],
+      },
     ];
     let html = '';
     let total = 0;
     for (const g of groups) {
-      const present = g.items.filter(([k]) => timings[k] != null);
-      if (!present.length && !(g.title === 'Morfologia' && timings.morphAngles != null)) continue;
-      const sub = present.reduce((s, [k]) => s + (timings[k] ?? 0), 0);
+      const present = g.items.filter((r) => timings[r.key] != null);
+      const hasAngles = g.title === 'Morfologia' && timings.morphAngles != null;
+      if (!present.length && !hasAngles) continue;
+      // Subtotal / total exclude the breakdown rows (they decompose 'Estrazione (tot.)').
+      const sub = present.reduce((s, r) => s + (r.breakdown ? 0 : timings[r.key] ?? 0), 0);
       total += sub;
       html +=
         `<div class="debug-log-row debug-log-group"><span class="debug-log-k">${g.title}</span>` +
         `<span class="debug-log-v">${ms(sub)}</span></div>`;
-      for (const [k, label] of present) {
-        html += `<div class="debug-log-row indent"><span class="debug-log-k">${label}</span><span class="debug-log-v">${ms(timings[k])}</span></div>`;
+      for (const r of present) {
+        html +=
+          `<div class="debug-log-row indent${r.breakdown ? ' breakdown' : ''}">` +
+          `<span class="debug-log-k">${r.breakdown ? '· ' : ''}${r.label}</span>` +
+          `<span class="debug-log-v">${ms(timings[r.key])}</span></div>`;
       }
-      if (g.title === 'Morfologia' && timings.morphAngles != null) {
-        const n = timings.morphAngles;
-        html += `<div class="debug-log-row indent"><span class="debug-log-k">Angoli provati</span><span class="debug-log-v">${n}</span></div>`;
+      if (hasAngles) {
+        html += `<div class="debug-log-row indent"><span class="debug-log-k">Angoli provati</span><span class="debug-log-v">${timings.morphAngles}</span></div>`;
       }
     }
     html += `<div class="debug-log-row debug-log-total"><span class="debug-log-k">Totale misurato</span><span class="debug-log-v">${ms(total)}</span></div>`;

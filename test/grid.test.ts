@@ -170,8 +170,8 @@ test('reconstructs the lattice, rejecting off-lattice lines at the grid angle', 
 });
 
 test('frame extension tiles the grid beyond the detected extent', () => {
-  // A small centred grid: 'frame' must continue the lattice out to the image edges.
-  const raw = syntheticGrid({ W: 1000, H: 1000, s: 80, n: 6, rotDeg: 0 });
+  // An identified grid must continue the lattice out to the image edges (extend like a manual one).
+  const raw = syntheticGrid({ W: 1000, H: 1000, s: 100, n: 8, rotDeg: 0 });
   const off = buildGrid(raw, 1, 1000, 1000, { ...DEFAULT_PARAMS, extend: 'off' });
   const frame = buildGrid(raw, 1, 1000, 1000, { ...DEFAULT_PARAMS, extend: 'frame' });
 
@@ -188,16 +188,35 @@ test('frame extension tiles the grid beyond the detected extent', () => {
   for (const l of frame.familyA) {
     assert.ok(clipLineToRect(l, 1000, 1000), 'every family-A line crosses the frame');
   }
-  assert.ok(Math.abs(frame.info.spacingA - 80) < 1.5, `pitch preserved, got ${frame.info.spacingA}`);
+  assert.ok(Math.abs(frame.info.spacingA - 100) < 1.5, `pitch preserved, got ${frame.info.spacingA}`);
+});
+
+const framedExtended = (raw: RawLine[], W = 1000, H = 1000) => {
+  const frame = buildGrid(raw, 1, W, H, { ...DEFAULT_PARAMS, extend: 'frame' });
+  return frame.familyA.filter((l) => l.extended).length + frame.familyB.filter((l) => l.extended).length;
+};
+
+test('frame extension: a pure 2-line family is NOT tiled', () => {
+  // Two spurious parallel edges (a table edge + a book edge) are not a confirmed periodic axis
+  // (< MIN_FRAME_EVIDENCE), so they can't balloon into a full-frame fake grid.
+  const raw = syntheticGrid({ W: 1000, H: 1000, s: 80, n: 2, rotDeg: 0 });
+  assert.equal(framedExtended(raw), 0, 'a 2-line family is not frame-tiled');
+});
+
+test('frame extension: a small identified grid still tiles the WHOLE frame (extend like manual)', () => {
+  // Even a modest, low-coverage grid (6 lines spanning ~25% of the frame) is IDENTIFIED, so it must
+  // extend to the whole screen — extension is tied to identification, not to how much it covers.
+  const raw = syntheticGrid({ W: 1000, H: 1000, s: 50, n: 6, rotDeg: 0 });
+  assert.ok(framedExtended(raw) > 0, 'an identified grid tiles the frame regardless of coverage');
 });
 
 test('border extension adds only a couple of cells per side', () => {
-  // Plenty of margin around the grid, so extension is bounded by the cell cap,
-  // not the frame — 'border' must add at most ~2 per side, far fewer than 'frame'.
-  const raw = syntheticGrid({ W: 2000, H: 2000, s: 80, n: 6, rotDeg: 0 });
-  const off = buildGrid(raw, 1, 2000, 2000, { ...DEFAULT_PARAMS, extend: 'off' });
-  const border = buildGrid(raw, 1, 2000, 2000, { ...DEFAULT_PARAMS, extend: 'border' });
-  const frame = buildGrid(raw, 1, 2000, 2000, { ...DEFAULT_PARAMS, extend: 'frame' });
+  // A grid that spans most of the frame (so 'frame' tiling passes the coverage gate) but still
+  // leaves a few cells of margin: 'border' must add at most ~2 per side, fewer than 'frame'.
+  const raw = syntheticGrid({ W: 1000, H: 1000, s: 50, n: 15, rotDeg: 0 });
+  const off = buildGrid(raw, 1, 1000, 1000, { ...DEFAULT_PARAMS, extend: 'off' });
+  const border = buildGrid(raw, 1, 1000, 1000, { ...DEFAULT_PARAMS, extend: 'border' });
+  const frame = buildGrid(raw, 1, 1000, 1000, { ...DEFAULT_PARAMS, extend: 'frame' });
 
   const addedA = border.familyA.length - off.familyA.length;
   assert.ok(addedA > 0, 'border extends the grid');

@@ -599,7 +599,8 @@ body {
 .debug-bar.collapsed .debug-collapse .chev {
   transform: rotate(-90deg);
 }
-/* Timing log (scroll-text button) — where the pipeline spent its time. */
+/* Timing log (scroll-text button) — where the pipeline spent its time. It REPLACES the graph +
+   confidence strip (view selector), so it may be long → cap the height and scroll it vertically. */
 .debug-log {
   margin-top: 7px;
   padding: 7px 9px;
@@ -607,6 +608,10 @@ body {
   border-radius: 8px;
   background: var(--panel-2);
   font-variant-numeric: tabular-nums;
+  max-height: 68dvh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
 }
 .debug-log-row {
   display: flex;
@@ -691,6 +696,31 @@ body {
   font-size: 11px;
   font-weight: 600;
   line-height: 1.5;
+}
+
+/* --- Experimental-flag toggle chips (debug panel) ------------------- */
+.dbg-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 7px;
+}
+.dbg-flag {
+  appearance: none;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+.dbg-flag.on {
+  border-color: rgba(251, 191, 36, 0.9);
+  background: rgba(251, 191, 36, 0.16);
+  color: #fbbf24;
 }
 
 /* --- Confidence strip: per-pipeline quality + the final decision --- */
@@ -1171,11 +1201,17 @@ body {
 }
 
 /* --- Build version badge (overlaid, bottom-left) -------------------- */
-.version-badge {
+.version-row {
   position: absolute;
   left: 10px;
   bottom: calc(7px + env(safe-area-inset-bottom));
   z-index: 14;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  pointer-events: none;
+}
+.version-badge {
   padding: 2px 6px;
   border-radius: 6px;
   font-size: 11px;
@@ -1185,10 +1221,23 @@ body {
   color: rgba(226, 236, 247, 0.62);
   background: rgba(10, 14, 19, 0.42);
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
-  pointer-events: none;
   user-select: none;
 }
 .version-badge:empty {
+  display: none;
+}
+/* Debug indicator — a small amber chip next to the version, shown only in debug mode. */
+.dbg-badge {
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  color: #0a0e13;
+  background: rgba(251, 191, 36, 0.92);
+  user-select: none;
+}
+.dbg-badge[hidden] {
   display: none;
 }
 

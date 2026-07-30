@@ -109,6 +109,17 @@ const debugBar = $<HTMLDivElement>('debugBar');
 let debugStepId = 'overlay';
 let debugCollapsed = false;
 let debugLogOpen = false; // the timing log panel (scroll-text button) is showing
+// EXPERIMENTAL detector flags (default OFF): overrides merged into currentParams(), toggled from the
+// debug panel's flag row (tap = flip + re-detect) or the console (`__argrid.setFlags({...})`). Lets us
+// measure a flag on real captures without a rebuild. Empty ⇒ pure DEFAULT_PARAMS.
+const flagOverrides: Partial<DetectorParams> = {};
+const DEBUG_FLAGS: { key: keyof DetectorParams; label: string }[] = [
+  { key: 'morphCloseFirst', label: 'Close1°' },
+  { key: 'ridgeLocalThresh', label: 'CrestaLoc' },
+  { key: 'profilePitch', label: 'Profilo' },
+  { key: 'cornerVerify', label: 'Corner' },
+  { key: 'lineSupport', label: 'Supporto' },
+];
 // Floating "add" speed-dial.
 const fabWrap = $<HTMLDivElement>('fabWrap');
 const fab = $<HTMLButtonElement>('fab');
@@ -140,6 +151,8 @@ const brand = $<HTMLElement>('brand');
 // Build version (injected by Vite — GitVersion in CI), shown small on the map.
 const versionBadge = $<HTMLSpanElement>('versionBadge');
 versionBadge.textContent = `v${__APP_VERSION__}`;
+// Debug indicator chip (next to the version); shown only while debug mode is on.
+const dbgBadge = $<HTMLSpanElement>('dbgBadge');
 // Per-piece editor (Taglia / Movimento), shown when a token is selected.
 const pieceSize = $<HTMLSelectElement>('pieceSize');
 const pieceMove = $<HTMLSelectElement>('pieceMove');
@@ -342,8 +355,9 @@ function removeActiveArea() {
 function currentParams(): DetectorParams {
   // Reconstruct the full 2-D lattice and rebuild every row/column (occluded ones
   // included) — with the vanishing-point + rectification model these are
-  // reliable, so the complete grid is shown.
-  return { ...DEFAULT_PARAMS, fillGrid: true };
+  // reliable, so the complete grid is shown. `flagOverrides` layers any experimental
+  // flags toggled in the debug panel / console on top (empty in normal use).
+  return { ...DEFAULT_PARAMS, fillGrid: true, ...flagOverrides };
 }
 
 const mb = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1);
@@ -395,6 +409,14 @@ function boot() {
           effectiveAngle: () => effectiveAngle(),
           // Current detection state, for test assertions.
           state: () => ({ gridReliable, gridDims: { ...gridDims }, showingResult }),
+          // Experimental-flag overrides (same store the debug panel's chips use): read the
+          // current overrides, or set some and re-detect on the last capture.
+          flags: () => ({ ...flagOverrides }),
+          setFlags: (o: Partial<DetectorParams>) => {
+            Object.assign(flagOverrides, o);
+            if (lastCapture) runDetection();
+            return { ...flagOverrides };
+          },
         };
       }
       btnCapture.disabled = false;
@@ -1478,6 +1500,29 @@ function rebuildDebugBar() {
   head.appendChild(actions);
   debugBar.appendChild(head);
 
+  // Experimental-flag toggles: one tappable chip per flag (on = amber). Tapping flips the
+  // override and re-runs detection on the current capture, so a flag can be measured live.
+  // Shown in both views, hidden when collapsed. Needs a capture to re-detect against.
+  if (!debugCollapsed) {
+    const flags = document.createElement('div');
+    flags.className = 'dbg-flags';
+    for (const f of DEBUG_FLAGS) {
+      const on = flagOverrides[f.key] ?? DEFAULT_PARAMS[f.key];
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'dbg-flag' + (on ? ' on' : '');
+      b.textContent = f.label;
+      b.title = `${String(f.key)} = ${on ? 'on' : 'off'} — tocca per invertire e ri-analizzare`;
+      b.addEventListener('click', () => {
+        (flagOverrides as Record<string, boolean>)[f.key] = !on;
+        if (lastCapture) runDetection();
+        else rebuildDebugBar();
+      });
+      flags.appendChild(b);
+    }
+    debugBar.appendChild(flags);
+  }
+
   const pct = (c: number) => Math.round(c * 100);
   const chip = (cls: string, name: string, conf: number) => {
     const el = document.createElement('div');
@@ -1499,10 +1544,13 @@ function rebuildDebugBar() {
     debugBar.appendChild(banner);
   }
 
+  // View selector: the timing-log button switches the body between GRAPH view (pipeline graph +
+  // confidence strip, log OFF) and LOG view (the timing log, log ON) — never both at once. The
+  // header + rejection banner stay in either view.
   // Confidence strip: each independent fit's quality + the final decision. Sits under
-  // the head; hidden when the bar is collapsed (like the graph).
+  // the head; hidden when the bar is collapsed (like the graph) or in the log view.
   const pipes = lastResult?.debugPipelines ?? [];
-  if (pipes.length) {
+  if (pipes.length && !debugLogOpen) {
     const stats = document.createElement('div');
     stats.className = 'debug-stats';
     for (const p of pipes) stats.appendChild(chip(p.chosen ? 'chosen' : '', p.label, p.confidence));
@@ -1516,7 +1564,8 @@ function rebuildDebugBar() {
     debugBar.appendChild(stats);
   }
 
-  // Scrollable graph body.
+  // Scrollable graph body — GRAPH view only (log OFF). The LOG view below replaces it.
+  if (!debugLogOpen) {
   const scroll = document.createElement('div');
   scroll.className = 'debug-scroll';
   const graph = document.createElement('div');
@@ -1595,8 +1644,9 @@ function rebuildDebugBar() {
 
   scroll.appendChild(graph);
   debugBar.appendChild(scroll);
+  } // end GRAPH view (!debugLogOpen)
 
-  // Timing log (toggled by the scroll-text button): ONE row per pipeline NODE, grouped by
+  // Timing log (toggled by the scroll-text button) — the LOG view. ONE row per pipeline NODE, grouped by
   // pipeline (luminance / chroma / morphology) with a per-group subtotal + grand total. Rows
   // flagged `breakdown` are a per-node decomposition of the row above them (the morphology's
   // extraction), so they're shown but NOT summed into the totals (they'd double-count).
@@ -2971,7 +3021,7 @@ brand.addEventListener('click', () => {
     brandTaps = [];
     debug = !debug;
     btnLoadImage.hidden = !debug; // the gallery-load button is a debug affordance
-    setStatus(debug ? 'Debug attivo' : 'Debug disattivato');
+    dbgBadge.hidden = !debug; // DBG chip next to the version replaces the old status text
     if (debug && lastCapture && !lastResult?.debugSteps) {
       runDetection(); // first enable on a result computed without diagnostics — build them
     } else {

@@ -252,8 +252,12 @@
           </button>
         </div>
 
-        <!-- Build version (computed by GitVersion in CI), overlaid bottom-left. -->
-        <span id="versionBadge" class="version-badge" aria-hidden="true"></span>
+        <!-- Build version (GitVersion in CI) + debug indicator, overlaid bottom-left. The
+             DBG chip shows only while debug mode is on (triple-tap the logo). -->
+        <div class="version-row">
+          <span id="versionBadge" class="version-badge" aria-hidden="true"></span>
+          <span id="dbgBadge" class="dbg-badge" aria-hidden="true" hidden>DBG</span>
+        </div>
       </main>
     </div>
 

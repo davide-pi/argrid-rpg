@@ -56,13 +56,6 @@ export interface DetectorParams {
    * map (a high-frequency sand/dirt texture leaves many tiny fragments; grid lines are
    * long). Orientation-agnostic length filter — see dropShortComponents. */
   edgeClean: boolean;
-  /** A/B flag for the "Phase 3" periodic-pitch cure (OFF by default → behaviour is byte-for-byte
-   * the pre-Phase-3 path). When ON it swaps in three surgical, jointly-inseparable changes, all
-   * in the RECTIFIED plane: (3a) a κ = wmax/wmin horizon-stability gate + 1-parameter horizon
-   * sweep that rejects a smearing rectification; (3b) a fill-weighted sparse-DFT comb (see
-   * combPitch) that replaces robustCell+coarsenPitch and climbs out of a sub-pitch seed; and
-   * (3c) a perspective-safe degeneracy test (comb fillRatio) + rectified-pitch squareness. */
-  periodicPitch: boolean;
 }
 
 export const DEFAULT_PARAMS: DetectorParams = {
@@ -77,7 +70,6 @@ export const DEFAULT_PARAMS: DetectorParams = {
   fftPrior: true,
   orientGate: true,
   edgeClean: true,
-  periodicPitch: false,
 };
 
 /** A line as normal form: nx*x + ny*y = d, with (nx,ny) a unit vector. */
@@ -135,8 +127,6 @@ export interface GridResult {
   // lines survive raw→angle-split→duplicate-merge→VP-concurrency→regular-lattice. Pinpoints
   // WHERE an obvious grid's lines are being discarded.
   debugFit?: { split: [number, number]; merged: [number, number]; vp: [number, number]; lattice: [number, number] };
-  // Fase C1 diagnostics: the periodicity-fallback's quality on this frame (for calibration).
-  debugPeriodic?: { peakRatio: number; fillRatio: number; pitchA: number; pitchB: number; nA: number; nB: number } | null;
   info: {
     rawCount: number;
     aCount: number;
@@ -761,25 +751,6 @@ export function* detectGridFromMatSteps(
     }
 
     const edges = morphEdges ?? cannyEdges; // whichever mask survived
-
-    // Fase C1 (EXPERIMENTAL, NOT wired into the decision): the periodicity-fallback quality.
-    // Measured on the corpus and found INSUFFICIENT — on texture-buried grids the edge-density
-    // profile is dominated by texture, so `combPitch` locks onto a fine sub-pitch and `peakRatio`
-    // does NOT separate real grids from texture. Kept dormant behind `wantEdges` (debug only, zero
-    // production cost) for future iteration; see periodicExtract's header.
-    if (wantEdges) {
-      const periodic = periodicExtract(edges, orient, scale);
-      result.debugPeriodic = periodic
-        ? {
-            peakRatio: +periodic.peakRatio.toFixed(2),
-            fillRatio: +periodic.fillRatio.toFixed(2),
-            pitchA: Math.round(periodic.pitchA),
-            pitchB: Math.round(periodic.pitchB),
-            nA: periodic.nA,
-            nB: periodic.nB,
-          }
-        : null;
-    }
 
     yield { frac: 0.9, label: 'Ricostruzione della griglia…' };
     result.info.cannyHigh = cannyHigh;
@@ -1837,12 +1808,8 @@ export function buildGrid(
     const cellsB = cellsAcross(B.angleDeg, B.spacing);
     // Cell squareness (ratio of the two families' pitches) feeds the confidence's soft
     // squareness term; cellsA/cellsB stay for `info` and the fusion size tie-break.
-    // Phase 3c: under periodicPitch use the RECTIFIED-plane pitches (a.rectPitch/b.rectPitch) —
-    // image-space pitches diverge under perspective foreshortening and would wrongly penalise a
-    // valid perspective grid. This is only a SOFT, wide-tolerance signal (a projective rectify
-    // leaves a residual affine ambiguity, so the ratio isn't guaranteed ≈1) — never a hard gate.
-    const pitchA = params.periodicPitch && A.rectPitch ? A.rectPitch : A.spacing;
-    const pitchB = params.periodicPitch && B.rectPitch ? B.rectPitch : B.spacing;
+    const pitchA = A.spacing;
+    const pitchB = B.spacing;
     const aspect =
       pitchA > 0 && pitchB > 0 ? Math.max(pitchA / pitchB, pitchB / pitchA) : Infinity;
     const confidence = gridConfidence(A.metrics, B.metrics, degenerate, aspect);
@@ -1860,37 +1827,12 @@ export function buildGrid(
   // returns the IDENTITY3 const itself when there's no perspective, so the second fit is
   // redundant then and skipped.
   const H = buildRectify(vA.vp, vB.vp);
-  let chosen: ReturnType<typeof fitPair>;
-  if (params.periodicPitch && H !== IDENTITY3) {
-    // Phase 3a: κ-gated rectify choice + 1-parameter horizon sweep. Reject a horizon that would
-    // smear the lattice (large near/far compression κ, or a sign flip = horizon inside the band);
-    // otherwise sweep the horizon outward (milder warp) and let evidence pick, with identity as a
-    // graded prior in the marginal κ band. Replaces the plain H-vs-identity choice below.
-    const inlierLines = [...inA, ...inB].map((s) => s.line);
-    const stab = rectifyStability(cross3(vA.vp, vB.vp), inlierLines, cx, cy, W0, H0);
-    const idFit = fitPair(IDENTITY3);
-    if (stab.signFlip || stab.kappa >= KAPPA_REJECT) {
-      chosen = idFit; // untrustworthy horizon → identity (HARD)
-    } else {
-      let bestH = fitPair(H);
-      for (const f of HORIZON_SWEEP) {
-        const cand = fitPair(scaleHorizon(H, f));
-        if (betterPair(cand, bestH)) bestH = cand;
-      }
-      if (stab.kappa <= KAPPA_TRUST) {
-        chosen = betterPair(bestH, idFit) ? bestH : idFit; // full trust: evidence decides
-      } else {
-        chosen = bestH.confidence - idFit.confidence > RECTIFY_MARGIN ? bestH : idFit; // graded
-      }
-    }
-  } else {
-    // Fix 1 (Phase-3 flag OFF — unchanged): fit H, and if it's a real rectification also fit identity
-    // and keep the better pair, rescuing a family a marginally-wrong VP smeared to ~2 lines.
-    chosen = fitPair(H);
-    if (H !== IDENTITY3) {
-      const withIdentity = fitPair(IDENTITY3);
-      if (betterPair(withIdentity, chosen)) chosen = withIdentity;
-    }
+  // Fit H, and if it's a real rectification also fit identity and keep the better pair,
+  // rescuing a family a marginally-wrong VP smeared to ~2 lines.
+  let chosen = fitPair(H);
+  if (H !== IDENTITY3) {
+    const withIdentity = fitPair(IDENTITY3);
+    if (betterPair(withIdentity, chosen)) chosen = withIdentity;
   }
   const { A, B, degenerate, cellsA, cellsB, confidence } = chosen;
 
@@ -2046,70 +1988,11 @@ function buildRectify(vpA: V3, vpB: V3): M3 {
   return [1, 0, 0, 0, 1, 0, l0, l1, l2];
 }
 
-/** Phase 3a — push the rectify's horizon `f×` farther from the image centre (same VP direction,
- * so a milder warp). `H = [1,0,0, 0,1,0, l0,l1,l2]` with `(l0,l1)` unit ⇒ `|l2|` is exactly the
- * horizon's distance from centre, so scaling `l2` scales that distance. `f→∞` ⇒ identity. */
-function scaleHorizon(H: M3, f: number): M3 {
-  return [H[0], H[1], H[2], H[3], H[4], H[5], H[6], H[7], H[8] * f];
-}
-
-/** Phase 3a — rectification stability. For the (unit-normalized) horizon `l·P = w`, the projective
- * weight `w` is the SIGNED distance of a point from the horizon, and the rectified offsets scale as
- * `1/w`; so `κ = max|w| / min|w|` over the clipped endpoints of BOTH families' inlier lines is the
- * near/far compression the rectify applies to the grid band, and a SIGN CHANGE in `w` means the
- * horizon actually crosses the band (worst case — the rectify explodes there). A large κ or a sign
- * flip ⇒ the horizon estimate is untrustworthy ⇒ prefer identity. Endpoints are clipped in ORIGINAL
- * image coords (via the passed re-centring), then evaluated in centred coords where `l2` lives. */
-function rectifyStability(
-  horizon: V3,
-  inlierLines: Line2[],
-  cx: number,
-  cy: number,
-  W0: number,
-  H0: number,
-): { kappa: number; signFlip: boolean } {
-  const hn = Math.hypot(horizon[0], horizon[1]);
-  if (hn < 1e-9) return { kappa: 1, signFlip: false }; // both VPs at infinity → no warp
-  const l0 = horizon[0] / hn;
-  const l1 = horizon[1] / hn;
-  const l2 = horizon[2] / hn;
-  let wmin = Infinity;
-  let wmax = 0;
-  let sawPos = false;
-  let sawNeg = false;
-  for (const l of inlierLines) {
-    const seg = clipLineToRect({ nx: l.nx, ny: l.ny, d: l.d + l.nx * cx + l.ny * cy }, W0, H0);
-    if (!seg) continue;
-    for (const [x, y] of seg) {
-      const w = l0 * (x - cx) + l1 * (y - cy) + l2;
-      if (w > 0) sawPos = true;
-      else if (w < 0) sawNeg = true;
-      const aw = Math.abs(w);
-      if (aw < wmin) wmin = aw;
-      if (aw > wmax) wmax = aw;
-    }
-  }
-  const signFlip = sawPos && sawNeg;
-  if (!isFinite(wmin) || wmin <= 1e-9) return { kappa: Infinity, signFlip };
-  return { kappa: wmax / wmin, signFlip };
-}
-
-/** Phase 3a thresholds for the κ-gated rectify choice. κ ≤ TRUST: horizon fully trusted, evidence
- * (betterPair) decides H-vs-identity. TRUST < κ < REJECT: graded — keep identity UNLESS H beats it
- * by RECTIFY_MARGIN of confidence. κ ≥ REJECT or a sign flip: reject H outright, use identity. The
- * sweep tries the estimated horizon and a couple pushed farther out (milder warp). All ratio-based,
- * so permissive to a legitimately steep grid; the sweep still gets the last word by evidence. */
-const KAPPA_TRUST = 4;
-const KAPPA_REJECT = 12;
-const RECTIFY_MARGIN = 0.1;
-const HORIZON_SWEEP = [1.5, 2];
-
 interface FamilyGrid {
   lines: Line2[];
   angleDeg: number;
   spacing: number;
   metrics: FamilyMetrics; // rectified-plane evidence; `familyQuality(metrics)` is the score
-  rectPitch?: number; // Phase 3c: the LS-refit pitch in RECTIFIED offset units (for squareness)
 }
 
 /** Raw per-family evidence, measured in the RECTIFIED plane (perspective removed, so a
@@ -2370,210 +2253,6 @@ function coarsenPitch(offs: number[], cell: number): number {
   return best;
 }
 
-/** Result of the Phase-3b comb: the fundamental pitch, the lattice phase, and two diagnostics. */
-export interface CombFit {
-  /** p* — the fundamental cell in rectified-offset units (the COARSEST complete pitch). */
-  pitch: number;
-  /** a* — lattice phase (anchor), in [0, pitch): the offsets sit near `a* + pitch·k`. */
-  anchor: number;
-  /** completeness of the lattice at p* — #distinct occupied slots / span in slots. Low ⇒ smear. */
-  fillRatio: number;
-  /** J(p*) / median(J) — how sharp the periodic peak is (broadband noise ≈ 1, a real grid ≫ 1). */
-  peakRatio: number;
-}
-
-/** Weight of the completeness term in the comb objective `J = |S| · fillRatio^γ`. Kept small
- * (∈[0.5,1]) so a heavily-occluded grid — where EVERY pitch has low fill — still lets the bare
- * comb `|S|` (which peaks at the fundamental) win, instead of over-coarsening. */
-const COMB_GAMMA = 0.7;
-
-/**
- * Phase 3b — robust pitch + phase from a family's 1-D offsets via a fill-weighted SPARSE DFT comb,
- * evaluated ONLY at candidate frequencies (pure JS; no OpenCV, no idft). Replaces robustCell +
- * coarsenPitch as the sub-pitch guard.
- *
- * The comb `S(p) = |Σ_i exp(i·2π·o_i/p)|` is MAXIMAL at the sub-multiples p/2, p/3 (every lattice of
- * pitch p is also a lattice of pitch p/2 with alternate slots empty) — so a bare argmax of |S| locks
- * onto the FINEST pitch: that IS the sub-pitch bug. The cure is to weight by completeness
- * `fillRatio(p) = (#distinct occupied slots)/((o_max−o_min)/p + 1)`, which is ≈1 at the true pitch
- * but ≈1/2 at p/2, ≈1/3 at p/3 — so `J(p) = |S(p)|·fillRatio(p)^γ` favours the COARSEST complete
- * pitch. The search spans [0.5·seed, 2.2·seed] so it can climb UP from a sub-pitch seed to the
- * fundamental. Phase `φ = arg(Σ exp(i·2π·o/p*))` gives the anchor `a* = (φ/2π)·p* (mod p*)`.
- *
- * Pure and exported so it is unit-testable directly on arrays of offsets.
- */
-export function combPitch(offsets: number[], seed: number): CombFit {
-  const n = offsets.length;
-  if (n < 2 || !(seed > 0)) {
-    return { pitch: seed > 0 ? seed : 0, anchor: n ? offsets[0] : 0, fillRatio: 0, peakRatio: 1 };
-  }
-  let omin = Infinity;
-  let omax = -Infinity;
-  for (const o of offsets) {
-    if (o < omin) omin = o;
-    if (o > omax) omax = o;
-  }
-  const TWO_PI = 2 * Math.PI;
-  // Objective J(p) and its parts. re/im are needed at p* to extract the phase.
-  const evalP = (p: number): { J: number; re: number; im: number; fill: number } => {
-    let re = 0;
-    let im = 0;
-    for (const o of offsets) {
-      const a = (TWO_PI * o) / p;
-      re += Math.cos(a);
-      im += Math.sin(a);
-    }
-    const S = Math.hypot(re, im);
-    const spanSlot = (omax - omin) / p + 1;
-    const slots = new Set<number>();
-    for (const o of offsets) slots.add(Math.round((o - omin) / p));
-    const fill = spanSlot > 0 ? clamp01(slots.size / spanSlot) : 0;
-    return { J: S * Math.pow(fill, COMB_GAMMA), re, im, fill };
-  };
-
-  // Sweep on frequency f = 1/p (uniform pitch RESOLUTION) across [0.5·seed, 2.2·seed].
-  const fMin = 1 / (2.2 * seed);
-  const fMax = 1 / (0.5 * seed);
-  const NF = 480;
-  let best = { J: -1, p: seed, re: 1, im: 0, fill: 0 };
-  const Js: number[] = [];
-  for (let i = 0; i <= NF; i++) {
-    const f = fMin + ((fMax - fMin) * i) / NF;
-    const p = 1 / f;
-    const e = evalP(p);
-    Js.push(e.J);
-    if (e.J > best.J) best = { J: e.J, p, re: e.re, im: e.im, fill: e.fill };
-  }
-  // Local refine: one finer linear pass in ±one coarse step around the best f, for a precise pitch.
-  const df = (fMax - fMin) / NF;
-  const fBest = 1 / best.p;
-  const NR = 40;
-  for (let i = 0; i <= NR; i++) {
-    const f = fBest - df + (2 * df * i) / NR;
-    if (f <= 0) continue;
-    const e = evalP(1 / f);
-    if (e.J > best.J) best = { J: e.J, p: 1 / f, re: e.re, im: e.im, fill: e.fill };
-  }
-
-  const phi = Math.atan2(best.im, best.re);
-  const anchorRaw = (phi / TWO_PI) * best.p;
-  const anchor = ((anchorRaw % best.p) + best.p) % best.p; // always in [0, p*)
-  const medJ = median(Js.filter((x) => x > 0));
-  const peakRatio = medJ > 0 ? best.J / medJ : 1;
-  return { pitch: best.p, anchor, fillRatio: best.fill, peakRatio };
-}
-
-export interface PeriodicResult {
-  raw: RawLine[]; // synthesized grid lines (rho in WORKING coords, theta = family normal), both families
-  peakRatio: number; // min of the two families' autocorrelation peak sharpness (grid ≫ texture)
-  fillRatio: number; // min of the two families' lattice completeness
-  pitchA: number; // ORIGINAL-coord pitch of family A
-  pitchB: number;
-  nA: number; // synthesized line count, family A
-  nB: number;
-}
-
-/**
- * Fase C1 — periodicity-based extraction FALLBACK. Where the line-based pipeline drowns in texture
- * (faint / brown-on-earth grids), the AGGREGATE edge-density PROFILE projected onto each dominant
- * orientation still carries the grid's periodicity even when no individual Hough line survives. For
- * each of the two FFT orientations we build the 1-D offset histogram of the edge pixels, find its
- * peaks, and run the (fill-weighted, harmonic-safe) `combPitch` on them to recover pitch + phase;
- * a SHARP profile peak (`peakRatio`) is the discriminator between a real grid and texture. Then we
- * synthesize a clean, regular lattice — so the downstream fit gets uniform lines instead of a smear.
- * Returns null when there's no clear two-family periodicity. `edges` is the WORKING-coord edge mask.
- */
-function periodicExtract(
-  edges: any,
-  orient: { a: number; b: number } | null,
-  scale: number,
-): PeriodicResult | null {
-  if (!orient) return null;
-  const W = edges.cols;
-  const H = edges.rows;
-  const data = edges.data as Uint8Array;
-
-  const family = (angDeg: number) => {
-    const nx = Math.cos(angDeg / DEG);
-    const ny = Math.sin(angDeg / DEG);
-    let oMin = Infinity;
-    let oMax = -Infinity;
-    for (const [x, y] of [[0, 0], [W, 0], [0, H], [W, H]] as const) {
-      const o = x * nx + y * ny;
-      if (o < oMin) oMin = o;
-      if (o > oMax) oMax = o;
-    }
-    const n = Math.ceil(oMax - oMin) + 1;
-    if (n < 8) return null;
-    const prof = new Float64Array(n);
-    let idx = 0;
-    for (let y = 0; y < H; y++) {
-      for (let x = 0; x < W; x++, idx++) {
-        if (data[idx]) {
-          const b = Math.round(x * nx + y * ny - oMin);
-          if (b >= 0 && b < n) prof[b]++;
-        }
-      }
-    }
-    // Light smoothing (±2 box) so a grid line's few-px-thick edge band reads as one peak.
-    const sm = new Float64Array(n);
-    let mx = 0;
-    for (let i = 0; i < n; i++) {
-      let s = 0;
-      for (let k = -2; k <= 2; k++) { const j = i + k; if (j >= 0 && j < n) s += prof[j]; }
-      sm[i] = s;
-      if (s > mx) mx = s;
-    }
-    if (mx <= 0) return null;
-    // Peaks: local maxima above a fraction of the profile max (a grid line is a strong ridge).
-    const peaks: number[] = [];
-    for (let i = 1; i < n - 1; i++) {
-      if (sm[i] >= 0.22 * mx && sm[i] >= sm[i - 1] && sm[i] > sm[i + 1]) peaks.push(oMin + i);
-    }
-    if (peaks.length < 3) return null;
-    const gaps: number[] = [];
-    for (let i = 1; i < peaks.length; i++) gaps.push(peaks[i] - peaks[i - 1]);
-    const seed = median(gaps);
-    if (!(seed > 0)) return null;
-    const cf = combPitch(peaks, seed);
-    if (!(cf.pitch > 0)) return null;
-    return { nx, ny, angDeg, cf, oMin, oMax };
-  };
-
-  const A = family(orient.a);
-  const B = family(orient.b);
-  if (!A || !B) return null;
-
-  const synth = (F: NonNullable<ReturnType<typeof family>>): RawLine[] => {
-    const p = F.cf.pitch;
-    const a0 = F.cf.anchor;
-    const theta = ((F.angDeg % 180) + 180) % 180;
-    const lines: RawLine[] = [];
-    const kmin = Math.ceil((F.oMin - a0) / p);
-    const kmax = Math.floor((F.oMax - a0) / p);
-    if (kmax - kmin > 200) return lines; // sub-pitch guard: refuse to synthesize a texture comb
-    for (let k = kmin; k <= kmax; k++) lines.push({ rho: a0 + k * p, thetaDeg: theta });
-    return lines;
-  };
-
-  const rawA = synth(A);
-  const rawB = synth(B);
-  if (rawA.length < 3 || rawB.length < 3) return null;
-  return {
-    raw: [...rawA, ...rawB],
-    peakRatio: Math.min(A.cf.peakRatio, B.cf.peakRatio),
-    fillRatio: Math.min(A.cf.fillRatio, B.cf.fillRatio),
-    pitchA: A.cf.pitch / scale,
-    pitchB: B.cf.pitch / scale,
-    nA: rawA.length,
-    nB: rawB.length,
-  };
-}
-
-/** Phase 3c — a comb fit whose lattice is emptier than this is a sub-pitch smear (too many phantom
- * empty slots). Perspective-safe: a real grid stays near-complete (fillRatio≈1) at any perspective. */
-const FILL_DEGENERATE_MIN = 0.4;
-
 /** Conservative extension: how many cells past the detected extent 'border' may
  * add (recovers an undetected outer border; bounded by the image frame). */
 const EXTEND_BORDER_CELLS = 2;
@@ -2652,16 +2331,7 @@ function fitFamilyGrid(
     return finalize(pts.map((p) => backToImage(p.off, meanNx, meanNy, false)));
   }
 
-  // Phase 3b (periodicPitch): the fill-weighted comb replaces coarsenPitch as the sub-pitch guard —
-  // it climbs from a sub-pitch seed to the fundamental even under smear, where coarsenPitch's
-  // absolute-tolerance test fails. `robustCell` still seeds the search window. Flag OFF: unchanged.
-  let combFit: CombFit | null = null;
-  if (params.periodicPitch) {
-    combFit = combPitch(pts.map((p) => p.off), cell);
-    if (combFit.pitch > 0) cell = combFit.pitch;
-  } else {
-    cell = coarsenPitch(pts.map((p) => p.off), cell);
-  }
+  cell = coarsenPitch(pts.map((p) => p.off), cell);
 
   // Drop cell-splitting duplicates: a line within half a cell of a neighbour —
   // keep the better-supported one (these are never distinct grid lines).
@@ -2676,37 +2346,25 @@ function fitFamilyGrid(
   }
   pts = dedup;
   const seed = robustCell(pts.map((p) => p.off)) || cell;
-  if (params.periodicPitch) {
-    combFit = combPitch(pts.map((p) => p.off), seed);
-    if (combFit.pitch > 0) cell = combFit.pitch;
-  } else {
-    cell = coarsenPitch(pts.map((p) => p.off), seed);
-  }
+  cell = coarsenPitch(pts.map((p) => p.off), seed);
 
   const offs = pts.map((p) => p.off);
   if (offs.length < 2 || !params.reconstruct) {
     return finalize(offs.map((o) => backToImage(o, meanNx, meanNy, false)));
   }
 
-  // Anchor phase. Phase 3b: seed it from the comb's global phase a* (= arg Σ), already the best-fit
-  // lattice phase; the LS refit below uses GLOBAL indices, so any representative anchor is fine.
-  // Flag OFF: the original search for the offset whose lattice captures the most other lines.
-  let a: number;
-  if (params.periodicPitch && combFit) {
-    a = combFit.anchor;
-  } else {
-    a = offs[0];
-    let bestC = -1;
-    for (const a0 of offs) {
-      let c = 0;
-      for (const o of offs) {
-        const k = Math.round((o - a0) / cell);
-        if (Math.abs(o - a0 - k * cell) <= 0.4 * cell) c++;
-      }
-      if (c > bestC) {
-        bestC = c;
-        a = a0;
-      }
+  // Anchor phase: search for the offset whose lattice captures the most other lines.
+  let a = offs[0];
+  let bestC = -1;
+  for (const a0 of offs) {
+    let c = 0;
+    for (const o of offs) {
+      const k = Math.round((o - a0) / cell);
+      if (Math.abs(o - a0 - k * cell) <= 0.4 * cell) c++;
+    }
+    if (c > bestC) {
+      bestC = c;
+      a = a0;
     }
   }
 
@@ -2781,14 +2439,7 @@ function fitFamilyGrid(
   const cellSamples: number[] = [];
   for (let k = kmin; k < kmax; k += step) cellSamples.push(imgCellAt(k));
   const imgCell = cellSamples.length ? Math.max(...cellSamples) : imgCellAt(kmin);
-  // Phase 3c (periodicPitch): a fit is ALSO a sub-pitch smear when the comb lattice is too empty
-  // (fillRatio < FILL_DEGENERATE_MIN) — perspective-safe, whereas the image-cell test alone can't
-  // tell a genuine steep grid from a smear. The numeric backstop (largest/nearest image cell above)
-  // is kept in both modes. Flag OFF: purely the image-cell backstop, unchanged.
-  let degenerate = imgCell > 0 && imgCell < minCell;
-  if (params.periodicPitch && combFit && combFit.fillRatio < FILL_DEGENERATE_MIN) {
-    degenerate = true;
-  }
+  const degenerate = imgCell > 0 && imgCell < minCell;
 
   const canFill = !degenerate && params.fillGrid && kmax - kmin <= 200;
   const core: Line2[] = [];
@@ -2842,9 +2493,7 @@ function fitFamilyGrid(
     extendFrom(kmin, -1, lo);
     lo.reverse(); // back to ascending-k order
   }
-  const out = finalize([...lo, ...core, ...hi], degenerate ? EMPTY_METRICS : metrics);
-  out.rectPitch = b; // Phase 3c: rectified-plane pitch, for the squareness signal in buildGrid
-  return out;
+  return finalize([...lo, ...core, ...hi], degenerate ? EMPTY_METRICS : metrics);
 }
 
 function median(xs: number[]): number {

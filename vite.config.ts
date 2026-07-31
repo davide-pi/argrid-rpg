@@ -1,11 +1,10 @@
 import { defineConfig } from 'vite';
 import { VitePWA } from 'vite-plugin-pwa';
 
-// App version for the on-map badge. In CI, GitVersion provides it via APP_VERSION
-// (and also runs `npm version`, so npm_package_version matches); for local builds
-// it falls back to package.json's version.
-const appVersion =
-  process.env.APP_VERSION || process.env.npm_package_version || '0.0.0-dev';
+// App version for the on-map badge. In CI, GitVersion provides it via APP_VERSION.
+// Local dev/builds have no APP_VERSION, so they show a fixed "0.0.0-local" marker
+// (rather than package.json's version, which would masquerade as a real release).
+const appVersion = process.env.APP_VERSION || '0.0.0-local';
 
 export default defineConfig({
   // Replaced verbatim in the bundle; consumed as `__APP_VERSION__` in the app.

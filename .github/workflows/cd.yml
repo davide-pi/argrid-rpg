@@ -72,3 +72,54 @@ jobs:
           NETLIFY_AUTH_TOKEN: "${{ secrets.NETLIFY_AUTH_TOKEN }}"
           NETLIFY_SITE_ID: "${{ secrets.NETLIFY_SITE_ID }}"
         timeout-minutes: 5
+
+  cleanup:
+    name: Prune old Netlify deploys
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy]
+    # Runs after every deploy — preview or production. Skipped when nothing was
+    # deployed (the deploy job didn't run / didn't succeed).
+    if: ${{ always() && needs.deploy.result == 'success' }}
+    steps:
+      - name: Keep recent deploys plus a minimum of stable/preview, delete the rest
+        env:
+          NETLIFY_AUTH_TOKEN: "${{ secrets.NETLIFY_AUTH_TOKEN }}"
+          NETLIFY_SITE_ID: "${{ secrets.NETLIFY_SITE_ID }}"
+          KEEP_STABLE: "3" # minimum stable (production) deploys to always retain
+          KEEP_PREVIEW: "2" # minimum preview (draft) deploys to always retain
+          MAX_AGE_DAYS: "7" # additionally, retain every deploy younger than this
+        run: |
+          set -euo pipefail
+          api="https://api.netlify.com/api/v1"
+          auth="Authorization: Bearer ${NETLIFY_AUTH_TOKEN}"
+          cutoff="$(( $(date +%s) - MAX_AGE_DAYS * 24 * 3600 ))"
+
+          deploys="$(curl -fsS -H "$auth" "$api/sites/${NETLIFY_SITE_ID}/deploys?per_page=100")"
+
+          # Delete a deploy only if it is BOTH older than the cutoff AND beyond its group's
+          # minimum (newest $KEEP_STABLE stable / newest $KEEP_PREVIEW previews). So every
+          # deploy younger than $MAX_AGE_DAYS is kept, and each group keeps at least its
+          # minimum regardless of age.
+          ids="$(printf '%s' "$deploys" | jq -r \
+            --argjson keep_stable "$KEEP_STABLE" \
+            --argjson keep_preview "$KEEP_PREVIEW" \
+            --argjson cutoff "$cutoff" '
+            def isold: (.created_at | sub("\\.[0-9]+";"") | fromdateiso8601) < $cutoff;
+            ( [ .[] | select(.draft == false and .state == "ready") ]
+                | sort_by(.created_at) | reverse | .[$keep_stable:] | .[] | select(isold) | .id ),
+            ( [ .[] | select(.draft == true and .state == "ready") ]
+                | sort_by(.created_at) | reverse | .[$keep_preview:] | .[] | select(isold) | .id )
+          ')"
+
+          if [ -z "$ids" ]; then echo "Nothing to prune."; exit 0; fi
+
+          while IFS= read -r id; do
+            [ -n "$id" ] || continue
+            # `|| echo 000` so a network-level curl failure doesn't trip errexit and abort the loop
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$auth" "$api/deploys/${id}" || echo 000)"
+            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+              echo "Deleted $id"
+            else
+              echo "::warning::Could not delete $id (HTTP $code)"
+            fi
+          done <<< "$ids"

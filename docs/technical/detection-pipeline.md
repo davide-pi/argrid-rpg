@@ -94,7 +94,7 @@ exact synthetic θ do **not** catch it — only real Hough output does.
 | --- | --- | --- |
 | `maxDim` | `1600` | Longest side after downscale (speed/robustness). |
 | `mergeFrac` | `0.012` | Offset merge distance as a fraction of `maxDim`. |
-| `fillGrid` | `true` | Emit occluded rows/cols as `filled` lines (`:798`). UI forces this on (`main.ts:233`). |
+| `fillGrid` | `true` | Emit occluded rows/cols as `filled` lines. UI forces this on (`currentParams` `main.ts:88`). |
 | `focusGating` | `false` | Suppress out-of-focus edges before Hough. Off — it erased faint/hand-drawn grids. |
 | `reconstruct` | `true` | Rebuild the regular lattice and drop off-lattice lines; if off, only detected offsets are used. |
 | `lineMorph` | `true` | Noisy/low-contrast fallback (grid on dirt/cork): if the plain Canny path detects `< 3` lines per family, retry on a morphological line mask (`enhanceGridLines`) and keep it if it detects more. Strength is counted from **detected** lines only, so fill/extension can't mask a weak detection. |
@@ -115,11 +115,11 @@ are the **total** family sizes (detected + filled + extended); the `lineMorph` f
 confidence gate work off the **detected-only** counts, so fill/extension never inflate them.
 
 **Reliability gate (the draw decision).** `confidence` is the calibrated `gridConfidence`
-(`grid-detector.ts:2082`): a soft-AND of the two families' `familyQuality` (evidence × regularity/
+(`grid-detector.ts:2308`): a soft-AND of the two families' `familyQuality` (evidence × regularity/
 completeness) times a `squareness` term (aspect via `harmonicAspect`), heavily penalised when
 `degenerate`. Cell-count, aspect and regularity are **folded into it**, not checked separately.
-`applyDetectedGrid()` (`main.ts:577`) then sets `gridReliable = isGridReliable(info)`
-(`grid-detector.ts:2111`) = `!degenerate && detectedA,detectedB ≥ 2 && confidence ≥
+`applyDetectedGrid()` (`main.ts:299`) then sets `gridReliable = isGridReliable(info)`
+(`grid-detector.ts:2334`) = `!degenerate && detectedA,detectedB ≥ 2 && confidence ≥
 DRAW_THRESHOLD` (**0.65**). Above the bar the found grid is drawn; below it the photo shows
 alone (no toast, no auto panel). `DRAW_THRESHOLD` is calibrated on the labelled corpus (correct
 grids ≥ ~0.86; false positives 0.43–0.53). When no grid is drawn, contextual guidance ("Nessuna
@@ -129,16 +129,16 @@ griglia rilevata — disegnala a mano / rifai la foto") is carried by the single
 ## Debug output (edges, raw Hough lines, pipeline graph)
 
 `detectGrid(…, wantEdges=true)` fills `result.edges` (edge mask as `ImageData`).
-`draw()` blits it at 0.45 alpha and strokes every `rawLines` entry in translucent red.
-Debug is a module boolean toggled by **triple-tapping the logo**, which re-runs
-detection so the diagnostics appear/disappear; a translucent **DBG** chip sits next to
-the version badge while it's on.
+`draw()` (`draw-loop.ts`) blits it at 0.45 alpha and strokes every `rawLines` entry in
+translucent red. Debug is a flag on `S` (`S.debug`) toggled by **triple-tapping the logo**
+(handler in `debug-panel.ts`), which re-runs detection so the diagnostics appear/disappear;
+a translucent **DBG** chip sits next to the version badge while it's on.
 
 When `wantEdges`, the generator captures a downscaled RGBA snapshot of each stage **plus the
 fixed pipeline topology** into `result.debugSteps` (`DebugStep[]` — every node carries
 `inputs`, `executed`, `used`), and per-candidate quality into `result.debugPipelines`
 (`PipelineStat[]`), `result.debugAgreement`, `result.debugTimings`, `debugRawLum`/`debugRawMorph`.
-`main.ts` renders these as a top panel (`#debugBar`, `rebuildDebugBar`, positioned by
+`debug-panel.ts` renders these as a top panel (`#debugBar`, `rebuildDebugBar`, positioned by
 `GRAPH_LAYOUT`): a **pipeline graph** (Foto → Grigio → Contrasto → Sfocatura → Canny → Bordi
 uniti → Pulizia texture → Orientati → Hough L, plus the morphology sub-graph Cresta H/V → Linee
 H/V → Morfologica → Hough M, with the colour extractor **Bordi colore** folded into *Bordi uniti*

@@ -23,7 +23,7 @@ export default defineConfig({
   plugins: [
     VitePWA({
       registerType: 'autoUpdate',
-      includeAssets: ['icon.svg', 'opencv.js'],
+      includeAssets: ['logo.png', 'opencv.js'],
       manifest: {
         name: 'ARGrid — Grid Detector',
         short_name: 'ARGrid',
@@ -34,10 +34,13 @@ export default defineConfig({
         orientation: 'any',
         icons: [
           {
-            src: 'icon.svg',
-            sizes: 'any',
-            type: 'image/svg+xml',
-            purpose: 'any maskable',
+            // Same brand logo used for the favicon / apple-touch-icon / on-map brand.
+            // Content bleeds to the edges, so NOT 'maskable' (launchers crop the safe
+            // zone and would clip the "ARGRID RPG" wordmark).
+            src: 'logo.png',
+            sizes: '500x500',
+            type: 'image/png',
+            purpose: 'any',
           },
         ],
       },

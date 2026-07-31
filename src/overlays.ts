@@ -4,16 +4,7 @@
 // homography, so they stay correct under perspective. One cell = 1.5 m = 5 ft.
 
 import type { Line2 } from './grid-detector';
-
-/** Intersection point of two lines (null if parallel). */
-function intersect(a: Line2, b: Line2): { x: number; y: number } | null {
-  const det = a.nx * b.ny - a.ny * b.nx;
-  if (Math.abs(det) < 1e-9) return null;
-  return {
-    x: (a.d * b.ny - b.d * a.ny) / det,
-    y: (a.nx * b.d - b.nx * a.d) / det,
-  };
-}
+import { intersect, invert3x3 } from './geometry';
 
 export type Unit = 'q' | 'm' | 'ft';
 export type AreaType = 'emanazione' | 'esplosione' | 'linea' | 'cono';
@@ -54,10 +45,14 @@ export const CREATURE_SIZES: Array<{ label: string; cells: number }> = [
   { label: 'Mastodontica', cells: 4 },
 ];
 
+/** One grid cell in real-world units (Pathfinder 2e: 5 ft = 1.5 m). */
+export const CELL_METERS = 1.5;
+export const CELL_FEET = 5;
+
 /** Convert a size in the chosen unit to grid cells (1 cell = 1.5 m = 5 ft). */
 export function unitToCells(size: number, unit: Unit): number {
-  if (unit === 'm') return size / 1.5;
-  if (unit === 'ft') return size / 5;
+  if (unit === 'm') return size / CELL_METERS;
+  if (unit === 'ft') return size / CELL_FEET;
   return size;
 }
 
@@ -111,21 +106,6 @@ export function applyH(H: Mat9, x: number, y: number): V2 {
   return [(H[0] * x + H[1] * y + H[2]) / w, (H[3] * x + H[4] * y + H[5]) / w];
 }
 
-export function invert3(m: Mat9): Mat9 | null {
-  const [a, b, c, d, e, f, g, h, i] = m;
-  const A = e * i - f * h;
-  const B = -(d * i - f * g);
-  const C = d * h - e * g;
-  const det = a * A + b * B + c * C;
-  if (Math.abs(det) < 1e-12) return null;
-  const s = 1 / det;
-  return [
-    A * s, (c * h - b * i) * s, (b * f - c * e) * s,
-    B * s, (a * i - c * g) * s, (c * d - a * f) * s,
-    C * s, (b * g - a * h) * s, (a * e - b * d) * s,
-  ];
-}
-
 export interface GridMap {
   toImage(a: number, b: number): V2;
   toGrid(x: number, y: number): V2;
@@ -147,7 +127,7 @@ export function makeGridMap(familyA: Line2[], familyB: Line2[]): GridMap | null 
   if (src.length < 4) return null;
   const H = solveHomography(src, dst);
   if (!H) return null;
-  const Hinv = invert3(H);
+  const Hinv = invert3x3(H);
   if (!Hinv) return null;
   return {
     toImage: (a: number, b: number) => applyH(H, a, b),
@@ -155,7 +135,9 @@ export function makeGridMap(familyA: Line2[], familyB: Line2[]): GridMap | null 
   };
 }
 
-/** Movement-ring colours (green / yellow / orange), cycling every 3. */
+/** Movement-ring colour per band (1..5): a high-contrast teal→amber→orange→pink→
+ * violet ramp that clamps at the 5th colour (it does NOT cycle) and deliberately
+ * avoids ally-green / enemy-red so a ring never reads as a token or a threat. */
 export function ringColor(moveIndex: number): string {
   // One colour per movement band (1..5). High-contrast ramp teal → amber → orange →
   // magenta → violet: bands read apart at a glance, and it avoids the pure ally-green
@@ -346,18 +328,26 @@ function lineCells(oi: number, oj: number, angleDeg: number, R: number): Array<[
   return out;
 }
 
+/** True when (i,j) is a valid CELL of an na×nb node grid (cells run 0..n-2). */
+function inGridCell(na: number, nb: number, i: number, j: number): boolean {
+  return i >= 0 && j >= 0 && i <= na - 2 && j <= nb - 2;
+}
+
+/** A creature's block width in cells (≥1, integer). */
+const creatureWidth = (cells: number): number => Math.max(1, cells | 0);
+
 /** Cells (i,j) affected by an area, using the Pathfinder 2e templates. */
 export function areaCells(area: AreaOverlay, na: number, nb: number): Array<[number, number]> {
   const R = area.sizeCells;
   const [oi, oj] = area.cell;
   const out: Array<[number, number]> = [];
-  const within = (i: number, j: number) => i >= 0 && j >= 0 && i <= na - 2 && j <= nb - 2;
+  const within = (i: number, j: number) => inGridCell(na, nb, i, j);
 
   if (area.type === 'emanazione') {
     // From the creature's block, using the PF2e alternating-diagonal distance
     // (NOT plain Chebyshev): R=1 → 3×3, R=2 → 5×5 with the four corners cut
     // (they are 3 away by the diagonal rule), etc. — matching the book template.
-    const w = Math.max(1, area.creatureCells | 0);
+    const w = creatureWidth(area.creatureCells);
     const [bi, bj] = creatureBlock(oi, oj, w);
     for (let i = 0; i <= na - 2; i++)
       for (let j = 0; j <= nb - 2; j++) if (blockDist(bi, bj, w, i, j) <= R) out.push([i, j]);
@@ -404,6 +394,46 @@ const skey = (i: number, j: number, p: number) => `${i},${j},${p}`;
 const ORTHO: Array<[number, number]> = [[1, 0], [-1, 0], [0, 1], [0, -1]];
 const DIAG: Array<[number, number]> = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
 
+/** Binary min-heap ordered by `less` (pops a before b iff `less(a, b)`). One
+ * implementation shared by both Dijkstra searches below. */
+function makeMinHeap<T>(less: (a: T, b: T) => boolean) {
+  const heap: T[] = [];
+  return {
+    get size(): number {
+      return heap.length;
+    },
+    push(v: T): void {
+      heap.push(v);
+      let n = heap.length - 1;
+      while (n > 0) {
+        const p = (n - 1) >> 1;
+        if (!less(heap[n], heap[p])) break;
+        [heap[p], heap[n]] = [heap[n], heap[p]];
+        n = p;
+      }
+    },
+    pop(): T {
+      const top = heap[0];
+      const last = heap.pop()!;
+      if (heap.length) {
+        heap[0] = last;
+        let n = 0;
+        for (;;) {
+          const l = 2 * n + 1;
+          const r = l + 1;
+          let m = n;
+          if (l < heap.length && less(heap[l], heap[m])) m = l;
+          if (r < heap.length && less(heap[r], heap[m])) m = r;
+          if (m === n) break;
+          [heap[m], heap[n]] = [heap[n], heap[m]];
+          n = m;
+        }
+      }
+      return top;
+    },
+  };
+}
+
 /**
  * Dijkstra over (cell, parity) states with the PF2e alternating-diagonal rule.
  * A diagonal's cost (1 or 2) depends on how many diagonals were taken so far, so
@@ -418,50 +448,21 @@ function dijkstraStates(
   sources: Array<[number, number, number]>,
   diagCost: (parity: number) => number,
 ): { cost: Map<string, number>; prev: Map<string, string[]> } {
-  const inGrid = (i: number, j: number) => i >= 0 && j >= 0 && i <= na - 2 && j <= nb - 2;
+  const inGrid = (i: number, j: number) => inGridCell(na, nb, i, j);
   const impassable = obs.impassable ?? new Set<string>();
   const cost = new Map<string, number>();
   const prev = new Map<string, string[]>();
-  const heap: Array<[number, string]> = [];
-  const push = (c: number, k: string) => {
-    heap.push([c, k]);
-    let n = heap.length - 1;
-    while (n > 0) {
-      const p = (n - 1) >> 1;
-      if (heap[p][0] <= heap[n][0]) break;
-      [heap[p], heap[n]] = [heap[n], heap[p]];
-      n = p;
-    }
-  };
-  const pop = (): [number, string] => {
-    const top = heap[0];
-    const last = heap.pop()!;
-    if (heap.length) {
-      heap[0] = last;
-      let n = 0;
-      for (;;) {
-        const l = 2 * n + 1;
-        const r = l + 1;
-        let m = n;
-        if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
-        if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
-        if (m === n) break;
-        [heap[m], heap[n]] = [heap[n], heap[m]];
-        n = m;
-      }
-    }
-    return top;
-  };
+  const heap = makeMinHeap<[number, string]>((a, b) => a[0] < b[0]);
   for (const [i, j, p] of sources)
     if (inGrid(i, j) && !impassable.has(`${i},${j}`)) {
       const k = skey(i, j, p);
       if ((cost.get(k) ?? Infinity) > 0) {
         cost.set(k, 0);
-        push(0, k);
+        heap.push([0, k]);
       }
     }
-  while (heap.length) {
-    const [c, k] = pop();
+  while (heap.size) {
+    const [c, k] = heap.pop();
     if (c > (cost.get(k) ?? Infinity)) continue;
     const [is, js, ps] = k.split(',');
     const i = +is;
@@ -475,7 +476,7 @@ function dijkstraStates(
       if (nc < old) {
         cost.set(nk, nc);
         prev.set(nk, [k]);
-        push(nc, nk);
+        heap.push([nc, nk]);
       } else if (nc === old) {
         (prev.get(nk) ?? prev.set(nk, []).get(nk)!).push(k);
       }
@@ -497,7 +498,7 @@ function moveSearch(
   nb: number,
   obs: MoveObstacles,
 ): { cost: Map<string, number>; prev: Map<string, string[]>; source: Set<string> } {
-  const w = Math.max(1, mv.creatureCells | 0);
+  const w = creatureWidth(mv.creatureCells);
   const [bi, bj] = creatureBlock(mv.cell[0], mv.cell[1], w);
   const sources: Array<[number, number, number]> = [];
   const source = new Set<string>();
@@ -545,6 +546,28 @@ export function moveCells(
   return out;
 }
 
+/** Best (minimum-cost) end-states for `target` over both parities, within budget.
+ * Returns the min cost and every tying state key (ordered parity 0 then 1). */
+function bestBudgetedEnds(
+  search: { cost: Map<string, number> },
+  ti: number,
+  tj: number,
+  budget: number,
+): { best: number; ends: string[] } {
+  let best = Infinity;
+  const ends: string[] = [];
+  for (const p of [0, 1]) {
+    const c = search.cost.get(skey(ti, tj, p));
+    if (c === undefined || c > budget) continue;
+    if (c < best) {
+      best = c;
+      ends.length = 0;
+    }
+    if (c === best) ends.push(skey(ti, tj, p));
+  }
+  return { best, ends };
+}
+
 /**
  * The MOST DIRECT routes from the creature to `target`: every cell on a minimum-cost
  * path (the predecessor DAG, so all equally-shortest routes — no superfluous detours),
@@ -561,18 +584,7 @@ export function shortestRoutes(
   const search = moveSearch(mv, na, nb, obs);
   const [ti, tj] = target;
   const budget = mv.speedCells * Math.max(1, mv.moves);
-  // Best end-states for the target (both parities), within budget.
-  let best = Infinity;
-  const ends: string[] = [];
-  for (const p of [0, 1]) {
-    const c = search.cost.get(skey(ti, tj, p));
-    if (c === undefined || c > budget) continue;
-    if (c < best) {
-      best = c;
-      ends.length = 0;
-    }
-    if (c === best) ends.push(skey(ti, tj, p));
-  }
+  const { best, ends } = bestBudgetedEnds(search, ti, tj, budget);
   if (!ends.length) return null;
   // Walk the predecessor DAG back to the sources, collecting cells.
   const cells = new Set<string>();
@@ -606,17 +618,9 @@ export function shortestRoute(
   const search = moveSearch(mv, na, nb, obs);
   const [ti, tj] = target;
   const budget = mv.speedCells * Math.max(1, mv.moves);
-  let best = Infinity;
-  let bestKey: string | null = null;
-  for (const p of [0, 1]) {
-    const c = search.cost.get(skey(ti, tj, p));
-    if (c === undefined || c > budget) continue;
-    if (c < best) {
-      best = c;
-      bestKey = skey(ti, tj, p);
-    }
-  }
-  if (bestKey === null) return null;
+  const { best, ends } = bestBudgetedEnds(search, ti, tj, budget);
+  if (!ends.length) return null;
+  const bestKey = ends[0];
   const cellOf = (k: string): [number, number] => {
     const [i, j] = k.slice(0, k.lastIndexOf(',')).split(',').map(Number);
     return [i, j];
@@ -702,9 +706,9 @@ export function movePareto(
   if (speed <= 0) return [];
   const maxM = Math.max(1, Math.min(mv.moves, Math.max(1, maxMoves)));
   const budget = maxM * speed;
-  const w = Math.max(1, mv.creatureCells | 0);
+  const w = creatureWidth(mv.creatureCells);
   const [bi, bj] = creatureBlock(mv.cell[0], mv.cell[1], w);
-  const inGrid = (i: number, j: number) => i >= 0 && j >= 0 && i <= na - 2 && j <= nb - 2;
+  const inGrid = (i: number, j: number) => inGridCell(na, nb, i, j);
   const impassable = obs.impassable ?? new Set<string>();
   const [ti, tj] = target;
 
@@ -726,39 +730,10 @@ export function movePareto(
     prev: Label | null;
   }
   const labels = new Map<string, Label[]>(); // (cell,parity) → non-dominated labels
-  const heap: Label[] = [];
   // Dijkstra order: by cost, then by fewest creatures.
   const less = (a: Label, b: Label) =>
     a.cost < b.cost || (a.cost === b.cost && popcount(a.mask) < popcount(b.mask));
-  const push = (l: Label) => {
-    heap.push(l);
-    let n = heap.length - 1;
-    while (n > 0) {
-      const par = (n - 1) >> 1;
-      if (!less(heap[n], heap[par])) break;
-      [heap[par], heap[n]] = [heap[n], heap[par]];
-      n = par;
-    }
-  };
-  const pop = (): Label => {
-    const top = heap[0];
-    const last = heap.pop()!;
-    if (heap.length) {
-      heap[0] = last;
-      let n = 0;
-      for (;;) {
-        const l = 2 * n + 1;
-        const r = l + 1;
-        let m = n;
-        if (l < heap.length && less(heap[l], heap[m])) m = l;
-        if (r < heap.length && less(heap[r], heap[m])) m = r;
-        if (m === n) break;
-        [heap[m], heap[n]] = [heap[n], heap[m]];
-        n = m;
-      }
-    }
-    return top;
-  };
+  const heap = makeMinHeap<Label>(less);
   // A label (cost, mask) is dominated by (c, m) when c ≤ cost AND m ⊆ mask: cheaper
   // and having met a SUBSET of creatures can only end with ≤ cost and ≤ creatures.
   const addLabel = (l: Label): boolean => {
@@ -784,12 +759,12 @@ export function movePareto(
     for (let j = bj; j < bj + w; j++)
       if (inGrid(i, j) && !impassable.has(`${i},${j}`)) {
         const l: Label = { i, j, p: 0, cost: 0, mask: startMask, prev: null };
-        if (addLabel(l)) push(l);
+        if (addLabel(l)) heap.push(l);
       }
 
   const diagCost = (p: number) => (p === 0 ? 1 : 2);
-  while (heap.length) {
-    const cur = pop();
+  while (heap.size) {
+    const cur = heap.pop();
     const arr = labels.get(skey(cur.i, cur.j, cur.p));
     if (!arr || !arr.includes(cur)) continue; // stale (was dominated since)
     const relax = (ni: number, nj: number, np: number, step: number) => {
@@ -798,7 +773,7 @@ export function movePareto(
       if (cost > budget) return;
       const mask = cur.mask | maskOf(ni, nj);
       const l: Label = { i: ni, j: nj, p: np, cost, mask, prev: cur };
-      if (addLabel(l)) push(l);
+      if (addLabel(l)) heap.push(l);
     };
     for (const [dx, dy] of ORTHO) relax(cur.i + dx, cur.j + dy, cur.p, 1);
     for (const [dx, dy] of DIAG) relax(cur.i + dx, cur.j + dy, 1 - cur.p, diagCost(cur.p));

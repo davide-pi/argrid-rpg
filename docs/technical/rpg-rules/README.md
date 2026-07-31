@@ -5,9 +5,11 @@ argrid-rpg overlays a **tabletop RPG's tactical rules** on the detected grid. Th
 **rules surface** a system has to define. It is the extensible heart of the app: detection and rendering are
 system-agnostic; only this layer knows a game's rules.
 
-> Where the rules live in code: **`src/overlays.ts`** (pure geometry) with its wiring in `src/main.ts`. The
-> *engine/mechanisms* (homography, the movement search, the Pareto route preview) are documented in
-> [`../tactical-overlays.md`](../tactical-overlays.md); the *rules* are documented here.
+> Where the rules live in code: **`src/overlays.ts`** (pure geometry). Its UI wiring is split across
+> `src/draw-loop.ts` (rendering), `src/board.ts` (token/threat/flanking geometry), `src/placement.ts`
+> (area/movement controls) and `src/hud.ts`. The *engine/mechanisms* (homography, the movement search,
+> the Pareto route preview) are documented in [`../tactical-overlays.md`](../tactical-overlays.md); the
+> *rules* are documented here.
 
 ## Supported systems
 
@@ -28,7 +30,7 @@ concrete functions/constants in `src/overlays.ts` — tuned for **Pathfinder 2e*
 | **Reach / threat** | which cells does a creature threaten? | `threatCells` |
 | **Movement cost** | what does moving cell→cell cost? | the step cost inside `moveCells` / `movePareto` (diagonals alternate) |
 | **Fixed sizes / orientations** | the book's preset template sizes & angles | `FIXED_SIZES`, `snapToAngles` |
-| **Unit conversion** | cells ↔ metres / feet | `unitToCells` / `cellsToUnit` (**1 cell = 1.5 m = 5 ft**) |
+| **Unit conversion** | cells ↔ metres / feet | `unitToCells` + `CELL_METERS`/`CELL_FEET` (**1 cell = 1.5 m = 5 ft**); the UI-side inverse `cellsToUnit` lives in `src/placement.ts` |
 
 ## Adding a new system
 

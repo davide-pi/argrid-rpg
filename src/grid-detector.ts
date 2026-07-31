@@ -1,20 +1,26 @@
-// Core computer-vision pipeline: find the two families of lines that make up a
-// grid of squares in a photo, then fill in missing/occluded lines.
+// Core computer-vision pipeline: reconstruct the grid as a TRUE 2-D lattice
+// (not a bag of independent lines) from a photo, filling missing/occluded lines.
 //
 // Everything is AUTOMATIC — Canny thresholds come from Otsu, the Hough
 // accumulator threshold is proportional to the image size and self-tunes via a
 // retry loop, so there are no knobs to expose to the user.
 //
-// Pipeline
-//   grayscale -> CLAHE (local contrast) -> blur -> auto-Canny (Otsu)
+// Pipeline (see `detectGridFromMatSteps` for the driver, `buildGrid` for the fit)
+//   grayscale -> CLAHE (local contrast) -> blur -> auto-Canny (Otsu), fused with
+//     chromatic edges and optionally gated to a tap-to-focus point
+//   -> noise-density classification + short-component cleanup
 //   -> adaptive Hough lines (retry until a sane number of lines)
-//   -> cluster lines into two ~perpendicular families by angle (handles any
-//      rotation automatically)
-//   -> snap each line to its family's mean orientation, dedupe
-//   -> estimate the cell pitch and interpolate missing interior lines
+//   -> cluster lines into two families by orientation (any rotation), with an
+//      FFT periodicity prior and a VP-aware oriented re-extraction recovery
+//   -> per family: vanishing-point RANSAC, rectify via the horizon, then fit a
+//      regular lattice and rebuild every row/column (buildGrid)
+//   -> a morphological second-opinion fit (deskew sweep) + consensus fusion
 //
 // Everything is returned as plain data in ORIGINAL image coordinates so the UI
 // can draw the overlay with the Canvas 2D API (no OpenCV needed for drawing).
+
+import { intersect, invert3x3 } from './geometry';
+export { intersect };
 
 export interface DetectorParams {
   /** Downscale so the longest side is at most this many px (speed/robustness). */
@@ -249,14 +255,13 @@ const gridStrength = (r: GridResult): number =>
 interface GridDescriptor {
   ang: [number, number]; // family normal angles (deg)
   pitch: [number, number]; // family median pitch (px)
-  strength: number; // min detected lines across the two families
 }
 
 const describeGrid = (r: GridResult): GridDescriptor | null => {
   if (r.info.degenerate) return null;
   const strength = Math.min(r.info.detectedA, r.info.detectedB);
   if (strength < 2 || r.info.spacingA <= 0 || r.info.spacingB <= 0) return null;
-  return { ang: [r.info.angleADeg, r.info.angleBDeg], pitch: [r.info.spacingA, r.info.spacingB], strength };
+  return { ang: [r.info.angleADeg, r.info.angleBDeg], pitch: [r.info.spacingA, r.info.spacingB] };
 };
 
 /** Largest integer m (1..MAX) whose multiple of the finer pitch matches the coarser pitch,
@@ -690,9 +695,8 @@ export function* detectGridFromMatSteps(
 
     const mainFit = result; // luminance path result (incl. oriented recovery), for the panel
 
-    // --- Chromatic candidate ------------------------------------------------
-    // (The chroma candidate was removed: the colour-only edges are folded into the luminance edge
-    // map above, so the MAIN fit already sees them — a separate chroma Hough added no value.)
+    // No separate chromatic candidate: colour-only edges are folded into the luminance edge map
+    // above, so the MAIN fit already sees a hue-only grid (a separate chroma Hough added no value).
     let morphFit: GridResult | null = null;
     let agreement: number | null = null; // winner's consensus agreement, set by fuseGrids below
 
@@ -1499,22 +1503,9 @@ const mulM3V = (m: M3, v: V3): V3 => [
   m[6] * v[0] + m[7] * v[1] + m[8] * v[2],
 ];
 const transpose3 = (m: M3): M3 => [m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]];
-function inv3(m: M3): M3 | null {
-  const [a, b, c, d, e, f, g, h, i] = m;
-  const A = e * i - f * h;
-  const B = -(d * i - f * g);
-  const C = d * h - e * g;
-  const det = a * A + b * B + c * C;
-  if (Math.abs(det) < 1e-12) return null;
-  const D = -(b * i - c * h);
-  const E = a * i - c * g;
-  const F = -(a * h - b * g);
-  const G = b * f - c * e;
-  const Hh = -(a * f - c * d);
-  const I = a * e - b * d;
-  const s = 1 / det;
-  return [A * s, D * s, G * s, B * s, E * s, Hh * s, C * s, F * s, I * s];
-}
+// 3×3 inverse lives in the shared geometry module (bit-identical formula); this
+// thin wrapper keeps the M3 tuple typing local to the detector.
+const inv3 = (m: M3): M3 | null => invert3x3(m) as M3 | null;
 
 /** A line nx·x+ny·y=d as homogeneous coefficients (line·point=0). */
 const lineToHom = (l: Line2): V3 => [l.nx, l.ny, -l.d];
@@ -2526,6 +2517,71 @@ const LATTICE_TOL = 0.3;
  * `crossesImage` tests (in the same centred frame) whether a line still meets the
  * image, so extrapolation stops at the frame.
  */
+/** Anchor phase: the rectified offset whose lattice (pitch `cell`) captures the most
+ * lines — searched instead of trusting `offs[0]`, so one stray line can't set the phase. */
+function latticeAnchor(offs: number[], cell: number): number {
+  let a = offs[0];
+  let bestC = -1;
+  for (const a0 of offs) {
+    let c = 0;
+    for (const o of offs) {
+      const k = Math.round((o - a0) / cell);
+      if (Math.abs(o - a0 - k * cell) <= 0.4 * cell) c++;
+    }
+    if (c > bestC) {
+      bestC = c;
+      a = a0;
+    }
+  }
+  return a;
+}
+
+/** Least-squares snap-and-refit of the lattice (≤6 iterations), seeded from `anchor`
+ * and pitch `cell`. Each line snaps to a GLOBAL integer index (round((off−a)/b)) — not
+ * a running sum — so one off-lattice line can't shift the rest. The inlier set is seeded
+ * from the clean anchor fit BEFORE the first least-squares fit, otherwise an off-lattice
+ * line biases it and gets absorbed instead of rejected. Returns the refined offset `a`,
+ * pitch `b`, and per-line inlier mask (`keep`). Lines count as on-lattice within
+ * LATTICE_TOL·cell of a node (a real grid's lines sit within ~0.1·cell). */
+function refitLattice(
+  offs: number[],
+  anchor: number,
+  cell: number,
+): { a: number; b: number; keep: boolean[] } {
+  let a = anchor;
+  let b = cell;
+  const keep = offs.map((o) => Math.abs(o - (a + cell * Math.round((o - a) / cell))) / cell <= LATTICE_TOL);
+  for (let iter = 0; iter < 6; iter++) {
+    let n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (let i = 0; i < offs.length; i++) {
+      if (!keep[i]) continue;
+      const k = Math.round((offs[i] - a) / b);
+      n++;
+      sx += k;
+      sy += offs[i];
+      sxx += k * k;
+      sxy += k * offs[i];
+    }
+    if (n < 2) break;
+    const denom = n * sxx - sx * sx;
+    if (Math.abs(denom) < 1e-9) break;
+    const nb = (n * sxy - sx * sy) / denom;
+    const na = (sy - nb * sx) / n;
+    if (!(nb > 0)) break;
+    let changed = false;
+    for (let i = 0; i < offs.length; i++) {
+      const k = Math.round((offs[i] - na) / nb);
+      const ok = Math.abs(offs[i] - (na + nb * k)) / nb <= LATTICE_TOL;
+      if (ok !== keep[i]) changed = true;
+      keep[i] = ok;
+    }
+    a = na;
+    b = nb;
+    if (!changed && iter > 0) break;
+  }
+  return { a, b, keep };
+}
+
 function fitFamilyGrid(
   inLines: LineSup[],
   H: M3,
@@ -2594,59 +2650,9 @@ function fitFamilyGrid(
     return finalize(offs.map((o) => backToImage(o, meanNx, meanNy, false)));
   }
 
-  // Anchor phase: search for the offset whose lattice captures the most other lines.
-  let a = offs[0];
-  let bestC = -1;
-  for (const a0 of offs) {
-    let c = 0;
-    for (const o of offs) {
-      const k = Math.round((o - a0) / cell);
-      if (Math.abs(o - a0 - k * cell) <= 0.4 * cell) c++;
-    }
-    if (c > bestC) {
-      bestC = c;
-      a = a0;
-    }
-  }
-
-  // Snap each line to a GLOBAL integer index (round((off − a)/b)) — not a
-  // running sum — so a single off-lattice line can't shift the indices of the
-  // rest. Seed the inlier set from the clean anchor fit (a, cell) BEFORE the
-  // least-squares refit, otherwise an off-lattice line biases the very first
-  // fit and gets absorbed instead of rejected.
-  let b = cell;
-  // Lattice inlier tolerance (Fase A): a line counts as on-lattice within LATTICE_TOL·cell of a
-  // node. Tightened 0.4→0.3 so a parallel TEXTURE line sitting ~0.35·cell off a node no longer
-  // inflates `inlier`/regularity (a real grid's lines sit within ~0.1·cell of their nodes).
-  const keep = offs.map((o) => Math.abs(o - (a + cell * Math.round((o - a) / cell))) / cell <= LATTICE_TOL);
-  for (let iter = 0; iter < 6; iter++) {
-    let n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
-    for (let i = 0; i < offs.length; i++) {
-      if (!keep[i]) continue;
-      const k = Math.round((offs[i] - a) / b);
-      n++;
-      sx += k;
-      sy += offs[i];
-      sxx += k * k;
-      sxy += k * offs[i];
-    }
-    if (n < 2) break;
-    const denom = n * sxx - sx * sx;
-    if (Math.abs(denom) < 1e-9) break;
-    const nb = (n * sxy - sx * sy) / denom;
-    const na = (sy - nb * sx) / n;
-    if (!(nb > 0)) break;
-    let changed = false;
-    for (let i = 0; i < offs.length; i++) {
-      const k = Math.round((offs[i] - na) / nb);
-      const ok = Math.abs(offs[i] - (na + nb * k)) / nb <= LATTICE_TOL;
-      if (ok !== keep[i]) changed = true;
-      keep[i] = ok;
-    }
-    a = na;
-    b = nb;
-    if (!changed && iter > 0) break;
-  }
+  // Anchor the lattice, then least-squares snap-and-refit its inliers (see helpers).
+  const anchor = latticeAnchor(offs, cell);
+  const { a, b, keep } = refitLattice(offs, anchor, cell);
 
   const detectedIdx = new Set<number>();
   for (let i = 0; i < offs.length; i++) if (keep[i]) detectedIdx.add(Math.round((offs[i] - a) / b));
@@ -2785,14 +2791,4 @@ export function clipLineToRect(
   }
   if (uniq.length < 2) return null;
   return [uniq[0], uniq[1]];
-}
-
-/** Intersection point of two lines (null if parallel). */
-export function intersect(a: Line2, b: Line2): { x: number; y: number } | null {
-  const det = a.nx * b.ny - a.ny * b.nx;
-  if (Math.abs(det) < 1e-9) return null;
-  return {
-    x: (a.d * b.ny - b.d * a.ny) / det,
-    y: (a.nx * b.d - b.nx * a.d) / det,
-  };
 }

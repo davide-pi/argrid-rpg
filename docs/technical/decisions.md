@@ -23,7 +23,8 @@ so gating is only worth it for strongly out-of-focus backgrounds.
 
 ### Occluded lines are rebuilt AND shown
 **Decision:** `fillGrid: true`; rebuilt (interpolated) lines are drawn at 0.5 alpha,
-detected lines at 1.0 (`src/grid-detector.ts:798`; `drawFamily` `src/main.ts:1097`).
+detected lines at 1.0 (`fitFamilyGrid` in `src/grid-detector.ts`; `drawFamily`
+`src/draw-loop.ts:545`, which fades `l.filled` lines).
 **Why:** an earlier "hide the dashed fills" choice was about the *unreliable* 1-D
 interpolation. The 2-D model's rebuilt lines are trustworthy, so the complete grid is
 displayed (occluded ones just fainter).
@@ -70,7 +71,7 @@ perspective (`buildGrid` / `ransacVP` / `fitFamilyGrid`, `src/grid-detector.ts`)
   a genuine shallow-angle floor/table VP. Without it, a low-angle floor (VP legitimately
   in-frame) was rejected → no rectification → collapse to a fronto-parallel **2×2**. A
   fronto-parallel grid fans ~0° so it never triggers the override (no regression there);
-  `MIN_GRID_CELLS` (5, in `main.ts`) is the backstop that hides any residual 2×2 collapse.
+  `MIN_GRID_CELLS` (5, in `grid-detector.ts`) is the backstop that hides any residual 2×2 collapse.
 - **Sub-multiple rejection** — `coarsenPitch` prefers the coarsest integer multiple of the
   base cell that still holds (almost) all offsets, so the fit can't lock onto a 1/m harmonic
   (tolerance is absolute, tied to the base cell, so occluded/dropped lines don't over-coarsen).
@@ -104,7 +105,7 @@ carries the guidance ("Nessuna griglia rilevata — usa il tasto griglia / fotoc
 **edit-grid** button opens an on-demand chooser (`#editChooser`: **grid to adapt** / **draw by
 hand**) on *any* result, so a well-detected grid can also be tweaked. **Cancelling** the editor
 restores the detected grid (`applyDetectedGrid`), never discards it. The manual editor
-(`src/main.ts`, "Manual grid editor") has two modes, both producing the same `familyA`/`familyB`
+(`src/manual-grid.ts`) has two modes, both producing the same `familyA`/`familyB`
 `Line2[]` the detector would — so drawing (`drawFamily`) and every tactical tool (`makeGridMap`,
 tokens, areas, movement) work unchanged:
 - **Adapt** — a **quad** (4 draggable corners) tiled into N×M cells; the quad→unit-square
@@ -185,8 +186,8 @@ strong and skip the morphological fallback the noisy-photo path depends on.
 ## Tactical engine
 
 ### Unified single grid colour (no H/V distinction)
-**Decision:** both families draw in one soft white `#eaf1fb` via two `drawFamily(…)`
-calls (`src/main.ts:434`).
+**Decision:** both families draw in one soft white `#eaf1fb` (`gridColor` in `draw()`) via two
+`drawFamily(…)` calls (`src/draw-loop.ts:56`).
 **Why:** the user doesn't distinguish horizontals from verticals; the previous cyan +
 pink pair added noise. (Trade-off: on a light/parchment map soft white can read faint —
 switch to a dark grid colour there.)
@@ -194,7 +195,7 @@ switch to a dark grid colour there.)
 ### Cone rotates around a FIXED chosen intersection
 **Decision:** a cone is a 90° sector of the burst radiating from `area.corner` (the
 selected node); rotating turns only the sector, the origin stays put
-(`areaCells` `src/overlays.ts:369`; `ringOriginGrid` `src/main.ts:887`).
+(`areaCells` `src/overlays.ts:340`; `ringOriginGrid` `src/placement.ts:38`).
 **Why:** "voglio definire un incrocio e farlo sempre da lì." A helper that derived the
 corner from cell + direction moved the origin between corners as you rotated and fed
 back into the angle, so it was removed. **Accepted trade-off:** a short orthogonal cone
@@ -203,27 +204,28 @@ from a corner is 2,4,2, not the book's cell-centred 1,3,3 — kept for a clean c
 ### Angle ring rotates only from the shape's TIP
 **Decision:** `ringHit` matches only within ~1.1 cells of the tip handle
 (`ringHandleGrid` = origin + `gridDir(angle)·reach`); no full-circle band
-(`src/main.ts:1411`, `:905`).
+(`src/placement.ts:264`, `:58`).
 **Why:** "voglio ruotare SOLO se clicco sulla fine della linea o la punta del cono, così
 clic su un'altra cella non ruota a caso." The old whole-band grab rotated on stray taps.
 
 ### Line/cone angles snap to the book slopes only
 **Decision:** fixed orientations — line = the four book slopes reflected into every
-octant (`lineAngles` `src/overlays.ts:242`), cone = the 8 grid dirs; `snapToAngles`
-snaps coarsely (`:265`).
+octant (`lineAngles` `src/overlays.ts:224`), cone = the 8 grid dirs; `snapToAngles`
+snaps coarsely (`:247`).
 **Why:** "il cerchio consente tutti gli angoli, deve andare a scatti / solo quegli
 angoli." A continuous ring produced irregular, non-book staircases.
 
 ### Movement fixed at 5 movements; speed is per-piece
 **Decision:** `MOVE_ACTIONS = 5` and `MAX_PATH_MOVES = 5` — no movements selector; each
 token carries its own `speed` (default `DEFAULT_PIECE_SPEED = 6` cells / 30 ft)
-(`src/main.ts:134`, `:135`, `:601`).
+(`MOVE_ACTIONS`/`DEFAULT_PIECE_SPEED` `src/placement.ts:13`,`:11`; `MAX_PATH_MOVES`
+`src/draw-loop.ts:179`).
 **Why:** simplifies the HUD; movement always previews up to 5 bands, and the reachable
 distance is driven by the piece's speed rather than a global control.
 
 ### Threat shown only during movement, both sides
 **Decision:** `threatSidesToShow()` returns `['ally','enemy']` in a move overlay, else
-`[]` (`src/main.ts:506`); the Minaccia toggle was removed.
+`[]` (`src/placement.ts:23`); the Minaccia toggle was removed.
 **Why:** "l'area di minaccia lasciamola visualizzata solo durante il movimento,
 togliamo lo switch." Showing both sides lets you read the whole board's threat while
 planning a move.
@@ -231,7 +233,7 @@ planning a move.
 ### Route preview = Pareto frontier counting DISTINCT creatures
 **Decision:** `movePareto` returns the `(movements ↔ threats)` frontier; threats are
 counted **per distinct creature, once**, including the start square, via a subset-state
-search over `(cell, parity, creature-bitmask)` (`src/overlays.ts:692`).
+search over `(cell, parity, creature-bitmask)` (`src/overlays.ts:696`).
 **Why:** earlier previews (an oval of every route, then the full shortest-path DAG) were
 too dense and rejected. The user wanted the fastest route plus each alternative that
 spends +1 movement to be threatened by fewer *creatures* (not cells) — a creature met in
@@ -239,15 +241,15 @@ many cells still counts once.
 
 ### Area removed only by the ✕ (single control surface)
 **Decision:** the FAB becomes an ✕ that both drops and removes the active area; a tap on
-empty ground or on the area origin does nothing (`updateFabIcon` `src/main.ts:1274`,
-`removeActiveArea` `:223`). The whole bottom sheet was replaced by one on-map HUD.
+empty ground or on the area origin does nothing (`updateFabIcon` `src/placement.ts:110`,
+`removeActiveArea` `src/hud.ts:118`). The whole bottom sheet was replaced by one on-map HUD.
 **Why:** "si toglie solo con la X." A stray tap must not clear an area, and there is one
 contextual control surface (the HUD) instead of a sheet + panel.
 
 ### HUD does not reopen when you reposition
 **Decision:** dragging an area calls a slimmed `selectCellAt` that only moves the
 overlay; the HUD auto-expands only on explicit actions (add area / open editor / start
-movement) or the chevron (`refreshHud` `src/main.ts:185`, `showHud` `:216`).
+movement) or the chevron (`refreshHud` `src/hud.ts:74`, `showHud` `src/hud.ts:111`).
 **Why:** "se riduco il menù non deve riaprirsi se sposto l'area."
 
 ## Platform
@@ -262,7 +264,7 @@ frozen. Also: never `revokeObjectURL` the blob script — Emscripten keeps refer
 
 ### Redraw is cheap — never re-run OpenCV
 **Decision:** detection runs once per capture; every interaction calls `draw()`
-(`src/main.ts:403`) which repaints the photo + vector overlays only.
+(`src/draw-loop.ts:14`) which repaints the photo + vector overlays only.
 **Why:** OpenCV work is synchronous and heavy; keeping the interaction loop off it keeps
 the phone UI responsive.
 

@@ -8,12 +8,23 @@ layer is built to grow into **other RPG systems**.
 
 ## Modules (where things live)
 
+`main.ts` is now thin (boot + capture + `runDetection` + ordered `initX()` wiring); the HUD, draw
+loop, gestures and placement each live in their own module.
+
 | Module | File | Does |
 |---|---|---|
 | Detection | `src/grid-detector.ts` | CV pipeline: Canny + Hough + vanishing-point RANSAC + rectify + lattice fit |
+| Shared math | `src/geometry.ts` | pure projective helpers (`intersect`, `invert3x3`) shared by the detector + overlays |
 | Rules/geometry | `src/overlays.ts` | distances, area templates, reach/threat, movement (`moveCells`, `movePareto`) — **the seam for RPG systems** |
-| App wiring | `src/main.ts` | capture, draw loop, on-map HUD, FAB placement, pointer gestures, `window.__argrid` DEV hook |
+| App state | `src/tactical-state.ts` | the one shared mutable `S` (grid/selection/tokens/overlay/debug) + `Token`/`ImgPt` types |
+| Render | `src/draw-loop.ts` | the single `draw()` pass: grid + areas/movement/threat/paths/flanking/tokens |
+| Board logic | `src/board.ts` | token/threat/flanking geometry (`tokenBlock`, `threatCountMaps`, `flankedEnemies`) — no drawing/DOM |
+| Placement + HUD | `src/placement.ts`, `src/hud.ts` | FAB placement, area/movement + angle-ring controls; the on-map HUD + `(i)` help |
+| Gestures | `src/gestures.ts` | pointer tap / long-press / drag / rotate on the map |
+| Manual grid | `src/manual-grid.ts` | draw/adapt a grid by hand (quad + traced lines) |
+| App wiring | `src/main.ts` | boot, camera capture, `runDetection`, result chrome, ordered `initX()` |
 | Camera / zoom | `src/camera.ts`, `src/zoom.ts` | camera capture; zoom/pan of the result canvas |
+| DOM / DEV / debug | `src/dom.ts`, `src/dev-hook.ts`, `src/debug-panel.ts` | element lookups; `window.__argrid` DEV hook; debug pipeline panel |
 | OpenCV boot | `public/opencv-boot.js` | classic-script loader — **do not "modernize"** (see its comments) |
 
 ## Find the right doc (route here first)

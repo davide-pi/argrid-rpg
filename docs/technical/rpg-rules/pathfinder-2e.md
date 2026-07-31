@@ -7,7 +7,8 @@ book diagram (`assets/pf2e-areas.png`, git-ignored copyrighted art).
 
 ## Distances & diagonals
 
-- **1 cell (q) = 5 ft = 1.5 m** (`unitToCells` / `cellsToUnit`).
+- **1 cell (q) = 5 ft = 1.5 m** (`unitToCells` + the `CELL_METERS`/`CELL_FEET` constants in
+  `overlays.ts`; the UI-side inverse `cellsToUnit` is in `placement.ts`).
 - **Diagonals alternate 1/2**: a diagonal step costs 1, the next 2, and so on — so distance =
   `max(Δi, Δj) + floor(min(Δi, Δj) / 2)`, giving the sequence 1, 3, 4, 6, 7, 9 … `pf2eDist`, and from a
   creature's *N×N* block, `blockDist`. This single rule drives areas, reach and movement.

@@ -1,17 +1,31 @@
 # Architecture
 
-argrid-rpg is a single-page PWA with no framework: `main.ts` wires the DOM, owns all
-state, and drives one `<canvas id="view">` on which both the captured photo and every
-overlay are drawn (so alignment is exact). OpenCV is used **only** inside
-`grid-detector.ts`; everything else is plain TypeScript.
+argrid-rpg is a single-page PWA with no framework. All modules share **one** mutable state
+object (`S` in `tactical-state.ts`) and draw onto one `<canvas id="view">` where both the
+captured photo and every overlay are painted (so alignment is exact). OpenCV is used **only**
+inside `grid-detector.ts`; everything else is plain TypeScript. After a big consolidation
+`main.ts` is thin — it boots, captures, runs detection, and calls each module's `initX()` — while
+the rendering, gestures, HUD, placement and manual-grid editor each live in their own module.
 
 ## Module map
 
 | Module | File | Responsibility |
 | --- | --- | --- |
-| App shell / wiring | `src/main.ts` | DOM refs, all app state, boot, capture, the `draw()` loop, HUD, FAB, pointer gestures, DEV hook. |
-| CV pipeline | `src/grid-detector.ts` | Photo → two line families → 2-D lattice reconstruction. Pure data out (image coords); no DOM in the core (`buildGrid`, `detectGridFromMat`). |
+| App boot / wiring | `src/main.ts` | Boot, camera capture, `runDetection`, result chrome (`applyDetectedGrid`/`updateResultChrome`), the ordered `initX()` calls. No draw loop / HUD / gestures / placement here anymore. |
+| Shared state | `src/tactical-state.ts` | The one mutable `S` object (grid, selection, tokens, overlay, debug, manual-grid flags) + the `Token` interface and `ImgPt` type. |
+| DOM refs | `src/dom.ts` | Central `getElementById` bindings (`$` helper) every module imports. |
+| Shared geometry | `src/geometry.ts` | Pure projective math (`intersect`, `invert3x3`) shared by the detector **and** overlays — a dependency-free leaf so neither couples to the other. |
+| CV pipeline | `src/grid-detector.ts` | Photo → two line families → 2-D lattice reconstruction. Pure data out (image coords); no DOM in the core (`buildGrid`, `detectGridFromMatSteps`). Re-exports `intersect` from geometry. |
 | Tactical engine | `src/overlays.ts` | Grid↔image homography + PF2e geometry: distances, area templates, reach/threat, movement search, Pareto routes. Pure functions, unit-tested. |
+| Render | `src/draw-loop.ts` | The single `draw()` pass (photo + grid + tactical overlays on one canvas) and every `draw*`/`fillCells` helper; `ENEMY_COL`/`ALLY_COL`/`MAX_PATH_MOVES`. |
+| Board logic | `src/board.ts` | Token / threat / flanking geometry over `S.tokens` (`tokenBlock`, `tokenObstaclesFor`, `threatCountMaps`, `oppThreatAreas`, `flankedEnemies`, `tokenAt`). No drawing/DOM. |
+| HUD | `src/hud.ts` | The contextual heads-up panel (`refreshHud`/`hudContext`/`showHud`) + the `(i)` help popover. |
+| Placement | `src/placement.ts` | FAB placement, per-piece editor, area form, movement start, the on-map angle ring (`setPlaceMode`, `updateFabIcon`, `ringHit`, `threatSidesToShow`). |
+| Gestures | `src/gestures.ts` | Pointer tap / long-press / drag / rotate on the map (`initGestures`, `pointerToGrid`, `selectCellAt`); shares `activePointers` via `pointer-capture.ts`. |
+| Manual grid | `src/manual-grid.ts` | By-hand grid editor: adapt a draggable quad / trace reference lines, + magnifier loupe (`enterManualMode`, `commitManualGrid`). |
+| Debug panel | `src/debug-panel.ts` | Dev-only pipeline graph + confidence/timing logs, `drawDebugStep`, and the triple-tap debug toggle. |
+| Tap-to-focus | `src/tap-to-focus.ts` | Live-preview tap → focus reticle + the focus point the next capture weights. |
+| DEV hook | `src/dev-hook.ts` | `installDevHook` — the `window.__argrid` test surface (DEV only). |
 | Camera | `src/camera.ts` | `getUserMedia` (rear camera) wrapper; `grabFrame()` → canvas at native resolution. |
 | Zoom / pan | `src/zoom.ts` | CSS-transform pinch / wheel / drag zoom on the view; `suppress()` hook to freeze pan during a gesture. |
 | OpenCV bootstrap | `public/opencv-boot.js` | Classic (non-module) script: fetches `opencv.js` with progress, exposes `window.__cvOnProgress` / `window.__cvOnReady`. |
@@ -22,29 +36,29 @@ overlay are drawn (so alignment is exact). OpenCV is used **only** inside
 
 ```mermaid
 flowchart TD
-  boot["boot() — main.ts:245"] -->|__cvOnReady| cvready["cv ready + install window.__argrid (DEV)"]
-  cvready --> cam["Camera.start() — camera.ts"]
-  cam -->|"Scatta"| capture["capture() → grabFrame() — main.ts:323"]
-  capture --> process["processImage(canvas) — main.ts:334"]
-  process --> detect["detectGrid(cv, canvas, params) — grid-detector.ts:101"]
+  boot["boot() — main.ts:96"] -->|__cvOnReady| cvready["cv ready + installDevHook (DEV) — dev-hook.ts"]
+  cvready --> cam["camera.start() — camera.ts"]
+  cam -->|"Scatta"| capture["capture() → grabFrame() — main.ts:156"]
+  capture --> process["processImage(canvas) — main.ts:167"]
+  process --> detect["runDetection → detectGridSteps(...) — main.ts:212 / grid-detector.ts"]
   detect --> result["GridResult { familyA, familyB, rawLines, info, edges? }"]
-  result --> gmap["makeGridMap(familyA, familyB) — overlays.ts:135"]
-  gmap --> draw["draw() — main.ts:403"]
+  result --> gmap["applyDetectedGrid → makeGridMap(familyA, familyB) — main.ts:299 / overlays.ts:115"]
+  gmap --> draw["draw() — draw-loop.ts:14"]
 
   subgraph redraw["draw() — cheap, NEVER re-runs OpenCV"]
     draw --> photo["drawImage(lastCapture)"]
-    photo --> grid["drawFamily × 2 (single colour) — main.ts:1072"]
+    photo --> grid["drawFamily × 2 (single colour) — draw-loop.ts:56"]
     grid --> tac["overlay → paths → threat → flanking → tokens → selection + ring"]
   end
 
-  gesture["pointer / HUD / FAB events"] -->|mutate state| draw
+  gesture["pointer (gestures.ts) / HUD / FAB events"] -->|mutate S, call draw()| draw
 ```
 
-Key point: detection runs **once per capture** (`runDetection` → `detectGrid`,
-`main.ts:354`). Every interaction after that — selecting cells, moving pieces,
-rotating the angle ring, editing an area — only mutates module state and calls
-`draw()` (`main.ts:403`). `draw()` repaints the photo plus the vector overlays; it
-does not touch OpenCV. This is what keeps the UI responsive on a phone.
+Key point: detection runs **once per capture** (`runDetection`, `main.ts:212`). Every
+interaction after that — selecting cells, moving pieces, rotating the angle ring, editing an
+area — only mutates the shared state `S` and calls `draw()` (`draw-loop.ts:14`). `draw()`
+repaints the photo plus the vector overlays; it does not touch OpenCV. This is what keeps the UI
+responsive on a phone.
 
 **Reliability gate + manual grid.** After detection, `applyDetectedGrid` sets
 `gridReliable = isGridReliable(info)`: the calibrated `confidence` must clear
@@ -72,15 +86,16 @@ it as a blob `<script>`, and signals readiness via a **synchronous** callback
 microtask can wedge the main thread. See the header comment block in
 `public/opencv-boot.js` and [decisions.md](decisions.md).
 
-`main.ts` `boot()` (`main.ts:245`) subscribes to `window.__cvOnProgress` (loader bar)
-and `window.__cvOnReady` (`main.ts:263`); only when ready does it enable capture and
+`main.ts` `boot()` (`main.ts:96`) subscribes to `window.__cvOnProgress` (loader bar)
+and `window.__cvOnReady` (`main.ts:114`); only when ready does it enable capture and
 start the camera.
 
 ## DEV / test hook — `window.__argrid`
 
-Installed inside the ready callback, guarded by `import.meta.env.DEV` (stripped from
-production builds) — `main.ts:268`. A headless browser (Playwright) uses it to drive
-detection and the tactical UI on a synthetic canvas. Fields:
+`installDevHook(mod)` lives in `src/dev-hook.ts`; `boot()`'s ready callback calls it only when
+`import.meta.env.DEV` (so the whole module is tree-shaken from production builds — `main.ts:119`).
+A headless browser (Playwright) uses it to drive detection and the tactical UI on a synthetic
+canvas. Fields:
 
 | Field | Purpose |
 | --- | --- |
@@ -90,6 +105,8 @@ detection and the tactical UI on a synthetic canvas. Fields:
 | `cellClient(i, j)` | Client-space (screen) position of grid node `(i,j)` — to script taps / ring drags. |
 | `ringHandle()` | Grid position of the angle-ring tip handle. |
 | `effectiveAngle()` | Current snapped line/cone angle. |
+| `state()` | Snapshot `{ gridReliable, gridDims, showingResult }` for assertions. |
+| `focus()` / `setFocus(p)` | Read the tap-to-focus point, or set one (normalized `[0,1]`) and re-detect the last capture. |
 
 See [detection-pipeline.md](detection-pipeline.md) for the CV stages and
 [tactical-overlays.md](tactical-overlays.md) for the engine.

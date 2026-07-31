@@ -72,3 +72,48 @@ jobs:
           NETLIFY_AUTH_TOKEN: "${{ secrets.NETLIFY_AUTH_TOKEN }}"
           NETLIFY_SITE_ID: "${{ secrets.NETLIFY_SITE_ID }}"
         timeout-minutes: 5
+
+  cleanup:
+    name: Prune old Netlify deploys
+    runs-on: ubuntu-latest
+    needs: [prepare, deploy]
+    # Only after publishing a STABLE (tagged) release — never on predeploys.
+    if: needs.prepare.outputs.deploy_type == 'production'
+    steps:
+      - name: Keep last 3 stable deploys + latest preview, delete the rest
+        env:
+          NETLIFY_AUTH_TOKEN: "${{ secrets.NETLIFY_AUTH_TOKEN }}"
+          NETLIFY_SITE_ID: "${{ secrets.NETLIFY_SITE_ID }}"
+          KEEP_STABLE: "3" # tagged production deploys to retain (incl. the one just released)
+          KEEP_PREVIEW: "1" # most recent predeploy (draft) to retain as staging
+        run: |
+          set -euo pipefail
+          api="https://api.netlify.com/api/v1"
+          auth="Authorization: Bearer ${NETLIFY_AUTH_TOKEN}"
+
+          deploys="$(curl -fsS -H "$auth" "$api/sites/${NETLIFY_SITE_ID}/deploys?per_page=100")"
+
+          # IDs to delete:
+          #  - stable (draft=false, ready) beyond the newest $KEEP_STABLE
+          #  - predeploys (draft=true, ready) beyond the newest $KEEP_PREVIEW
+          ids="$(printf '%s' "$deploys" | jq -r \
+            --argjson keep_stable "$KEEP_STABLE" \
+            --argjson keep_preview "$KEEP_PREVIEW" '
+            ( [ .[] | select(.draft == false and .state == "ready") ]
+                | sort_by(.created_at) | reverse | .[$keep_stable:] | .[].id ),
+            ( [ .[] | select(.draft == true and .state == "ready") ]
+                | sort_by(.created_at) | reverse | .[$keep_preview:] | .[].id )
+          ')"
+
+          if [ -z "$ids" ]; then echo "Nothing to prune."; exit 0; fi
+
+          while IFS= read -r id; do
+            [ -n "$id" ] || continue
+            # `|| echo 000` so a network-level curl failure doesn't trip errexit and abort the loop
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$auth" "$api/deploys/${id}" || echo 000)"
+            if [ "$code" = "200" ] || [ "$code" = "204" ]; then
+              echo "Deleted $id"
+            else
+              echo "::warning::Could not delete $id (HTTP $code)"
+            fi
+          done <<< "$ids"

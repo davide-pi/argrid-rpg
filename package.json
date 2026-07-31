@@ -1,7 +1,6 @@
 {
   "name": "argrid-rpg",
   "private": true,
-  "version": "0.1.0",
   "type": "module",
   "description": "PWA that detects a grid of squares in a photo and highlights it in AR style.",
   "scripts": {

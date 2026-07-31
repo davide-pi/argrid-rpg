@@ -7,9 +7,10 @@ import { draw } from './draw-loop';
 import { runDetection, processImage, camera, setStatus } from './main';
 
 // Debug-only focus indicator (next to the DBG chip): BLUE when the last detection ran with a
-// tap-to-focus point (`lastFocusPoint` set), GREY otherwise. Shown/hidden together with dbgBadge.
+// tap-to-focus point (`lastFocusPoint` set), GREY otherwise. Shown ONLY in result mode (a photo
+// loaded/captured) — never on the live camera while shooting, even with debug on.
 export function updateFocusBadge() {
-  focusBadge.hidden = !S.debug;
+  focusBadge.hidden = !S.debug || !S.showingResult;
   focusBadge.classList.toggle('on', !!S.lastFocusPoint);
 }
 

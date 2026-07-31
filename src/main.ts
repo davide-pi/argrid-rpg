@@ -47,7 +47,7 @@ import {
 import { deselectCell, initGestures } from './gestures';
 import { draw } from './draw-loop';
 import { updateInfo, initHud } from './hud';
-import { rebuildDebugBar, initDebug } from './debug-panel';
+import { rebuildDebugBar, initDebug, updateFocusBadge } from './debug-panel';
 import { showManualBar, initManualGrid } from './manual-grid';
 import { clearFocusPoint, initTapToFocus } from './tap-to-focus';
 import { installDevHook } from './dev-hook';
@@ -400,6 +400,7 @@ function retake() {
   btnEditGrid.hidden = true;
   topActions.hidden = true; // leaving result mode → hide Pulisci / Rifai
   debugBar.hidden = true; // no pipeline to inspect on the live camera
+  updateFocusBadge(); // hide the focus indicator too — we're back on the live camera
   startCamera().catch(() => {
     setStatus('Fotocamera non disponibile — tocca lo schermo per riprovare');
     hint.hidden = false;

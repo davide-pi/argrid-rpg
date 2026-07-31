@@ -31,7 +31,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
     steps:
       - name: Download deploy metadata
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: "deploy-info"
           path: "meta"
@@ -52,7 +52,7 @@ jobs:
       url: ${{ steps.netlify.outputs.deploy-url }}
     steps:
       - name: Download build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: "dist"
           path: "./dist"
@@ -61,7 +61,7 @@ jobs:
 
       - name: Deploy to Netlify
         id: netlify
-        uses: nwtgck/actions-netlify@v3.0
+        uses: nwtgck/actions-netlify@v4.0.0
         with:
           publish-dir: "./dist"
           production-deploy: ${{ needs.prepare.outputs.deploy_type == 'production' }}

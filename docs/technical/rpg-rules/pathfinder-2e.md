@@ -27,8 +27,9 @@ its top-right corner):
 
 ## Area templates (`areaCells`)
 
-Coloured whole cells (blue). Sizes are the **book presets** (`FIXED_SIZES`); line/cone orientations snap to
-the book angles (`snapToAngles`).
+Coloured whole cells (blue). The size is **free in 1 q steps** (up to what the 3-digit field shows: 999 q · 999 m · 995 ft), with the book's common
+sizes offered as one-tap presets (`AREA_PRESETS`); line/cone orientations still snap to the book angles
+(`snapToAngles`).
 
 - **Emanazione** — `blockDist` from the creature's block (alternating-diagonal, **not** Chebyshev), with a
   selectable creature size. R=1 → 3×3; R=2 → a 5×5 with its **four corners cut** (they are 3 away by the
@@ -45,10 +46,15 @@ the book angles (`snapToAngles`).
 - **Linea** — 1-cell-wide staircase from the selected cell's far corner (`lineCells`); its length is
   trimmed by PF2e cost (a straight 6q line is 6 cells, a 45° 6q line is 4). It snaps to the **four book
   slopes** (`lineAngles`, reflected into every octant): 0°, a shallow **1:3 ≈ 18.4°** (the [3,3]/[3,3,3,2]
-  staircase — same for all lengths), a steep length-dependent slope (**1:2 ≈ 26.6°** at 12q), and 45°.
+  staircase), a steep **1:2 ≈ 26.6°** ([2,2,1] at 6q, [2,2,2,2,2] at 12q), and 45°.
+  - **Only those two staircases** are ever drawn, at any length: equal runs of **3** or of **2**, with the
+    **last run allowed to be short** when the length runs out (3-3-2, 3-3-1, 2-2-1) and **never overlapping**
+    — two consecutive rows share no column. Enforced for every length by `test/line-stairs.test.ts`.
 
 **Rotation:** lines and cones are turned on the map by grabbing the handle at the shape's **tip**; the
-origin stays fixed. Faint ticks mark the book orientations and the angle snaps to them (`fixedAngles`).
+origin stays fixed. Faint ticks mark the book orientations and the angle snaps to them (`fixedAngles`). When
+a long template puts that tip off screen the handle slides back along the direction to stay grabbable — the
+template keeps its full length.
 
 ## Reach & threat (`threatCells`)
 

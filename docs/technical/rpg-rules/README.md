@@ -29,7 +29,7 @@ concrete functions/constants in `src/overlays.ts` — tuned for **Pathfinder 2e*
 | **Area templates** | which cells does an emanation / burst / cone / line cover? | `areaCells` (+ `burstDist`, `coneDir`, `lineCells`, `lineAngles`, `fixedAngles`) |
 | **Reach / threat** | which cells does a creature threaten? | `threatCells` |
 | **Movement cost** | what does moving cell→cell cost? | the step cost inside `moveCells` / `movePareto` (diagonals alternate) |
-| **Fixed sizes / orientations** | the book's preset template sizes & angles | `FIXED_SIZES`, `snapToAngles` |
+| **Sizes / orientations** | free size in 1 q steps (presets = the book's common sizes) + the book angles | `AREA_PRESETS`, `MAX_SIZE_SHOWN`, `snapToAngles` |
 | **Unit conversion** | cells ↔ metres / feet | `unitToCells` + `CELL_METERS`/`CELL_FEET` (**1 cell = 1.5 m = 5 ft**); the UI-side inverse `cellsToUnit` lives in `src/placement.ts` |
 
 ## Adding a new system

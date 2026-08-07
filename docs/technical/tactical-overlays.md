@@ -54,12 +54,33 @@ type uses the right origin:
 from a lattice corner, counting cost 1 per orthogonal step and alternating 1/2 per
 diagonal — so a straight 6q line spans 6 cells while a 45° 6q line spans 4.
 
-Sizes and angles are **fixed to the book presets** — free-size mode was removed:
+The **size is free**, the **angles stay fixed** to the book slopes:
 
-- `FIXED_SIZES` (`overlays.ts:32`) — per-type size options.
-- `lineAngles(size)` (`:224`) — the four book slopes (0°, ~18.4°, ~26.6°, 45°) reflected
-  into every octant; `fixedAngles(type, size)` (`:240`) returns line angles, the 8 cone
-  dirs, or `[]`. `snapToAngles` (`:247`) snaps the ring's raw angle to the nearest.
+- **Size** — any whole number of cells the 3-digit field can show: `MAX_SIZE_SHOWN = 999`
+  (`overlays.ts:44`) caps the *displayed* number, so the cap in CELLS depends on the unit
+  (999 q, 666 in metres, 199 in feet — `maxCellsIn` `placement.ts:258`). The HUD sets it by
+  hand with a stepper that always moves **one cell** (its step is that cell expressed in the
+  chosen unit: 1 q / 1.5 m / 5 ft), with one-tap chips from `AREA_PRESETS` (`overlays.ts:35`)
+  **beside it** — the book's common sizes per type, the first entry being that type's
+  default. Switching area type keeps the size when the new type also offers it, else falls
+  back to that default. Layout (`index.html` `#hudArea`): type chips / stepper + presets
+  (`.hud-size-row`) / creature size on its own line, shown for emanations only
+  (`#areaCreatureFld`) so the chips keep that width.
+- Both hand-set fields — the area size and a **piece's movement** — are the same component,
+  `makeCellStepper` (`placement.ts:271`): the value in CELLS lives on the input's
+  `dataset.cells` and the text is only a *view* of it, so changing unit relabels without
+  changing the size; typing, − and + all land on whole cells. Wiring: `currentSizeCells` /
+  `setSizeCells` / `refreshSizeUI` for the area, `showPieceSpeed` / `refreshMoveUI` for the
+  piece.
+- `lineAngles(size)` (`:231`) — the four book slopes (0°, ~18.4°, ~26.6°, 45°) reflected
+  into every octant; `fixedAngles(type, size)` (`:247`) returns line angles, the 8 cone
+  dirs, or `[]`. `snapToAngles` (`:254`) snaps the ring's raw angle to the nearest.
+
+Because the size is free, the line staircase is pinned by
+[`test/line-stairs.test.ts`](../../test/line-stairs.test.ts): for **every** length and every
+fixed angle a line must be runs of 3 (the 1:3 slope) or of 2 (the 1:2 slope) — 1 for the 45°
+diagonal, a single run when straight — all equal except a **last one that may be cut short**
+(3-3-2, 2-2-1), never gapped and never overlapping (two consecutive rows share no column).
 
 ## Reach / threat — `threatCells(bi, bj, w, na, nb)` (`overlays.ts:188`)
 
@@ -128,8 +149,11 @@ space so it follows perspective (`drawAngleRing` `draw-loop.ts:390`). Its geomet
 
 - `ringOriginGrid()` (`placement.ts:38`) — a **fixed** centre during a drag: the chosen
   intersection (`corner`) for a cone, the selected cell's centre for a line.
-- `ringHandleGrid()` (`placement.ts:58`) — origin + `gridDir(effectiveAngle()) ·
-  ringReachCells()` (`:52`), i.e. the line end / cone front.
+- `ringHandleGrid()` (`placement.ts:82`) — origin + `gridDir(effectiveAngle()) ·
+  ringReachCells()` (`:58`), i.e. the line end / cone front — **pulled back** along that
+  direction when the tip is off screen, so the handle stays grabbable (`gridPointOnScreen`
+  `:64` reads the canvas's rendered rect, so it follows zoom/pan). The area keeps its
+  full length; the orientation ticks follow the handle's arc.
 - `ringHit` (`placement.ts:264`) matches **only** within ~1.1 cells of that tip handle, so
   a tap on any other cell never rotates. `rotateFromPointer` (`:272`) sets
   `areaAngleDeg = angleOfGridDir(g − o)`; faint ticks mark the allowed snapped
@@ -140,7 +164,20 @@ Pan is suppressed while rotating or dragging (or editing a manual grid) via
 `attachZoomPan(view, { suppress: () => S.ringRotating || S.dragKind !== null || … })`
 (`main.ts:75`).
 
-## Draw order (`draw` `draw-loop.ts:14`)
+## Draw order (`draw` `draw-loop.ts:29`)
 
 Photo → grid (`drawFamily` ×2) → overlay → path preview → threat/counters → flanking →
-tokens → blocked-X → selection + angle ring. See [architecture.md](architecture.md).
+tokens → blocked-X → selection + angle ring → magnifier loupe (while dragging). See
+[architecture.md](architecture.md).
+
+**Cost control** — a repaint redraws the full-resolution photo and every overlay, so:
+
+- Interactive callers use `requestDraw()` (`draw-loop.ts:20`), which coalesces to **one
+  repaint per animation frame**; `draw()` stays synchronous for detection results, the
+  debug panel and the DEV hook.
+- The canvas size is assigned **only when it changes** — setting `width`/`height` always
+  resets the canvas and reallocates its buffer, even with an identical value.
+- `movePareto` is memoized on `(overlay, target, grid dims, tokens)` (`pathCache` `:200`);
+  it is the heaviest thing a redraw can trigger.
+- Dragging a piece skips the HUD rebuild (`anchorSelectionTo` `placement.ts:196`) and
+  syncs it once on release.

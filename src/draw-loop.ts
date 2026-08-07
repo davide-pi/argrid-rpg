@@ -6,10 +6,26 @@ import { areaCells, moveCells, movePareto, ringColor, gridDir, creatureBlock, ty
 import { tokenBlock, tokenObstaclesFor, threatCountMaps, oppThreatAreas, flankedEnemies } from './board';
 import {
   moveGroup, threatSidesToShow, selectedPiece, ringActive, ringOriginGrid,
-  ringHandleGrid, ringReachCells, currentFixedAngles,
+  ringHandleGrid, currentFixedAngles,
 } from './placement';
 import { loupePoint, captureLoupe, drawStrokes, drawManualHandles, drawLoupe } from './manual-grid';
 import { drawDebugStep, debugStepActive } from './debug-panel';
+
+// A pointer drag fires far more often than the screen refreshes, and every draw()
+// repaints the full-resolution photo plus every overlay. Coalesce to ONE repaint per
+// animation frame: interactive callers (drag, rotate, HUD edits) go through
+// requestDraw(); draw() itself stays synchronous for the places that need the pixels
+// right away (post-detection, debug panel, the DEV hook).
+let drawQueued = false;
+
+export function requestDraw() {
+  if (drawQueued) return;
+  drawQueued = true;
+  requestAnimationFrame(() => {
+    drawQueued = false;
+    draw();
+  });
+}
 
 export function draw() {
   if (!S.lastResult || !S.lastCapture) return;
@@ -19,8 +35,11 @@ export function draw() {
     drawDebugStep();
     return;
   }
-  view.width = r.width;
-  view.height = r.height;
+  // Assigning width/height RESETS the canvas (reallocating its buffer) even when the
+  // value doesn't change — so only touch it on a real size change. The photo below
+  // covers the whole canvas, so no clear is needed.
+  if (view.width !== r.width) view.width = r.width;
+  if (view.height !== r.height) view.height = r.height;
   const ctx = view.getContext('2d')!;
 
   ctx.drawImage(S.lastCapture, 0, 0, r.width, r.height);
@@ -81,6 +100,11 @@ export function draw() {
       drawSelection(ctx, lw);
       drawAngleRing(ctx, lw);
     }
+    // Magnifier over the finger while dragging a piece / an area / the arrival, or
+    // rotating — the same loupe the manual grid uses, for the same reason: the finger
+    // covers exactly the cell being aimed at. Captured LAST, so it magnifies the
+    // finished frame (grid + overlay + pieces), then drawn on top of it.
+    if (S.dragPoint) drawLoupe(ctx, captureLoupe(S.dragPoint));
   }
 }
 
@@ -183,6 +207,11 @@ export const MAX_PATH_MOVES = 5;
 // that spends +1 movement to be threatened by FEWER creatures, down to 0 or the
 // cap. Threats are counted PER DISTINCT CREATURE (including the start square). Each
 // route is a line coloured by its movement band, with a badge = creatures met.
+// movePareto is the heaviest thing a redraw can trigger (a multi-label Dijkstra over
+// cell × parity × creature-mask). Dragging repaints every frame while the inputs usually
+// stay the same, so memoize the last result on everything it depends on.
+let pathCache: { key: string; routes: ReturnType<typeof movePareto> } | null = null;
+
 export function drawPaths(ctx: CanvasRenderingContext2D, lw: number) {
   if (!S.gridMap || S.activeOverlay?.kind !== 'move' || !S.moveTarget) return;
   const ov = S.activeOverlay;
@@ -191,7 +220,16 @@ export function drawPaths(ctx: CanvasRenderingContext2D, lw: number) {
   const obs = tokenObstaclesFor(group);
   const cappedMv = { ...ov, moves: Math.min(ov.moves, MAX_PATH_MOVES) };
 
-  const routes = movePareto(cappedMv, na, nb, S.moveTarget, MAX_PATH_MOVES, oppThreatAreas(group), obs);
+  const key = JSON.stringify([
+    cappedMv.cell, cappedMv.speedCells, cappedMv.moves, cappedMv.creatureCells, group,
+    S.moveTarget, na, nb, S.tokens.map((t) => [t.kind, t.i, t.j, t.w]),
+  ]);
+  if (pathCache?.key !== key)
+    pathCache = {
+      key,
+      routes: movePareto(cappedMv, na, nb, S.moveTarget, MAX_PATH_MOVES, oppThreatAreas(group), obs),
+    };
+  const routes = pathCache.routes;
 
   ctx.save();
   ctx.lineJoin = 'round';
@@ -392,10 +430,13 @@ export function drawAngleRing(ctx: CanvasRenderingContext2D, lw: number) {
   const o = ringOriginGrid();
   const h = ringHandleGrid();
   if (!o || !h) return;
-  const R = ringReachCells();
+  // The ticks sit on the HANDLE's arc, not the tip's: when a long area pushes its tip
+  // off screen the handle is pulled back (see ringHandleGrid), and the orientation marks
+  // must follow it to stay readable.
+  const R = Math.max(0.5, Math.hypot(h[0] - o[0], h[1] - o[1]));
   const toImg = (a: number, b: number) => S.gridMap!.toImage(a, b);
   ctx.save();
-  // Ticks at the allowed orientations, on the tip's arc.
+  // Ticks at the allowed orientations, on the handle's arc.
   ctx.strokeStyle = 'rgba(147,197,253,0.75)';
   ctx.lineWidth = Math.max(1.5, lw * 0.5);
   for (const ang of currentFixedAngles()) {

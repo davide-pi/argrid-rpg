@@ -74,7 +74,15 @@ export const infoBtn = $<HTMLButtonElement>('infoBtn');
 export const infoPop = $<HTMLDivElement>('infoPop');
 // Area controls (live inside the HUD now).
 export const areaTypeBox = $<HTMLDivElement>('areaType');
-export const areaSizeSel = $<HTMLSelectElement>('areaSizeSel');
+// Area size: a manual stepper (value shown in the chosen unit, always moved in whole
+// cells) plus a row of one-tap preset chips built from AREA_PRESETS.
+export const areaSizeInput = $<HTMLInputElement>('areaSizeInput');
+export const areaSizeMinus = $<HTMLButtonElement>('areaSizeMinus');
+export const areaSizePlus = $<HTMLButtonElement>('areaSizePlus');
+export const areaSizeUnit = $<HTMLSpanElement>('areaSizeUnit');
+export const areaPresets = $<HTMLDivElement>('areaPresets');
+// The creature select + its label: shown only for emanations, on its own line.
+export const areaCreatureFld = $<HTMLLabelElement>('areaCreatureFld');
 export const areaUnit = $<HTMLSelectElement>('areaUnit');
 export const areaCreature = $<HTMLSelectElement>('areaCreature');
 export const brand = $<HTMLElement>('brand');
@@ -84,7 +92,11 @@ export const versionBadge = $<HTMLSpanElement>('versionBadge');
 export const dbgBadge = $<HTMLSpanElement>('dbgBadge');
 // Debug-only focus indicator (next to the DBG chip).
 export const focusBadge = $<HTMLSpanElement>('focusBadge');
-// Per-piece editor (Taglia / Movimento), shown when a token is selected.
+// Per-piece editor (Taglia / Movimento), shown when a token is selected. Movement uses
+// the same hand-set stepper as the area size.
 export const pieceSize = $<HTMLSelectElement>('pieceSize');
-export const pieceMove = $<HTMLSelectElement>('pieceMove');
+export const pieceMove = $<HTMLInputElement>('pieceMove');
+export const pieceMoveMinus = $<HTMLButtonElement>('pieceMoveMinus');
+export const pieceMovePlus = $<HTMLButtonElement>('pieceMovePlus');
+export const pieceMoveUnit = $<HTMLSpanElement>('pieceMoveUnit');
 export const pieceRemove = $<HTMLButtonElement>('pieceRemove');

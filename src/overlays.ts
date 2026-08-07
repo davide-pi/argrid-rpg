@@ -28,13 +28,21 @@ export interface MoveOverlay {
 }
 export type Overlay = AreaOverlay | MoveOverlay;
 
-/** Fixed-mode size presets (in cells) per area type, from the PF2e templates. */
-export const FIXED_SIZES: Record<AreaType, number[]> = {
-  emanazione: [1, 2],
+/** Quick-pick sizes (in cells) per area type: the lengths the book uses most, offered
+ * as one-tap presets. They are NOT the only sizes — the size is free and moves in whole
+ * cells (1 q), so any length the 3-digit field can show can be dialled in by hand. The FIRST
+ * entry is the type's default (what a freshly chosen type starts at). */
+export const AREA_PRESETS: Record<AreaType, number[]> = {
+  emanazione: [1, 2, 3, 4, 6], // 5 / 10 / 15 / 20 / 30 ft
   esplosione: [1, 2, 3, 4, 6],
-  cono: [3, 6, 12],
-  linea: [6, 12],
+  cono: [3, 6, 12, 18, 24], // 15 / 30 / 60 / 90 / 120 ft
+  linea: [6, 12, 24], // 30 / 60 / 120 ft
 };
+
+/** Hand-set sizes (area templates and piece speed) are typed into a 3-digit field, so the
+ * displayed number never passes `MAX_SIZE_SHOWN`. The cap in CELLS therefore depends on
+ * the unit — 999 q, but 666 cells at 1.5 m each, 199 at 5 ft each (see `maxCellsIn`). */
+export const MAX_SIZE_SHOWN = 999;
 
 /** Creature sizes and the square block (in cells) each occupies. Minuscola,
  * Piccola and Media all take one cell, so they're grouped into a single option. */

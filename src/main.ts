@@ -34,13 +34,12 @@ import {
   areaCreature,
   versionBadge,
   pieceSize,
-  pieceMove,
 } from './dom';
 import {
   setPlaceMode,
   updateFabEnabled,
   highlightAreaType,
-  refreshMoveUI,
+  showPieceSpeed,
   DEFAULT_PIECE_SPEED,
   initPlacement,
 } from './placement';
@@ -367,16 +366,14 @@ function reportStatus() {
   setStatus('');
 }
 
-// Populate the fixed selects once.
+// Populate the creature-size selects once, and seed both hand-set steppers.
 {
   const sizeOpts = CREATURE_SIZES.map((c) => `<option value="${c.cells}">${c.label}</option>`).join('');
   areaCreature.innerHTML = sizeOpts;
   pieceSize.innerHTML = sizeOpts;
-  // Piece movement in cells (1..12), labelled in the chosen unit; default 6.
-  refreshMoveUI();
-  pieceMove.value = String(DEFAULT_PIECE_SPEED);
-  // Populate the area size select up-front so the FIRST area is built with a real
-  // size (previously it was empty until the HUD refreshed → only the origin dot).
+  showPieceSpeed(DEFAULT_PIECE_SPEED); // movement starts at 6 cells, shown in the chosen unit
+  // Fill in the area size up-front so the FIRST area is built with a real size
+  // (previously it was empty until the HUD refreshed → only the origin dot).
   highlightAreaType();
 }
 

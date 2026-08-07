@@ -46,6 +46,7 @@ body {
 .hud-icon,
 .capture-btn,
 .chip,
+.step-btn,
 .sel {
   touch-action: manipulation;
 }
@@ -1411,28 +1412,111 @@ body {
   line-height: 1.1;
   font-size: 12px;
 }
-/* Area section: the type chips + size (+ creature) selects on one wrapping line. */
-.hud-area-row {
+/* Area section: the type chips take their own line, then the size — the hand-set stepper
+   with the common sizes BESIDE it (which is why the stepper stays narrow). For emanations
+   the creature select drops to a line of its own so the chips keep that width. */
+.hud-size-row {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 }
-.hud-area-row .segtype {
-  display: flex;
-  flex-wrap: wrap;
-  width: auto;
+.hud-size-row .preset-row {
   flex: 1 1 auto;
   min-width: 0;
-  gap: 6px;
 }
-.hud-area-row .segtype .chip {
-  padding: 8px 11px;
-  border-radius: 999px;
-  font-size: 12px;
+/* Piece editor: size and movement side by side on one line, never wrapping. */
+.piece-row {
+  flex-wrap: nowrap;
+  gap: 10px;
 }
-.hud-area-row .sel {
+.piece-row .fld {
+  min-width: 0;
+  overflow: hidden; /* the size select gives way rather than pushing movement off the row */
+}
+.piece-row .sel {
+  min-width: 0;
+}
+/* Hand-set size: a stepper that always moves one whole cell (1 q), with the unit shown
+   next to the number (the header select relabels it). Used by the area size and by a
+   piece's movement. */
+.stepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
   flex: 0 0 auto;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 2px;
+}
+.stepper:focus-within {
+  border-color: var(--tactic);
+}
+.step-btn {
+  width: 30px;
+  height: 32px;
+  flex: none;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--fg);
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+}
+.step-btn:active {
+  transform: translateY(1px);
+}
+.step-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.step-input {
+  /* The value is capped at 3 digits, so the field is sized for exactly that (`ch` is a
+     digit's width, and tabular-nums keeps every digit the same) — no wider, to leave the
+     row's space to the preset chips beside it. */
+  width: 4ch;
+  height: 32px;
+  border: 0;
+  padding: 0 1px;
+  background: transparent;
+  color: var(--fg);
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums; /* digits keep their width while stepping */
+  text-transform: none; /* never inherit the `.fld` label's uppercase */
+  letter-spacing: 0;
+  text-align: right;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.step-input::-webkit-outer-spin-button,
+.step-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.step-input:focus {
+  outline: none;
+}
+.step-unit {
+  padding-right: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  /* The unit is always written lowercase (q / m / ft) — the piece editor's `.fld` label
+     is uppercased, and the unit must not inherit that. */
+  text-transform: lowercase;
+  letter-spacing: 0;
+}
+/* Preset chips sit beside the stepper, so they're compact and wrap within the space left. */
+.preset-row {
+  gap: 5px;
+  justify-content: flex-start;
+}
+.preset-row .chip {
+  padding: 6px 9px;
+  font-size: 12px;
 }
 .seg {
   display: flex;

@@ -2,11 +2,11 @@
 import { S } from './tactical-state';
 import {
   hud, hudBadge, hudTitle, hudArea, hudPiece, hudMove, hudCollapse, hudClose,
-  pieceRemove, pieceSize, pieceMove, infoWrap, infoBtn, infoPop,
+  pieceRemove, pieceSize, infoWrap, infoBtn, infoPop,
 } from './dom';
-import { selectedPiece, highlightAreaType, moveGroup, updateFabIcon } from './placement';
+import { selectedPiece, highlightAreaType, moveGroup, updateFabIcon, showPieceSpeed } from './placement';
 import { deselectCell } from './gestures';
-import { draw } from './draw-loop';
+import { requestDraw } from './draw-loop';
 
 // The exact top-bar button icons (Lucide), inlined so the (i) guidance points at the
 // real controls with their real glyphs — kept in sync with index.html (#btnEditGrid /
@@ -28,8 +28,10 @@ export function currentInfo(): string | null {
       : 'Trascina gli angoli per adattare la griglia · trascina il centro per spostarla.\nAvvicina o allontana due dita per ridimensionarla.';
   }
   if (S.placeMode === 'area') return 'Tocca una cella per posizionare l’area.';
-  if (S.placeMode === 'ally') return 'Tocca le celle per aggiungere o togliere alleati.';
-  if (S.placeMode === 'enemy') return 'Tocca le celle per aggiungere o togliere nemici.';
+  if (S.placeMode === 'ally')
+    return 'Tocca le celle per aggiungere o togliere alleati.\nTrascina una pedina per spostarla.';
+  if (S.placeMode === 'enemy')
+    return 'Tocca le celle per aggiungere o togliere nemici.\nTrascina una pedina per spostarla.';
   const ctx = hudContext();
   if (ctx === 'move')
     return 'Tocca una cella per vedere i percorsi · tocca un’altra pedina per spostarti su di essa.';
@@ -80,28 +82,36 @@ export function refreshHud() {
   }
   hud.hidden = false;
   hud.classList.toggle('collapsed', S.hudCollapsed);
-  // Movement has no body controls (its guidance lives behind the (i) button), so
-  // drop the empty body and its collapse chevron.
-  hud.classList.toggle('bodyless', ctx === 'move');
-  hudCollapse.hidden = ctx === 'move';
+  // The piece editor (Taglia / Movimento) follows the PIECE, not the context: it shows
+  // for a selected piece AND while that piece's movement is on the map. Movement used to
+  // be bodyless, which left a placed piece with no way back to its size/speed (tapping it
+  // starts a movement, so the editor was only a long-press away).
+  const piece = selectedPiece();
+  const showPiece = !!piece && (ctx === 'piece' || ctx === 'move');
+  // Nothing to edit (a movement whose piece is gone) → drop the empty body and its chevron.
+  hud.classList.toggle('bodyless', !showPiece && ctx !== 'area');
+  hudCollapse.hidden = !showPiece && ctx !== 'area';
   hudArea.hidden = ctx !== 'area';
-  hudPiece.hidden = ctx !== 'piece';
-  hudMove.hidden = ctx !== 'move';
-  pieceRemove.hidden = ctx !== 'piece'; // the trash lives in the head, only for a piece
+  hudPiece.hidden = !showPiece;
+  // The movement section holds no controls today (its guidance is behind the (i)); an
+  // empty visible section would only add a gap above the piece editor.
+  hudMove.hidden = ctx !== 'move' || hudMove.childElementCount === 0;
+  pieceRemove.hidden = !showPiece; // the trash lives in the head, only for a piece
   hudBadge.className = 'hud-badge';
   if (ctx === 'area') {
     hudTitle.textContent = 'Area';
     hudBadge.classList.add('area');
-    highlightAreaType(); // sync the chips + size / creature selects
+    highlightAreaType(); // sync the chips + size / creature controls
   } else if (ctx === 'piece') {
-    const t = selectedPiece()!;
-    hudTitle.textContent = t.kind === 'ally' ? 'Alleato' : 'Nemico';
-    hudBadge.classList.add(t.kind);
-    pieceSize.value = String(t.w);
-    pieceMove.value = String(t.speed);
+    hudTitle.textContent = piece!.kind === 'ally' ? 'Alleato' : 'Nemico';
+    hudBadge.classList.add(piece!.kind);
   } else {
     hudTitle.textContent = 'Movimento';
     hudBadge.classList.add(moveGroup());
+  }
+  if (showPiece) {
+    pieceSize.value = String(piece!.w);
+    showPieceSpeed(piece!.speed);
   }
   updateInfo();
 }
@@ -122,7 +132,7 @@ export function removeActiveArea() {
   S.moveTarget = null;
   refreshHud();
   updateFabIcon();
-  draw();
+  requestDraw();
 }
 
 export function initHud() {
@@ -141,7 +151,7 @@ hudClose.addEventListener('click', () => {
   if (S.activeOverlay?.kind === 'area') removeActiveArea();
   else {
     deselectCell();
-    draw();
+    requestDraw();
   }
 });
 }

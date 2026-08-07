@@ -1,11 +1,18 @@
 // Placement (FAB) + per-piece editor + area controls + on-map angle ring + movement start.
 import { S, type Token } from './tactical-state';
-import { fabWrap, fab, fabAlly, fabEnemy, fabArea, areaTypeBox, areaSizeSel, areaUnit, areaCreature, pieceSize, pieceMove, pieceRemove } from './dom';
-import { FIXED_SIZES, fixedAngles, snapToAngles, gridDir, angleOfGridDir, type Unit, type AreaType, type MoveOverlay } from './overlays';
+import {
+  view, fabWrap, fab, fabAlly, fabEnemy, fabArea, areaTypeBox, areaSizeInput, areaSizeMinus,
+  areaSizePlus, areaSizeUnit, areaPresets, areaUnit, areaCreature, areaCreatureFld,
+  pieceSize, pieceMove, pieceMoveMinus, pieceMovePlus, pieceMoveUnit, pieceRemove,
+} from './dom';
+import {
+  AREA_PRESETS, MAX_SIZE_SHOWN, unitToCells, fixedAngles, snapToAngles, gridDir,
+  angleOfGridDir, type Unit, type AreaType, type MoveOverlay,
+} from './overlays';
 import { tokenCovers, tokenAt, tokenBlock, blockToCell } from './board';
 import { deselectCell, pointerToGrid } from './gestures';
 import { showHud, updateInfo, removeActiveArea } from './hud';
-import { draw } from './draw-loop';
+import { requestDraw } from './draw-loop';
 import { setStatus } from './main';
 
 export const DEFAULT_PIECE_SPEED = 6;
@@ -53,14 +60,43 @@ export function ringReachCells(): number {
   return Math.max(1, currentSizeCells());
 }
 
+/** Is this grid point currently ON SCREEN? Goes through the canvas's rendered rect, so
+ * it accounts for the zoom/pan transform, and keeps `margin` px of slack for the handle
+ * to be touchable rather than half off the edge. */
+function gridPointOnScreen(g: [number, number], margin: number): boolean {
+  if (!S.gridMap) return false;
+  const rect = view.getBoundingClientRect();
+  if (rect.width === 0 || rect.height === 0) return false;
+  const [x, y] = S.gridMap.toImage(g[0], g[1]);
+  const cx = rect.left + (x / view.width) * rect.width;
+  const cy = rect.top + (y / view.height) * rect.height;
+  return (
+    cx >= margin && cy >= margin &&
+    cx <= window.innerWidth - margin && cy <= window.innerHeight - margin
+  );
+}
+
+/** Slack (px) kept between the rotation handle and the screen edge. */
+const HANDLE_MARGIN_PX = 28;
+
 // Grid position of the rotation handle at the current effective angle (null if
-// there is nothing to rotate).
+// there is nothing to rotate). Normally the shape's tip — but a long area (or a
+// zoomed-in map) puts that tip off screen, where it can't be grabbed, so the handle
+// is pulled BACK along the direction to the farthest point still on screen. Only the
+// handle moves; the area itself keeps its full length.
 export function ringHandleGrid(): [number, number] | null {
   const o = ringOriginGrid();
   if (!o) return null;
   const d = gridDir(effectiveAngle());
   const R = ringReachCells();
-  return [o[0] + d[0] * R, o[1] + d[1] * R];
+  const at = (t: number): [number, number] => [o[0] + d[0] * R * t, o[1] + d[1] * R * t];
+  const tip = at(1);
+  if (gridPointOnScreen(tip, HANDLE_MARGIN_PX)) return tip;
+  for (let t = 0.9; t >= 0.15; t -= 0.05) {
+    const p = at(t);
+    if (gridPointOnScreen(p, HANDLE_MARGIN_PX)) return p;
+  }
+  return tip; // the whole ray is off screen (the origin too) — nothing better to offer
 }
 
 /** Build a movement overlay for a token — movement always starts from a piece,
@@ -69,6 +105,18 @@ export function moveOverlayFromToken(t: Token): MoveOverlay {
   const { bi, bj, w } = tokenBlock(t);
   const speedCells = Math.max(0, t.speed || 0); // the piece's own movement (in cells)
   return { kind: 'move', cell: blockToCell(bi, bj, w), speedCells, moves: MOVE_ACTIONS, creatureCells: w, group: t.kind };
+}
+
+/** Re-anchor the ACTIVE movement on its piece after the piece changed (size/speed),
+ * so editing a moving piece updates what's drawn instead of dropping the movement.
+ * The arrival cell is kept — tweaking the speed must not lose the planned route. */
+export function syncMoveOverlayTo(t: Token) {
+  if (S.activeOverlay?.kind !== 'move') return;
+  const { bi, bj, w } = tokenBlock(t);
+  const cell = blockToCell(bi, bj, w);
+  S.selectedCell = [cell[0], cell[1]];
+  S.selectedNode = [cell[0], cell[1]];
+  S.activeOverlay = moveOverlayFromToken(t);
 }
 
 /** Start (or switch) movement from the token on cell (i,j). Returns false if the
@@ -84,7 +132,7 @@ export function startMovementFromCell(i: number, j: number): boolean {
   S.activeOverlay = moveOverlayFromToken(t);
   showHud(); // starting a movement is an explicit action → expand the HUD
   updateFabIcon();
-  draw();
+  requestDraw();
   return true;
 }
 
@@ -148,7 +196,7 @@ export function placeOrRemoveAt(i: number, j: number) {
   if (idx >= 0) {
     S.tokens.splice(idx, 1);
     deselectCell();
-    draw();
+    requestDraw();
     return;
   }
   const t: Token = {
@@ -160,17 +208,23 @@ export function placeOrRemoveAt(i: number, j: number) {
   };
   S.tokens.push(t);
   selectPieceAt(i, j); // select the just-added piece so it can be tweaked
-  draw();
+  requestDraw();
+}
+
+/** Point the selection at a piece WITHOUT touching the HUD. Used while DRAGGING, where
+ * the panel's content doesn't change and rebuilding it on every pointermove costs. */
+export function anchorSelectionTo(t: Token) {
+  const { bi, bj, w } = tokenBlock(t);
+  const cell = blockToCell(bi, bj, w);
+  S.selectedCell = [cell[0], cell[1]];
+  S.selectedNode = [cell[0], cell[1]];
 }
 
 /** Select the token covering (i,j) and open its editor. */
 export function selectPieceAt(i: number, j: number) {
   const t = tokenAt(i, j);
   if (!t) return;
-  const { bi, bj, w } = tokenBlock(t);
-  const cell = blockToCell(bi, bj, w);
-  S.selectedCell = [cell[0], cell[1]];
-  S.selectedNode = [cell[0], cell[1]];
+  anchorSelectionTo(t);
   S.activeOverlay = null;
   S.moveTarget = null;
   showHud(); // opening a piece editor is explicit → expand the HUD
@@ -186,7 +240,7 @@ export function creatureVal(sel: HTMLSelectElement): number {
   return Math.max(1, +sel.value || 1);
 }
 
-// Sizes come from the PF2e preset list (labelled in the chosen unit).
+// Sizes are FREE and always land on a whole cell; the unit only relabels them.
 export function cellsToUnit(cells: number, unit: Unit): number {
   if (unit === 'm') return cells * 1.5;
   if (unit === 'ft') return cells * 5;
@@ -197,28 +251,135 @@ export function sizeLabel(cells: number, unit: Unit): string {
   return `${cellsToUnit(cells, unit)} ${unit}`;
 }
 
-export function refreshSizeUI() {
-  const opts = FIXED_SIZES[S.currentAreaType];
-  const prev = +areaSizeSel.value;
-  areaSizeSel.innerHTML = opts
-    .map((s) => `<option value="${s}">${sizeLabel(s, areaUnit.value as Unit)}</option>`)
-    .join('');
-  if (opts.includes(prev)) areaSizeSel.value = String(prev);
+/** The measure unit chosen in the header. */
+const unit = (): Unit => areaUnit.value as Unit;
+
+const round2 = (v: number): number => Math.round(v * 100) / 100;
+
+/** The largest whole-cell size whose LABEL still fits the 3-digit field in `u`:
+ * 999 q, 666 cells in metres (999 m), 199 in feet (995 ft). */
+function maxCellsIn(u: Unit): number {
+  return Math.max(1, Math.floor(MAX_SIZE_SHOWN / cellsToUnit(1, u)));
 }
 
-// The piece Movement select (1..12 cells) is LABELLED in the chosen unit — "6 q",
-// "9 m", "30 ft" — like the area size, so the number carries its measure.
-export function refreshMoveUI() {
-  const prev = pieceMove.value || String(DEFAULT_PIECE_SPEED);
-  pieceMove.innerHTML = Array.from({ length: 12 }, (_, k) => {
-    const cells = k + 1;
-    return `<option value="${cells}">${sizeLabel(cells, areaUnit.value as Unit)}</option>`;
-  }).join('');
-  pieceMove.value = prev;
+/** A size in cells: a whole cell inside [1, maxCellsIn(unit)], whatever was typed. */
+const clampCells = (cells: number): number =>
+  Math.max(1, Math.min(maxCellsIn(unit()), Math.round(cells || 0)));
+
+/**
+ * A size field set BY HAND — the area template's length, a piece's movement. The value
+ * lives in CELLS on the input's dataset; the text is only its VIEW in the chosen unit, so
+ * switching unit relabels without changing the size. Typing, − and + all land on whole
+ * cells (the field's `step` is one cell expressed in that unit: 1 q / 1.5 m / 5 ft).
+ * `onEdit` fires only for the USER's edits, never for a programmatic `set`.
+ */
+function makeCellStepper(
+  input: HTMLInputElement,
+  minus: HTMLButtonElement,
+  plus: HTMLButtonElement,
+  unitEl: HTMLElement,
+  fallback: () => number,
+  onEdit: () => void,
+) {
+  const get = (): number => {
+    const raw = input.dataset.cells;
+    return clampCells(raw === undefined ? fallback() : +raw);
+  };
+  const set = (cells: number) => {
+    const c = clampCells(cells);
+    input.dataset.cells = String(c);
+    input.value = String(round2(cellsToUnit(c, unit())));
+    minus.disabled = c <= 1; // nothing below one cell…
+    plus.disabled = c >= maxCellsIn(unit()); // …nor past what the field can show
+  };
+  const relabel = () => {
+    const u = unit();
+    const cell = cellsToUnit(1, u);
+    input.step = String(cell);
+    input.min = String(cell);
+    input.max = String(cellsToUnit(maxCellsIn(u), u));
+    unitEl.textContent = u;
+    set(get()); // re-show the same size in the (possibly new) unit
+  };
+  const edit = (cells: number) => {
+    set(cells);
+    onEdit();
+  };
+  const attach = () => {
+    input.addEventListener('input', () => {
+      // Don't rewrite the field mid-typing (the caret would jump) — the value snaps to
+      // whole cells here and the TEXT is normalized on commit (change/blur).
+      input.dataset.cells = String(clampCells(unitToCells(+input.value, unit())));
+      onEdit();
+    });
+    input.addEventListener('change', () => edit(get()));
+    minus.addEventListener('click', () => edit(get() - 1));
+    plus.addEventListener('click', () => edit(get() + 1));
+  };
+  return { get, set, relabel, attach };
 }
 
+// The area template's size, with the preset chips below it.
+const areaSize = makeCellStepper(
+  areaSizeInput, areaSizeMinus, areaSizePlus, areaSizeUnit,
+  () => AREA_PRESETS[S.currentAreaType][0],
+  () => {
+    markActivePreset();
+    if (S.activeOverlay?.kind === 'area') updateAreaOverlay();
+  },
+);
+
+// The selected piece's movement, edited live like everything else in the HUD.
+const pieceSpeed = makeCellStepper(
+  pieceMove, pieceMoveMinus, pieceMovePlus, pieceMoveUnit,
+  () => DEFAULT_PIECE_SPEED,
+  () => {
+    const t = selectedPiece();
+    if (!t) return;
+    t.speed = pieceSpeed.get();
+    syncMoveOverlayTo(t); // a movement on screen redraws with the new speed
+    requestDraw();
+  },
+);
+
+/** The area size in CELLS. */
 export function currentSizeCells(): number {
-  return +areaSizeSel.value || 0;
+  return areaSize.get();
+}
+
+/** Show a size (cells) in the area stepper. Leaves the overlay alone — callers rebuild
+ * it when the change is the user's. */
+export function setSizeCells(cells: number) {
+  areaSize.set(cells);
+  markActivePreset();
+}
+
+/** Show a piece's movement (cells) in its stepper. */
+export function showPieceSpeed(cells: number) {
+  pieceSpeed.set(cells);
+}
+
+/** Light up the preset chip matching the current size (none when it was hand-typed). */
+function markActivePreset() {
+  const c = currentSizeCells();
+  for (const el of areaPresets.querySelectorAll<HTMLElement>('.chip'))
+    el.classList.toggle('on', +el.dataset.cells! === c);
+}
+
+/** Relabel the size stepper and rebuild the preset chips for the current type + unit. */
+export function refreshSizeUI() {
+  const u = unit();
+  areaSize.relabel();
+  areaPresets.innerHTML = AREA_PRESETS[S.currentAreaType]
+    .map((c) => `<button type="button" class="chip" data-cells="${c}">${sizeLabel(c, u)}</button>`)
+    .join('');
+  markActivePreset();
+}
+
+/** Relabel the piece-movement stepper for the chosen unit ("6 q" → "9 m" → "30 ft"),
+ * keeping the same number of cells. */
+export function refreshMoveUI() {
+  pieceSpeed.relabel();
 }
 
 /** The fixed orientations for the current area/size (empty if it has none). */
@@ -238,7 +399,9 @@ export function highlightAreaType() {
   }
   // Line/cone rotate via the on-map ring (tip handle) — the rotation hint lives
   // behind the (i) button and depends on the type, so refresh it.
-  areaCreature.hidden = S.currentAreaType !== 'emanazione'; // creature size only for emanations
+  // Creature size only for emanations — hide the whole field (label included); it sits on
+  // its own line so the preset chips keep the width beside the stepper.
+  areaCreatureFld.hidden = S.currentAreaType !== 'emanazione';
   refreshSizeUI();
   updateInfo();
 }
@@ -256,7 +419,7 @@ export function updateAreaOverlay() {
     creatureCells: creatureVal(areaCreature),
   };
   updateFabIcon(); // an area is now active → FAB is the ✕
-  draw();
+  requestDraw();
 }
 
 // True only when a pointer lands on the rotation handle (the shape's tip), so a
@@ -275,7 +438,7 @@ export function rotateFromPointer(clientX: number, clientY: number) {
   if (!g || !o) return;
   S.areaAngleDeg = angleOfGridDir(g[0] - o[0], g[1] - o[1]);
   if (S.activeOverlay?.kind === 'area') updateAreaOverlay();
-  else draw();
+  else requestDraw();
 }
 
 // The tapped grid cell (floored), or null off-grid.
@@ -302,7 +465,7 @@ export function setMoveTargetAt(clientX: number, clientY: number) {
   const c = pointerCell(clientX, clientY);
   if (!c) return;
   S.moveTarget = c;
-  draw();
+  requestDraw();
 }
 
 export function initPlacement() {
@@ -310,23 +473,36 @@ export function initPlacement() {
 areaTypeBox.addEventListener('click', (e) => {
   const chip = (e.target as HTMLElement).closest<HTMLElement>('.chip');
   const t = chip?.dataset.t as AreaType | undefined;
-  if (!t) return;
+  if (!t || t === S.currentAreaType) return; // re-tapping the same type must not reset the size
   S.currentAreaType = t;
+  // Keep a size the new type also offers; otherwise start from that type's default (a
+  // 1 q cone or line would be a poor default).
+  const opts = AREA_PRESETS[t];
+  if (!opts.includes(currentSizeCells())) setSizeCells(opts[0]);
   highlightAreaType();
   if (S.activeOverlay?.kind === 'area') updateAreaOverlay();
 });
-// Live edits (the map is dynamic — no confirm needed). The unit relabels BOTH the
-// area size and the piece movement selects ("6 q" → "9 m" …).
+// Live edits (the map is dynamic — no confirm needed). The unit relabels the area size
+// (stepper + presets) and the piece movement ("6 q" → "9 m" …) without changing the
+// underlying number of cells.
 areaUnit.addEventListener('input', () => {
   refreshSizeUI();
   refreshMoveUI();
   if (S.activeOverlay?.kind === 'area') updateAreaOverlay();
 });
-for (const el of [areaSizeSel, areaCreature]) {
-  el.addEventListener('input', () => {
-    if (S.activeOverlay?.kind === 'area') updateAreaOverlay();
-  });
-}
+// Both hand-set fields (area size, piece movement): type it, or step it a cell at a time.
+areaSize.attach();
+pieceSpeed.attach();
+// …plus the one-tap presets for the area size.
+areaPresets.addEventListener('click', (e) => {
+  const chip = (e.target as HTMLElement).closest<HTMLElement>('.chip');
+  if (!chip) return;
+  setSizeCells(+chip.dataset.cells!);
+  if (S.activeOverlay?.kind === 'area') updateAreaOverlay();
+});
+areaCreature.addEventListener('input', () => {
+  if (S.activeOverlay?.kind === 'area') updateAreaOverlay();
+});
 // FAB speed-dial: ＋ opens the menu; while a placement mode is active OR an area is on
 // the map the FAB is an ✕ — it exits the mode, or REMOVES the active area (the same ✕
 // that adds an area removes it, so you always have an ✕ to make the area disappear).
@@ -350,21 +526,19 @@ pieceSize.addEventListener('input', () => {
   t.i = Math.round(bi + oldW / 2 - newW / 2);
   t.j = Math.round(bj + oldW / 2 - newW / 2);
   const nb = tokenBlock(t);
-  selectPieceAt(nb.bi, nb.bj); // re-anchor selection to the resized block
-  draw();
+  // Resizing while its movement is shown keeps the movement (recomputed for the new
+  // block); otherwise re-anchor the selection to the resized block.
+  if (S.activeOverlay?.kind === 'move') syncMoveOverlayTo(t);
+  else selectPieceAt(nb.bi, nb.bj);
+  requestDraw();
 });
-pieceMove.addEventListener('input', () => {
-  const t = selectedPiece();
-  if (!t) return;
-  t.speed = Math.max(0, +pieceMove.value || 0);
-  draw();
-});
+// (the Movement stepper is wired above, with the area size — see pieceSpeed)
 pieceRemove.addEventListener('click', () => {
   const t = selectedPiece();
   if (!t) return;
   const idx = S.tokens.indexOf(t);
   if (idx >= 0) S.tokens.splice(idx, 1);
   deselectCell();
-  draw();
+  requestDraw();
 });
 }

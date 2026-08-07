@@ -249,8 +249,72 @@ contextual control surface (the HUD) instead of a sheet + panel.
 ### HUD does not reopen when you reposition
 **Decision:** dragging an area calls a slimmed `selectCellAt` that only moves the
 overlay; the HUD auto-expands only on explicit actions (add area / open editor / start
-movement) or the chevron (`refreshHud` `src/hud.ts:74`, `showHud` `src/hud.ts:111`).
+movement) or the chevron (`refreshHud` `src/hud.ts:76`, `showHud` `src/hud.ts:118`).
 **Why:** "se riduco il menù non deve riaprirsi se sposto l'area."
+
+### The piece editor follows the PIECE, not the context
+**Decision:** the Taglia / Movimento controls (and the trash) show whenever a piece is
+selected **and** while that piece's movement is on the map; only a movement whose piece is
+gone stays bodyless (`refreshHud` `src/hud.ts:76`, `showPiece` `:90`). Editing either one
+re-anchors the live movement instead of dropping it, keeping the chosen arrival
+(`syncMoveOverlayTo` `src/placement.ts:83`).
+**Why:** a placed piece was effectively frozen — tapping it starts a movement, and the
+movement HUD had no body, so size/speed were reachable only through an undiscoverable
+long-press (and not at all while placing). Speed is also exactly what one wants to fix
+*while* looking at the movement it produces.
+
+### Placement mode: tap removes a piece, drag moves it
+**Decision:** in `ally`/`enemy` placement a pointer landing on a piece starts a `piece`
+drag (no long-press); the release deletes it **only if it never moved**
+(`src/gestures.ts:157` and the `pointerup` `piece` branch `:229`).
+**Why:** "rimuoverle con un click … ma anche spostarle tramite drag and drop senza che
+vengano cancellate." Before, a drag in placement mode did nothing at all. Pieces are
+always addressed through `tokenBlock` (`pieceCell` `src/gestures.ts:97`) because `t.i/t.j`
+are raw values the block clamps at the board edge.
+
+### Redraws are coalesced to one per animation frame
+**Decision:** interactive callers (drag, rotate, HUD edits) go through `requestDraw()`
+(`src/draw-loop.ts:20`), a `requestAnimationFrame`-coalesced repaint; `draw()` stays
+synchronous for detection results, the debug panel and the DEV hook. Two costs were
+removed alongside it: the canvas size is only assigned when it actually changes
+(assigning `width`/`height` *always* resets the canvas and reallocates its buffer), and
+`movePareto` is memoized on its inputs (`pathCache` `src/draw-loop.ts:200`). Dragging a
+piece no longer rebuilds the HUD per pointermove — it syncs once on release
+(`anchorSelectionTo` `src/placement.ts:196`).
+**Why:** "mi sembra un po' laggoso quando si ruotano le aree o si muove qualcosa."
+A pointer fires far more often than the screen refreshes, and each repaint redraws a
+full-resolution photo plus every overlay.
+
+### The rotation handle is pulled back to stay on screen
+**Decision:** `ringHandleGrid` (`src/placement.ts:82`) puts the handle on the shape's tip
+only while that tip is visible; otherwise it walks back along the direction to the
+farthest point still on screen (`gridPointOnScreen`, which reads the canvas's rendered
+rect, so it accounts for zoom/pan). The orientation ticks follow the handle's arc
+(`drawAngleRing` `src/draw-loop.ts:437`).
+**Why:** "se l'area esce dallo schermo non riesco più a ruotarla" — a 24 q line or a
+zoomed-in map put the only grab point outside the viewport. The area keeps its full
+length; only the handle moves.
+
+### The magnifier loupe is shared with tactical drags
+**Decision:** `S.dragPoint` (image pixels, set by the gesture layer) drives the same
+loupe the manual-grid editor uses, captured LAST in `draw()` so it magnifies the finished
+frame (`src/draw-loop.ts:100`).
+**Why:** the finger hides exactly the cell being aimed at — the reason the loupe exists
+for grid corners applies just as much to dropping a piece, an area or an arrival cell.
+
+### Area size is free (1 q steps) with preset chips
+**Decision:** the size select is gone. The HUD has a manual stepper whose step is exactly
+one cell — relabelled in the chosen unit (1 q / 1.5 m / 5 ft) — plus one-tap chips from
+`AREA_PRESETS` (`src/overlays.ts:35`). The field is 3 digits wide, so the cap is on the
+DISPLAYED number (`MAX_SIZE_SHOWN = 999`, `:44`) and the cap in cells follows the unit
+(999 q, 666 m-cells, 199 ft-cells — `maxCellsIn`). The size in cells lives on the input's
+`dataset.cells`, the text being only its view. The **piece's movement** uses the very same
+component (`makeCellStepper` `src/placement.ts:271`) — it was a 1..12 dropdown, and a
+speed is exactly the same kind of hand-set, whole-cell quantity.
+**Why:** the preset list could not express the sizes a table actually needs; presets stay
+as shortcuts for the common templates. Line ANGLES stay snapped to the book slopes, so a
+free length only ever truncates an existing staircase — pinned for every length by
+`test/line-stairs.test.ts` (runs of 2 or 3, last one may be short, never overlapping).
 
 ## Platform
 

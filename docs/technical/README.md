@@ -23,7 +23,8 @@ tactical geometry is plain TypeScript, so a redraw (`draw()`) never re-runs Open
 | Shared projective math (`intersect`, matrix inverse) | `geometry.ts` — `intersect`, `invert3x3` | `rg -n "intersect\|invert3x3" src/geometry.ts` |
 | Grid line **drawing** (colour, occluded/filled lines, clipping to border) | `draw-loop.ts` — `draw` / `drawFamily` | `rg -n "drawFamily\|gridColor\|l\.filled" src/draw-loop.ts` |
 | Add / adjust an **area template** (emanation/burst/cone/line) | `overlays.ts` — `areaCells` | `rg -n "areaCells\|blockDist\|burstDist\|lineCells\|coneDir" src/overlays.ts` |
-| Change area **size / angle presets** | `overlays.ts` — `FIXED_SIZES`, `lineAngles`, `fixedAngles` | `rg -n "FIXED_SIZES\|lineAngles\|fixedAngles\|snapToAngles" src/overlays.ts` |
+| Change area **size presets / cap / angle presets** | `overlays.ts` — `AREA_PRESETS`, `MAX_SIZE_SHOWN`, `lineAngles`, `fixedAngles` | `rg -n "AREA_PRESETS\|MAX_SIZE_SHOWN\|lineAngles\|fixedAngles\|snapToAngles" src/overlays.ts` |
+| Change a **hand-set size field** (area size or piece movement: manual entry, 1 q steps, preset chips) | `placement.ts` — `makeCellStepper`, `maxCellsIn`, `refreshSizeUI`, `showPieceSpeed`; `index.html` `#areaSizeStep` / `#pieceMoveStep` / `#areaPresets` | `rg -n "makeCellStepper\|maxCellsIn\|SizeCells\|PieceSpeed" src/placement.ts` |
 | Change **movement** search (Dijkstra, diagonals, reachable bands) | `overlays.ts` — `dijkstraStates`, `moveCells` | `rg -n "dijkstraStates\|moveSearch\|moveCells" src/overlays.ts` |
 | Change **route preview** (Pareto cost↔threats) | `overlays.ts` — `movePareto`; `draw-loop.ts` — `drawPaths` | `rg -n "movePareto\|ParetoRoute\|drawPaths" src/overlays.ts src/draw-loop.ts` |
 | Change **reach / threat / flanking** display | `overlays.ts` — `threatCells`; `board.ts` — `threatCountMaps`/`flankedEnemies`; `draw-loop.ts` — `drawThreat` | `rg -n "threatCells\|drawThreat\|flankedEnemies\|threatSidesToShow" src/*.ts` |

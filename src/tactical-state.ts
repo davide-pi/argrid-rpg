@@ -64,6 +64,10 @@ export const S = {
   // While rotating the angle ring OR dragging the selection/arrival, suppress pan.
   ringRotating: false,
   dragKind: null as 'origin' | 'target' | 'piece' | null,
+  // Where the finger is (IMAGE pixels) during a tactical drag/rotate, so draw() can put
+  // the magnifier loupe there — the finger hides exactly the cell being aimed at. Null
+  // when nothing is being dragged.
+  dragPoint: null as ImgPt | null,
 
   // Drawing caches (created once, reused).
   edgeCanvas: null as HTMLCanvasElement | null,

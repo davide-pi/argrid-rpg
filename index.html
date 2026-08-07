@@ -137,26 +137,50 @@
             </div>
           </div>
           <div class="hud-body" id="hudBody">
-            <!-- Area controls: type + size (+ creature for emanations) on one line;
-                 the measure unit lives in the header. -->
+            <!-- Area controls, one line each: the type chips, then the size — set BY HAND
+                 with a stepper that always moves whole cells (1 q), the common template
+                 sizes one tap away BESIDE it — then (emanations only) the creature size.
+                 The measure unit lives in the header. -->
             <div class="hud-section" id="hudArea" hidden>
-              <div class="hud-area-row">
-                <div class="seg segtype" id="areaType">
-                  <button type="button" class="chip" data-t="emanazione">Emanazione</button>
-                  <button type="button" class="chip" data-t="esplosione">Esplosione</button>
-                  <button type="button" class="chip" data-t="cono">Cono</button>
-                  <button type="button" class="chip" data-t="linea">Linea</button>
-                </div>
-                <select id="areaSizeSel" class="sel" aria-label="Dimensione dell'area" title="Dimensione"></select>
-                <select id="areaCreature" class="sel" aria-label="Taglia della creatura" title="Taglia creatura" hidden></select>
+              <div class="seg segtype" id="areaType">
+                <button type="button" class="chip" data-t="emanazione">Emanazione</button>
+                <button type="button" class="chip" data-t="esplosione">Esplosione</button>
+                <button type="button" class="chip" data-t="cono">Cono</button>
+                <button type="button" class="chip" data-t="linea">Linea</button>
               </div>
+              <!-- Size: the hand-set stepper with the common sizes right beside it. -->
+              <div class="hud-size-row">
+                <div class="stepper" id="areaSizeStep">
+                  <button type="button" class="step-btn" id="areaSizeMinus" aria-label="Riduci di un quadretto" title="−1 q">−</button>
+                  <input id="areaSizeInput" class="step-input" type="number" inputmode="decimal" step="1" min="1"
+                         aria-label="Dimensione dell'area" title="Dimensione (passi di 1 q)" />
+                  <span class="step-unit" id="areaSizeUnit" aria-hidden="true">q</span>
+                  <button type="button" class="step-btn" id="areaSizePlus" aria-label="Aumenta di un quadretto" title="+1 q">+</button>
+                </div>
+                <div class="seg preset-row" id="areaPresets"></div>
+              </div>
+              <!-- Emanations only: the creature the area radiates from. On its OWN line, so
+                   the preset chips keep the full width beside the stepper. -->
+              <label class="fld" id="areaCreatureFld" hidden>Taglia
+                <select id="areaCreature" class="sel" aria-label="Taglia della creatura" title="Taglia creatura"></select>
+              </label>
             </div>
 
-            <!-- Piece editor -->
+            <!-- Piece editor. Movement uses the same hand-set stepper as the area size:
+                 one whole cell per step, labelled in the chosen unit. -->
             <div class="hud-section" id="hudPiece" hidden>
-              <div class="hud-row">
+              <div class="hud-row piece-row">
                 <label class="fld">Taglia <select id="pieceSize" class="sel"></select></label>
-                <label class="fld">Movimento <select id="pieceMove" class="sel"></select></label>
+                <div class="fld">
+                  <span>Movimento</span>
+                  <div class="stepper" id="pieceMoveStep">
+                    <button type="button" class="step-btn" id="pieceMoveMinus" aria-label="Riduci il movimento di un quadretto" title="−1 q">−</button>
+                    <input id="pieceMove" class="step-input" type="number" inputmode="decimal" step="1" min="1"
+                           aria-label="Movimento della pedina" title="Movimento (passi di 1 q)" />
+                    <span class="step-unit" id="pieceMoveUnit" aria-hidden="true">q</span>
+                    <button type="button" class="step-btn" id="pieceMovePlus" aria-label="Aumenta il movimento di un quadretto" title="+1 q">+</button>
+                  </div>
+                </div>
               </div>
             </div>
 

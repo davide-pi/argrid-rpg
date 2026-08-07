@@ -7,7 +7,7 @@ import {
 import { solveHomography, applyH, makeGridMap } from './overlays';
 import { clipLineToRect, buildGrid, intersect, DEFAULT_PARAMS, type Line2, type RawLine } from './grid-detector';
 import { activePointers, capturePointer } from './pointer-capture';
-import { draw } from './draw-loop';
+import { requestDraw } from './draw-loop';
 import { rebuildDebugBar } from './debug-panel';
 import { updateInfo } from './hud';
 import { updateFabEnabled } from './placement';
@@ -99,7 +99,7 @@ export function applyManual() {
   S.gridMap = makeGridMap(fam.A, fam.B);
   S.gridDims = { na: fam.A.length, nb: fam.B.length };
   S.gridReliable = true;
-  draw();
+  requestDraw();
 }
 
 /**
@@ -288,7 +288,7 @@ export function enterManualMode(mode: 'adapt' | 'draw' = 'adapt') {
     S.gridReliable = false;
     S.gridMap = null;
     updateManualBar();
-    draw();
+    requestDraw();
   } else {
     // Start from the current grid when it's usable, else a default quad — so a
     // well-detected grid is only tweaked, but a bad/absent one starts from scratch.
@@ -318,7 +318,7 @@ export function regenerateFromStrokes() {
   if (manualStrokes.length < 2) {
     S.gridReliable = false;
     S.gridMap = null;
-    draw();
+    requestDraw();
     return;
   }
   const raw = manualStrokes.map(([a, b]) => strokeToRaw(a, b));
@@ -336,7 +336,7 @@ export function regenerateFromStrokes() {
     S.gridReliable = false;
     S.gridMap = null;
   }
-  draw();
+  requestDraw();
 }
 
 /** Leave manual editing. keep=true commits the grid; false discards it (back to the
@@ -374,7 +374,7 @@ export function exitManualMode(keep: boolean) {
     applyDetectedGrid();
     deselectCell();
   }
-  draw();
+  requestDraw();
   updateResultChrome();
 }
 
@@ -478,7 +478,7 @@ export function manualPointerMove(e: PointerEvent) {
   if (S.manualDrag === DRAW_SENTINEL) {
     e.preventDefault();
     strokeEnd = p;
-    draw();
+    requestDraw();
     return;
   }
   if (S.manualDrag === null || !S.manualQuad || !manualDragLast) return;
@@ -522,7 +522,7 @@ export function manualPointerUp(e: PointerEvent) {
     } else {
       strokeStart = null;
       strokeEnd = null;
-      draw();
+      requestDraw();
     }
     return;
   }

@@ -48,7 +48,7 @@
 ## Verify
 
 - `cellClient` returns non-null → the grid was detected and the homography built.
-- Assert on DOM state (`#hud`, `#hudTitle`, `#fab` text, `#areaSizeSel.value`, etc.) and take screenshots.
+- Assert on DOM state (`#hud`, `#hudTitle`, `#fab` text, `#areaSizeInput.value`, etc.) and take screenshots.
 
 ## Rollback / if it fails
 

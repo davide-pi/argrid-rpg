@@ -370,9 +370,16 @@ function markActivePreset() {
 export function refreshSizeUI() {
   const u = unit();
   areaSize.relabel();
-  areaPresets.innerHTML = AREA_PRESETS[S.currentAreaType]
-    .map((c) => `<button type="button" class="chip" data-cells="${c}">${sizeLabel(c, u)}</button>`)
-    .join('');
+  areaPresets.replaceChildren(
+    ...AREA_PRESETS[S.currentAreaType].map((c) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'chip';
+      b.dataset.cells = String(c);
+      b.textContent = sizeLabel(c, u);
+      return b;
+    }),
+  );
   markActivePreset();
 }
 

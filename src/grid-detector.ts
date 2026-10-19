@@ -544,7 +544,6 @@ export function* detectGridFromMatSteps(
   let orientedRan = false; // the oriented re-extraction computed a mask
   let orientedAdopted = false; // …and it was stronger, so its re-fit won
   let morphRan = false; // the morphological pass ran
-  let morphChosen = false; // …and it beat the luminance fit
   try {
     yield { frac: 0.05, label: "Preparazione dell'immagine…" };
     gray = new cv.Mat();
@@ -786,7 +785,7 @@ export function* detectGridFromMatSteps(
     // consensus, so it carries no agreement of its own).
     agreement = winnerIdx === fused.index ? fused.agreement : null;
     result = candidates[winnerIdx].r;
-    morphChosen = candidates[winnerIdx].id === 'morph';
+    const morphChosen = candidates[winnerIdx].id === 'morph';
     // The winner's fused confidence becomes the reported confidence (stamped after the debug
     // panel captures each candidate's RAW internal confidence, below).
     const fusedConfidence = fused.confidences[winnerIdx] ?? result.info.confidence;
